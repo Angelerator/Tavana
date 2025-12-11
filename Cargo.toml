@@ -1,0 +1,120 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tavana-common",
+    "crates/tavana-gateway",
+    "crates/tavana-operator",
+    "crates/tavana-worker",
+    "crates/tavana-catalog",
+    "crates/tavana-metering",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Tavana Team"]
+license = "Apache-2.0"
+repository = "https://github.com/tavana/tavana"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.41", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Protocols - gRPC
+tonic = { version = "0.12", features = ["tls", "tls-roots"] }
+tonic-build = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+
+# Arrow ecosystem
+arrow = "53"
+arrow-flight = { version = "53", features = ["flight-sql-experimental"] }
+arrow-schema = "53"
+arrow-array = "53"
+arrow-ipc = "53"
+
+# PostgreSQL wire protocol
+pgwire = "0.25"
+
+# Kubernetes
+kube = { version = "0.96", features = ["runtime", "derive"] }
+k8s-openapi = { version = "0.23", features = ["v1_31"] }
+
+# Data formats and processing
+duckdb = { version = "1.1", features = ["bundled"] }
+object_store = { version = "0.11", features = ["aws", "azure", "gcp"] }
+deltalake = { version = "0.22", features = ["s3", "azure", "gcs"] }
+parquet = "53"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
+
+# Query parsing
+sqlparser = "0.52"
+
+# Authentication
+openidconnect = "3.5"
+jsonwebtoken = "9"
+
+# Security / TLS
+rustls = "0.23"
+rustls-pemfile = "2"
+rcgen = "0.13"
+ring = "0.17"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.27"
+opentelemetry = { version = "0.26", features = ["metrics", "trace"] }
+opentelemetry-otlp = { version = "0.26", features = ["tonic"] }
+opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
+prometheus = "0.13"
+
+# Web framework
+axum = { version = "0.7", features = ["macros", "tokio"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utils
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+blake3 = "1"
+bytes = "1"
+url = "2"
+base64 = "0.22"
+hex = "0.4"
+parking_lot = "0.12"
+dashmap = "6"
+
+# Pin crypto deps to avoid edition2024 requirement
+base64ct = "=1.6.0"
+pem-rfc7468 = "=0.7.0"
+
+# Config
+config = "0.14"
+dotenvy = "0.15"
+
+# CLI (for tavana-cli)
+clap = { version = "4", features = ["derive", "env"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+

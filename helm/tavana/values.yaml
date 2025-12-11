@@ -1,0 +1,216 @@
+# Tavana Helm Chart Values
+
+# Global settings
+global:
+  imageRegistry: ghcr.io/tavana
+  imagePullPolicy: IfNotPresent
+  imageTag: "latest"
+
+# Gateway settings
+gateway:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: tavana-gateway
+    tag: ""  # Defaults to global.imageTag
+  
+  service:
+    type: ClusterIP
+    pgPort: 5432
+    flightPort: 8815
+    httpPort: 8080
+  
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "1Gi"
+      cpu: "1000m"
+  
+  # TLS configuration
+  tls:
+    enabled: true
+    # Use cert-manager for automatic certificate management
+    certManager:
+      enabled: true
+      issuerName: letsencrypt-prod
+      issuerKind: ClusterIssuer
+
+# Operator settings
+operator:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: tavana-operator
+    tag: ""
+  
+  # Worker pod settings
+  worker:
+    image:
+      repository: tavana-worker
+      tag: ""
+    
+    # Default resource limits for worker pods
+    defaultResources:
+      minMemoryMb: 512
+      maxMemoryMb: 65536
+      minCpuMillicores: 500
+      maxCpuMillicores: 16000
+  
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "50m"
+    limits:
+      memory: "256Mi"
+      cpu: "200m"
+
+# Catalog settings
+catalog:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: tavana-catalog
+    tag: ""
+  
+  service:
+    grpcPort: 50052
+    httpPort: 8080
+  
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+# Metering settings
+metering:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: tavana-metering
+    tag: ""
+  
+  # Control plane for usage reporting
+  controlPlane:
+    enabled: false
+    url: ""
+    apiKey: ""
+  
+  # Usage data archival
+  archival:
+    enabled: true
+    # S3-compatible storage for Parquet archives
+    bucket: ""
+    prefix: "metering/"
+  
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "50m"
+    limits:
+      memory: "256Mi"
+      cpu: "200m"
+
+# PostgreSQL for catalog and metering
+postgresql:
+  enabled: true
+  auth:
+    postgresPassword: tavana-admin
+    database: tavana
+    username: tavana
+    password: tavana
+  primary:
+    persistence:
+      enabled: true
+      size: 8Gi
+  architecture: standalone
+
+# External database (if postgresql.enabled=false)
+externalDatabase:
+  host: ""
+  port: 5432
+  database: tavana
+  username: tavana
+  password: ""
+  existingSecret: ""
+  existingSecretPasswordKey: password
+
+# Ingress configuration
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+  hosts:
+    - host: tavana.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          port: 8080
+  tls: []
+
+# Service Account
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # AWS IRSA annotation
+  # eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT:role/tavana-role
+  # Azure Workload Identity annotation
+  # azure.workload.identity/client-id: CLIENT_ID
+
+# Pod Security
+podSecurityContext:
+  runAsNonRoot: true
+  fsGroup: 1000
+
+securityContext:
+  runAsUser: 1000
+  runAsNonRoot: true
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+
+# Network Policies
+networkPolicies:
+  enabled: true
+
+# Observability
+observability:
+  # OpenTelemetry
+  opentelemetry:
+    enabled: true
+    collectorEndpoint: "http://otel-collector:4317"
+  
+  # Prometheus
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      namespace: ""
+      labels: {}
+
+# Cloud-specific settings
+cloud:
+  # AWS-specific configuration
+  aws:
+    enabled: false
+    region: us-east-1
+    # Use IRSA for authentication
+    useIRSA: true
+  
+  # Azure-specific configuration
+  azure:
+    enabled: false
+    # Use Workload Identity
+    useWorkloadIdentity: true
+  
+  # GCP-specific configuration
+  gcp:
+    enabled: false
+    projectId: ""
+    # Use Workload Identity
+    useWorkloadIdentity: true
+

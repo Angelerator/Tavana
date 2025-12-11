@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: tavana
+data:
+  init.sql: |
+    -- Tavana Database Schema
+    CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+    CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+    
+    -- Catalog schema
+    CREATE SCHEMA IF NOT EXISTS catalog;
+    
+    CREATE TABLE catalog.catalogs (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        name VARCHAR(255) NOT NULL UNIQUE,
+        comment TEXT,
+        properties JSONB DEFAULT '{}',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+    
+    CREATE TABLE catalog.schemas (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        catalog_id UUID NOT NULL REFERENCES catalog.catalogs(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        comment TEXT,
+        properties JSONB DEFAULT '{}',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        UNIQUE(catalog_id, name)
+    );
+    
+    CREATE TABLE catalog.tables (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        schema_id UUID NOT NULL REFERENCES catalog.schemas(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        table_type VARCHAR(50) NOT NULL DEFAULT 'EXTERNAL',
+        data_source_format VARCHAR(50) NOT NULL,
+        storage_location TEXT NOT NULL,
+        comment TEXT,
+        properties JSONB DEFAULT '{}',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        UNIQUE(schema_id, name)
+    );
+    
+    -- Metering schema
+    CREATE SCHEMA IF NOT EXISTS metering;
+    
+    CREATE TABLE metering.query_executions (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        query_id UUID NOT NULL,
+        user_id VARCHAR(255) NOT NULL,
+        query_text TEXT NOT NULL,
+        query_fingerprint VARCHAR(64),
+        submitted_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        started_at TIMESTAMP WITH TIME ZONE,
+        completed_at TIMESTAMP WITH TIME ZONE,
+        status VARCHAR(50) NOT NULL DEFAULT 'PENDING',
+        error_message TEXT,
+        estimated_memory_mb INTEGER,
+        estimated_cpu_millicores INTEGER,
+        actual_peak_memory_mb INTEGER,
+        actual_cpu_seconds DOUBLE PRECISION,
+        bytes_scanned BIGINT DEFAULT 0,
+        bytes_returned BIGINT DEFAULT 0,
+        rows_returned BIGINT DEFAULT 0,
+        tables_accessed TEXT[],
+        pod_name VARCHAR(255),
+        worker_node VARCHAR(255)
+    );
+    
+    CREATE INDEX idx_query_executions_user ON metering.query_executions(user_id);
+    CREATE INDEX idx_query_executions_submitted ON metering.query_executions(submitted_at);
+    
+    -- Seed data
+    INSERT INTO catalog.catalogs (name, comment) VALUES ('default', 'Default catalog');
+    
+    INSERT INTO catalog.schemas (catalog_id, name, comment)
+    SELECT id, 'public', 'Default schema' FROM catalog.catalogs WHERE name = 'default';
+

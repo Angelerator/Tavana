@@ -1,0 +1,205 @@
+syntax = "proto3";
+
+package tavana.v1;
+
+import "google/protobuf/timestamp.proto";
+import "tavana/v1/common.proto";
+
+// Internal Catalog Service - gRPC for low-latency lookups from gateway
+service CatalogService {
+    // Catalog operations
+    rpc ListCatalogs(ListCatalogsRequest) returns (ListCatalogsResponse);
+    rpc GetCatalog(GetCatalogRequest) returns (Catalog);
+    rpc CreateCatalog(CreateCatalogRequest) returns (Catalog);
+    rpc DeleteCatalog(DeleteCatalogRequest) returns (DeleteCatalogResponse);
+    
+    // Schema operations
+    rpc ListSchemas(ListSchemasRequest) returns (ListSchemasResponse);
+    rpc GetSchema(GetSchemaRequest) returns (Schema);
+    rpc CreateSchema(CreateSchemaRequest) returns (Schema);
+    rpc DeleteSchema(DeleteSchemaRequest) returns (DeleteSchemaResponse);
+    
+    // Table operations
+    rpc ListTables(ListTablesRequest) returns (ListTablesResponse);
+    rpc GetTable(GetTableRequest) returns (Table);
+    rpc CreateTable(CreateTableRequest) returns (Table);
+    rpc UpdateTable(UpdateTableRequest) returns (Table);
+    rpc DeleteTable(DeleteTableRequest) returns (DeleteTableResponse);
+    
+    // Statistics operations
+    rpc GetTableStatistics(GetTableStatisticsRequest) returns (TableStatistics);
+    rpc UpdateTableStatistics(UpdateTableStatisticsRequest) returns (TableStatistics);
+    
+    // Health check
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// Catalog
+message Catalog {
+    string name = 1;
+    string comment = 2;
+    map<string, string> properties = 3;
+    google.protobuf.Timestamp created_at = 4;
+    google.protobuf.Timestamp updated_at = 5;
+}
+
+message ListCatalogsRequest {
+    uint32 max_results = 1;
+    string page_token = 2;
+}
+
+message ListCatalogsResponse {
+    repeated Catalog catalogs = 1;
+    string next_page_token = 2;
+}
+
+message GetCatalogRequest {
+    string name = 1;
+}
+
+message CreateCatalogRequest {
+    string name = 1;
+    string comment = 2;
+    map<string, string> properties = 3;
+}
+
+message DeleteCatalogRequest {
+    string name = 1;
+    bool force = 2;  // Delete even if not empty
+}
+
+message DeleteCatalogResponse {
+    bool success = 1;
+}
+
+// Schema
+message Schema {
+    string catalog_name = 1;
+    string name = 2;
+    string full_name = 3;  // catalog.schema
+    string comment = 4;
+    map<string, string> properties = 5;
+    google.protobuf.Timestamp created_at = 6;
+    google.protobuf.Timestamp updated_at = 7;
+}
+
+message ListSchemasRequest {
+    string catalog_name = 1;
+    uint32 max_results = 2;
+    string page_token = 3;
+}
+
+message ListSchemasResponse {
+    repeated Schema schemas = 1;
+    string next_page_token = 2;
+}
+
+message GetSchemaRequest {
+    string full_name = 1;  // catalog.schema
+}
+
+message CreateSchemaRequest {
+    string catalog_name = 1;
+    string name = 2;
+    string comment = 3;
+    map<string, string> properties = 4;
+}
+
+message DeleteSchemaRequest {
+    string full_name = 1;
+    bool force = 2;
+}
+
+message DeleteSchemaResponse {
+    bool success = 1;
+}
+
+// Table
+message Table {
+    string catalog_name = 1;
+    string schema_name = 2;
+    string name = 3;
+    string full_name = 4;  // catalog.schema.table
+    TableType table_type = 5;
+    DataFormat data_format = 6;
+    StorageLocation storage_location = 7;
+    repeated Column columns = 8;
+    repeated string partition_columns = 9;
+    string comment = 10;
+    map<string, string> properties = 11;
+    google.protobuf.Timestamp created_at = 12;
+    google.protobuf.Timestamp updated_at = 13;
+}
+
+enum TableType {
+    TABLE_TYPE_UNSPECIFIED = 0;
+    TABLE_TYPE_MANAGED = 1;
+    TABLE_TYPE_EXTERNAL = 2;
+    TABLE_TYPE_VIEW = 3;
+}
+
+message Column {
+    string name = 1;
+    string type_name = 2;
+    string type_text = 3;
+    int32 position = 4;
+    bool nullable = 5;
+    string comment = 6;
+}
+
+message ListTablesRequest {
+    string catalog_name = 1;
+    string schema_name = 2;
+    uint32 max_results = 3;
+    string page_token = 4;
+}
+
+message ListTablesResponse {
+    repeated Table tables = 1;
+    string next_page_token = 2;
+}
+
+message GetTableRequest {
+    string full_name = 1;  // catalog.schema.table
+}
+
+message CreateTableRequest {
+    string catalog_name = 1;
+    string schema_name = 2;
+    string name = 3;
+    TableType table_type = 4;
+    DataFormat data_format = 5;
+    StorageLocation storage_location = 6;
+    repeated Column columns = 7;
+    repeated string partition_columns = 8;
+    string comment = 9;
+    map<string, string> properties = 10;
+}
+
+message UpdateTableRequest {
+    string full_name = 1;
+    string new_name = 2;
+    StorageLocation storage_location = 3;
+    repeated Column columns = 4;
+    string comment = 5;
+    map<string, string> properties = 6;
+}
+
+message DeleteTableRequest {
+    string full_name = 1;
+}
+
+message DeleteTableResponse {
+    bool success = 1;
+}
+
+// Statistics
+message GetTableStatisticsRequest {
+    string full_name = 1;
+}
+
+message UpdateTableStatisticsRequest {
+    string full_name = 1;
+    TableStatistics statistics = 2;
+}
+
