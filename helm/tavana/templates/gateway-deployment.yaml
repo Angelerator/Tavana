@@ -1,0 +1,94 @@
+{{- if .Values.gateway.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tavana.fullname" . }}-gateway
+  labels:
+    {{- include "tavana.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  replicas: {{ .Values.gateway.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "tavana.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        {{- include "tavana.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: gateway
+    spec:
+      serviceAccountName: {{ include "tavana.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: gateway
+          image: {{ include "tavana.gateway.image" . }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - name: pg
+              containerPort: {{ .Values.gateway.service.pgPort }}
+              protocol: TCP
+            - name: flight
+              containerPort: {{ .Values.gateway.service.flightPort }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ .Values.gateway.service.httpPort }}
+              protocol: TCP
+          env:
+            - name: PG_PORT
+              value: {{ .Values.gateway.service.pgPort | quote }}
+            - name: FLIGHT_PORT
+              value: {{ .Values.gateway.service.flightPort | quote }}
+            - name: HTTP_PORT
+              value: {{ .Values.gateway.service.httpPort | quote }}
+            - name: CATALOG_ADDR
+              value: "http://{{ include "tavana.fullname" . }}-catalog:{{ .Values.catalog.service.grpcPort }}"
+            - name: TLS_ENABLED
+              value: {{ .Values.gateway.tls.enabled | quote }}
+            - name: LOG_LEVEL
+              value: "info"
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "tavana.fullname" . }}-gateway
+  labels:
+    {{- include "tavana.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  type: {{ .Values.gateway.service.type }}
+  ports:
+    - port: {{ .Values.gateway.service.pgPort }}
+      targetPort: pg
+      protocol: TCP
+      name: pg
+    - port: {{ .Values.gateway.service.flightPort }}
+      targetPort: flight
+      protocol: TCP
+      name: flight
+    - port: {{ .Values.gateway.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "tavana.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+{{- end }}
+

@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: tavana
+  labels:
+    app: tavana
+    component: worker
+spec:
+  # Start with 1 replica, HPA will scale 1-10 based on load
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tavana-worker
+  template:
+    metadata:
+      labels:
+        app: tavana-worker
+    spec:
+      containers:
+        - name: worker
+          image: tavana-worker:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 50053
+          env:
+            # Connection pool size per worker (4 parallel queries)
+            - name: POOL_SIZE
+              value: "4"
+            - name: LOG_LEVEL
+              value: "info"
+          envFrom:
+            - configMapRef:
+                name: tavana-config
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "4Gi"
+              cpu: "2"
+          readinessProbe:
+            tcpSocket:
+              port: 50053
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 50053
+            initialDelaySeconds: 10
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker
+  namespace: tavana
+spec:
+  selector:
+    app: tavana-worker
+  ports:
+    - port: 50053
+      targetPort: 50053

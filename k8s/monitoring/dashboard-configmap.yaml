@@ -1,0 +1,205 @@
+# Grafana Dashboard ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tavana-dashboard
+  namespace: tavana
+  labels:
+    grafana_dashboard: "1"
+data:
+  tavana-adaptive-scaling.json: |
+    {
+      "annotations": {
+        "list": []
+      },
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 0,
+      "id": null,
+      "links": [],
+      "liveNow": false,
+      "panels": [
+        {
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+          "id": 100,
+          "title": "Adaptive Scaling Overview",
+          "type": "row"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 3000 },
+                  { "color": "red", "value": 6000 }
+                ]
+              },
+              "unit": "decmbytes"
+            }
+          },
+          "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+          "id": 1,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "none",
+            "reduceOptions": { "calcs": ["lastNotNull"] }
+          },
+          "targets": [
+            {
+              "expr": "tavana_adaptive_threshold_mb",
+              "legendFormat": "Threshold"
+            }
+          ],
+          "title": "Current Threshold",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] },
+              "unit": "short"
+            }
+          },
+          "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+          "id": 2,
+          "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+          "targets": [{ "expr": "tavana_adaptive_hpa_min_replicas", "legendFormat": "Min" }],
+          "title": "HPA Min",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "thresholds" },
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] },
+              "unit": "short"
+            }
+          },
+          "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+          "id": 3,
+          "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+          "targets": [{ "expr": "tavana_adaptive_hpa_max_replicas", "legendFormat": "Max" }],
+          "title": "HPA Max",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": { "color": { "mode": "palette-classic" }, "unit": "percentunit" }
+          },
+          "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+          "id": 4,
+          "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+          "targets": [{ "expr": "tavana_worker_pool_cpu_utilization", "legendFormat": "CPU" }],
+          "title": "Worker CPU",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": { "color": { "mode": "palette-classic" }, "unit": "percentunit" }
+          },
+          "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+          "id": 5,
+          "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+          "targets": [{ "expr": "tavana_worker_pool_memory_utilization", "legendFormat": "Memory" }],
+          "title": "Worker Memory",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": { "color": { "mode": "palette-classic" }, "unit": "short" }
+          },
+          "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+          "id": 6,
+          "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+          "targets": [{ "expr": "tavana_ephemeral_pods_active", "legendFormat": "Active" }],
+          "title": "Ephemeral Pods",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": { "unit": "decmbytes" }
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+          "id": 10,
+          "targets": [{ "expr": "tavana_adaptive_threshold_mb", "legendFormat": "Threshold (MB)" }],
+          "title": "Threshold Over Time",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": {
+            "defaults": { "unit": "short" }
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+          "id": 11,
+          "targets": [
+            { "expr": "tavana_adaptive_hpa_min_replicas", "legendFormat": "HPA Min" },
+            { "expr": "tavana_adaptive_hpa_max_replicas", "legendFormat": "HPA Max" },
+            { "expr": "tavana_worker_replicas{state=\"ready\"}", "legendFormat": "Ready" }
+          ],
+          "title": "HPA Scaling",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 13 },
+          "id": 20,
+          "targets": [
+            { "expr": "tavana_adaptive_factor{factor_type=\"time\"}", "legendFormat": "Time" },
+            { "expr": "tavana_adaptive_factor{factor_type=\"day\"}", "legendFormat": "Day" },
+            { "expr": "tavana_adaptive_factor{factor_type=\"load\"}", "legendFormat": "Load" },
+            { "expr": "tavana_adaptive_factor{factor_type=\"event\"}", "legendFormat": "Event" }
+          ],
+          "title": "Adjustment Factors",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 21 },
+          "id": 30,
+          "options": { "pieType": "pie" },
+          "targets": [{ "expr": "increase(tavana_queries_routed_total[1h])", "legendFormat": "{{target}}" }],
+          "title": "Query Routing (1h)",
+          "type": "piechart"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 21 },
+          "id": 31,
+          "targets": [{ "expr": "rate(tavana_queries_routed_total[5m])", "legendFormat": "{{target}}" }],
+          "title": "Query Rate",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "unit": "s" } },
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 21 },
+          "id": 40,
+          "targets": [
+            { "expr": "histogram_quantile(0.5, rate(tavana_query_latency_seconds_bucket{status=\"success\"}[5m]))", "legendFormat": "P50 {{route}}" },
+            { "expr": "histogram_quantile(0.95, rate(tavana_query_latency_seconds_bucket{status=\"success\"}[5m]))", "legendFormat": "P95 {{route}}" }
+          ],
+          "title": "Query Latency",
+          "type": "timeseries"
+        }
+      ],
+      "refresh": "10s",
+      "schemaVersion": 38,
+      "style": "dark",
+      "tags": ["tavana", "adaptive"],
+      "time": { "from": "now-1h", "to": "now" },
+      "title": "Tavana Adaptive Scaling",
+      "uid": "tavana-adaptive"
+    }
+

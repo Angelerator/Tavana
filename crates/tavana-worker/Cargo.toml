@@ -1,0 +1,60 @@
+[package]
+name = "tavana-worker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tavana-worker"
+path = "src/main.rs"
+
+[dependencies]
+tavana-common = { path = "../tavana-common" }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-stream = "0.1"
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# gRPC
+tonic = { workspace = true }
+prost = { workspace = true }
+
+# Arrow
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-array = { workspace = true }
+arrow-ipc = { workspace = true }
+
+# DuckDB
+duckdb = { workspace = true }
+
+# Object storage
+object_store = { workspace = true }
+parquet = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utils
+uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+
+# Config
+clap = { workspace = true }
+dotenvy = { workspace = true }
+
+# System
+num_cpus = "1.16"
+

@@ -1,0 +1,34 @@
+# RBAC for Tavana Gateway to create DuckDBQuery CRDs for ephemeral pods
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tavana-gateway
+  namespace: tavana
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tavana-gateway-role
+rules:
+  # DuckDBQuery CRD management
+  - apiGroups: ["tavana.io"]
+    resources: ["duckdbqueries"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["tavana.io"]
+    resources: ["duckdbqueries/status"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tavana-gateway-binding
+subjects:
+  - kind: ServiceAccount
+    name: tavana-gateway
+    namespace: tavana
+roleRef:
+  kind: ClusterRole
+  name: tavana-gateway-role
+  apiGroup: rbac.authorization.k8s.io
+
