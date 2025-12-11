@@ -1,0 +1,87 @@
+[package]
+name = "tavana-gateway"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tavana-gateway"
+path = "src/main.rs"
+
+[dependencies]
+tavana-common = { path = "../tavana-common" }
+
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Protocols
+tonic = { workspace = true }
+prost = { workspace = true }
+arrow = { workspace = true }
+arrow-flight = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-array = { workspace = true }
+arrow-ipc = { workspace = true }
+pgwire = { workspace = true }
+
+# Web framework
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Query parsing
+sqlparser = { workspace = true }
+
+# Auth
+openidconnect = { workspace = true }
+jsonwebtoken = { workspace = true }
+
+# TLS
+rustls = { workspace = true, features = ["ring"] }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+prometheus = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utils
+uuid = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = "0.10"
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+blake3 = { workspace = true }
+once_cell = "1.19"
+
+# Config
+clap = { workspace = true }
+dotenvy = { workspace = true }
+
+# Query routing
+regex = "1.10"
+
+# S3 and data formats for real size estimation
+aws-sdk-s3 = "1.65"
+aws-config = "1.5"
+parquet = { version = "53.3", default-features = false, features = ["async"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+# Kubernetes (for creating DuckDBQuery CRs)
+kube = { workspace = true, features = ["rustls-tls", "derive"] }
+k8s-openapi = { workspace = true }
+schemars = "0.8"
+

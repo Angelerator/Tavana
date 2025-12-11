@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: tavana
+
+resources:
+  - namespace.yaml
+  - configmaps.yaml
+  - secrets.yaml
+  - postgres-init-configmap.yaml
+  - postgres.yaml
+  - minio.yaml
+  - gateway-deployment.yaml
+  - worker-deployment.yaml
+  - services.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: tavana
+  app.kubernetes.io/managed-by: kustomize
+

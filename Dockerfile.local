@@ -1,0 +1,62 @@
+# Fast Dockerfile for local development
+# Copies pre-built binaries from local target/release
+
+# =============================================================================
+# Worker image
+# =============================================================================
+FROM debian:bookworm-slim AS worker
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1000 -s /bin/bash tavana
+
+COPY target/release/tavana-worker /usr/local/bin/
+
+USER tavana
+WORKDIR /home/tavana
+
+EXPOSE 50053
+ENTRYPOINT ["tavana-worker"]
+
+# =============================================================================
+# Gateway image
+# =============================================================================
+FROM debian:bookworm-slim AS gateway
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1000 -s /bin/bash tavana
+
+COPY target/release/tavana-gateway /usr/local/bin/
+
+USER tavana
+WORKDIR /home/tavana
+
+EXPOSE 15432 8080 8815
+ENTRYPOINT ["tavana-gateway"]
+
+# =============================================================================
+# Operator image
+# =============================================================================
+FROM debian:bookworm-slim AS operator
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -u 1000 -s /bin/bash tavana
+
+COPY target/release/tavana-operator /usr/local/bin/
+
+USER tavana
+WORKDIR /home/tavana
+
+ENTRYPOINT ["tavana-operator"]
+

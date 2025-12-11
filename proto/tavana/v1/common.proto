@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package tavana.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Common error response
+message Error {
+    string code = 1;
+    string message = 2;
+    map<string, string> details = 3;
+}
+
+// Authentication token
+message AuthToken {
+    string token = 1;
+    TokenType token_type = 2;
+    google.protobuf.Timestamp expires_at = 3;
+}
+
+enum TokenType {
+    TOKEN_TYPE_UNSPECIFIED = 0;
+    TOKEN_TYPE_API_KEY = 1;
+    TOKEN_TYPE_JWT = 2;
+}
+
+// User identity extracted from auth
+message UserIdentity {
+    string user_id = 1;
+    string tenant_id = 2;
+    repeated string scopes = 3;
+    map<string, string> claims = 4;
+}
+
+// Pod resource requirements
+message PodResources {
+    uint32 memory_mb = 1;
+    uint32 cpu_millicores = 2;
+    uint32 gpu_count = 3;
+}
+
+// Data format types
+enum DataFormat {
+    DATA_FORMAT_UNSPECIFIED = 0;
+    DATA_FORMAT_PARQUET = 1;
+    DATA_FORMAT_DELTA = 2;
+    DATA_FORMAT_ICEBERG = 3;
+    DATA_FORMAT_CSV = 4;
+    DATA_FORMAT_JSON = 5;
+}
+
+// Cloud storage location
+message StorageLocation {
+    string uri = 1;  // s3://bucket/path, az://container/path, gs://bucket/path
+    StorageType storage_type = 2;
+}
+
+enum StorageType {
+    STORAGE_TYPE_UNSPECIFIED = 0;
+    STORAGE_TYPE_S3 = 1;
+    STORAGE_TYPE_ADLS = 2;
+    STORAGE_TYPE_GCS = 3;
+    STORAGE_TYPE_LOCAL = 4;
+}
+
+// Table statistics
+message TableStatistics {
+    uint64 row_count = 1;
+    uint64 size_bytes = 2;
+    uint32 file_count = 3;
+    google.protobuf.Timestamp last_updated = 4;
+    map<string, ColumnStatistics> column_stats = 5;
+}
+
+message ColumnStatistics {
+    uint64 distinct_count = 1;
+    uint64 null_count = 2;
+    bytes min_value = 3;
+    bytes max_value = 4;
+}
+
+// Health check
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+    ServiceStatus status = 1;
+    string version = 2;
+    google.protobuf.Timestamp started_at = 3;
+}
+
+enum ServiceStatus {
+    SERVICE_STATUS_UNSPECIFIED = 0;
+    SERVICE_STATUS_HEALTHY = 1;
+    SERVICE_STATUS_DEGRADED = 2;
+    SERVICE_STATUS_UNHEALTHY = 3;
+}
+

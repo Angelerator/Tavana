@@ -1,0 +1,50 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node/Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Kubernetes secrets (keep templates)
+k8s/secrets/
+*.pem
+*.key
+*.crt
+
+# Local data
+data/
+exports/
+*.duckdb
+*.parquet
+
+# Docker
+.docker/
+
+# Temporary
+tmp/
+temp/

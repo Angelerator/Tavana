@@ -1,0 +1,149 @@
+syntax = "proto3";
+
+package tavana.v1;
+
+import "google/protobuf/timestamp.proto";
+import "tavana/v1/common.proto";
+
+// Query execution service - internal communication between gateway and workers
+service QueryService {
+    // Execute a query and stream results back
+    rpc ExecuteQuery(ExecuteQueryRequest) returns (stream QueryResultBatch);
+    
+    // Cancel a running query
+    rpc CancelQuery(CancelQueryRequest) returns (CancelQueryResponse);
+    
+    // Get query status
+    rpc GetQueryStatus(GetQueryStatusRequest) returns (QueryStatusResponse);
+    
+    // Health check
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message ExecuteQueryRequest {
+    string query_id = 1;
+    string sql = 2;
+    UserIdentity user = 3;
+    QueryOptions options = 4;
+    PodResources allocated_resources = 5;
+}
+
+message QueryOptions {
+    uint32 timeout_seconds = 1;
+    uint64 max_rows = 2;
+    uint64 max_bytes = 3;
+    bool enable_profiling = 4;
+    map<string, string> session_params = 5;
+}
+
+message QueryResultBatch {
+    oneof result {
+        ArrowRecordBatch record_batch = 1;
+        QueryMetadata metadata = 2;
+        QueryProfile profile = 3;
+        Error error = 4;
+    }
+}
+
+message ArrowRecordBatch {
+    bytes schema = 1;  // Arrow IPC schema
+    bytes data = 2;    // Arrow IPC record batch
+    uint64 row_count = 3;
+}
+
+message QueryMetadata {
+    string query_id = 1;
+    repeated string columns = 2;
+    repeated string column_types = 3;
+    uint64 total_rows = 4;
+    uint64 total_bytes = 5;
+}
+
+message QueryProfile {
+    uint64 execution_time_ms = 1;
+    uint64 rows_scanned = 2;
+    uint64 bytes_scanned = 3;
+    uint64 rows_returned = 4;
+    uint64 bytes_returned = 5;
+    uint64 peak_memory_bytes = 6;
+    float cpu_seconds = 7;
+    repeated string tables_accessed = 8;
+}
+
+message CancelQueryRequest {
+    string query_id = 1;
+}
+
+message CancelQueryResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message GetQueryStatusRequest {
+    string query_id = 1;
+}
+
+message QueryStatusResponse {
+    string query_id = 1;
+    QueryState state = 2;
+    QueryProgress progress = 3;
+    Error error = 4;
+    google.protobuf.Timestamp started_at = 5;
+    google.protobuf.Timestamp completed_at = 6;
+}
+
+enum QueryState {
+    QUERY_STATE_UNSPECIFIED = 0;
+    QUERY_STATE_QUEUED = 1;
+    QUERY_STATE_RUNNING = 2;
+    QUERY_STATE_COMPLETED = 3;
+    QUERY_STATE_FAILED = 4;
+    QUERY_STATE_CANCELLED = 5;
+}
+
+message QueryProgress {
+    float percentage = 1;
+    uint64 rows_processed = 2;
+    uint64 bytes_processed = 3;
+    string current_stage = 4;
+}
+
+// Query history logging
+message QueryExecutionLog {
+    string query_id = 1;
+    string query_fingerprint = 2;
+    string user_id = 3;
+    string tenant_id = 4;
+    google.protobuf.Timestamp timestamp = 5;
+    
+    // Query details
+    string sql_text = 6;
+    string sql_normalized = 7;
+    repeated string tables_accessed = 8;
+    uint32 join_count = 9;
+    bool has_aggregation = 10;
+    bool has_window_function = 11;
+    
+    // Estimation vs Reality
+    uint32 estimated_memory_mb = 12;
+    uint32 estimated_cpu_millicores = 13;
+    uint64 estimated_rows = 14;
+    uint32 actual_peak_memory_mb = 15;
+    float actual_cpu_seconds = 16;
+    uint64 actual_rows_returned = 17;
+    
+    // Execution metrics
+    uint64 queue_time_ms = 18;
+    uint64 execution_time_ms = 19;
+    uint64 result_size_bytes = 20;
+    string pod_name = 21;
+    string worker_node = 22;
+    
+    // Outcome
+    QueryState status = 23;
+    string error_message = 24;
+    
+    // Billing
+    float cost_estimate_usd = 25;
+}
+

@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tavana-worker
+  namespace: tavana
+  labels:
+    app: tavana-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tavana-worker
+  template:
+    metadata:
+      labels:
+        app: tavana-worker
+    spec:
+      containers:
+        - name: worker
+          image: tavana-worker:latest
+          imagePullPolicy: Never  # Use local Docker images
+          ports:
+            - containerPort: 50053
+              name: grpc
+          env:
+            - name: GRPC_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: tavana-config
+                  key: GRPC_PORT
+            - name: MAX_MEMORY_GB
+              valueFrom:
+                configMapKeyRef:
+                  name: tavana-config
+                  key: MAX_MEMORY_GB
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: tavana-config
+                  key: LOG_LEVEL
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: tavana-config
+                  key: AWS_REGION
+            - name: S3_USE_PATH_STYLE
+              valueFrom:
+                configMapKeyRef:
+                  name: tavana-config
+                  key: S3_USE_PATH_STYLE
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: tavana-secrets
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: tavana-secrets
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_ENDPOINT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: tavana-secrets
+                  key: AWS_ENDPOINT_URL
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+          readinessProbe:
+            tcpSocket:
+              port: 50053
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 50053
+            initialDelaySeconds: 10
+            periodSeconds: 10
+
