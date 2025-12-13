@@ -317,7 +317,17 @@ async fn handle_connection(
                     Ok(result) => {
                         let duration = start_time.elapsed().as_secs_f64();
                         metrics::record_query_completed(route_label, "success", duration);
-                        debug!("Query result: {} columns, {} rows (took {:.2}s)", result.columns.len(), result.rows.len(), duration);
+                        
+                        // Calculate and record actual data size
+                        // Approximate: rows * columns * avg_field_size (assume 50 bytes avg)
+                        let estimated_bytes = (result.rows.len() * result.columns.len() * 50) as u64;
+                        let estimated_mb = estimated_bytes as f64 / (1024.0 * 1024.0);
+                        metrics::record_data_scanned(estimated_bytes);
+                        metrics::record_actual_query_size(estimated_mb);
+                        metrics::record_estimation_accuracy(estimate.data_size_mb, estimated_mb);
+                        
+                        debug!("Query result: {} columns, {} rows, ~{:.2}MB (took {:.2}s)", 
+                            result.columns.len(), result.rows.len(), estimated_mb, duration);
                         send_query_result(&mut socket, result).await?;
                         debug!("Query result sent successfully");
                     }
