@@ -9,6 +9,11 @@ metadata:
 spec:
   # Start with 1 replica, HPA will scale 1-10 based on load
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0  # Never reduce capacity during rollout
+      maxSurge: 1
   selector:
     matchLabels:
       app: tavana-worker
@@ -17,6 +22,8 @@ spec:
       labels:
         app: tavana-worker
     spec:
+      # Graceful shutdown - allow queries to complete
+      terminationGracePeriodSeconds: 60
       containers:
         - name: worker
           image: tavana-worker:latest
@@ -29,26 +36,53 @@ spec:
               value: "4"
             - name: LOG_LEVEL
               value: "info"
+            # DuckDB memory and temp settings
+            - name: MAX_MEMORY_GB
+              value: "3"  # Leave 1GB headroom from 4Gi limit
+            - name: DUCKDB_TEMP_DIR
+              value: "/tmp/duckdb"
+            - name: DUCKDB_MAX_TEMP_SIZE
+              value: "10GB"
           envFrom:
             - configMapRef:
                 name: tavana-config
           resources:
             requests:
-              memory: "512Mi"
-              cpu: "250m"
+              memory: "1Gi"  # Increased for stability
+              cpu: "500m"
             limits:
               memory: "4Gi"
               cpu: "2"
+          # Startup probe: allow DuckDB to initialize (up to 60s)
+          startupProbe:
+            tcpSocket:
+              port: 50053
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12  # 12 * 5s = 60s max startup time
+          # Readiness probe: check if worker can accept queries
           readinessProbe:
             tcpSocket:
               port: 50053
             initialDelaySeconds: 5
             periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          # Liveness probe: increased timeout for heavy queries
           livenessProbe:
             tcpSocket:
               port: 50053
-            initialDelaySeconds: 10
-            periodSeconds: 20
+            initialDelaySeconds: 15
+            periodSeconds: 30  # Less frequent to avoid false positives during heavy queries
+            timeoutSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - name: duckdb-temp
+              mountPath: /tmp/duckdb
+      volumes:
+        - name: duckdb-temp
+          emptyDir:
+            sizeLimit: 10Gi
 ---
 apiVersion: v1
 kind: Service
@@ -61,3 +95,15 @@ spec:
   ports:
     - port: 50053
       targetPort: 50053
+---
+# PodDisruptionBudget for worker pool availability during HPA scaling
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker-pdb
+  namespace: tavana
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: tavana-worker
