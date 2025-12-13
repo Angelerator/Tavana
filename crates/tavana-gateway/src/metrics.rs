@@ -479,3 +479,53 @@ pub fn record_ephemeral_pod_failed() {
     EPHEMERAL_PODS_ACTIVE.dec();
 }
 
+/// Record data scanned in bytes
+pub fn record_data_scanned(bytes: u64) {
+    DATA_SCANNED_BYTES_TOTAL.inc_by(bytes as f64);
+}
+
+/// Record actual query size after execution
+pub fn record_actual_query_size(size_mb: f64) {
+    QUERY_ACTUAL_SIZE_MB.observe(size_mb);
+}
+
+/// Record estimation accuracy
+pub fn record_estimation_accuracy(estimated_mb: f64, actual_mb: f64) {
+    if estimated_mb > 0.0 {
+        let ratio = actual_mb / estimated_mb;
+        ESTIMATION_ACCURACY_RATIO.observe(ratio);
+    }
+}
+
+/// Record resource estimation details for ML training
+pub fn record_resource_estimation(
+    data_mb: f64, 
+    memory_mb: f64, 
+    cpu_millicores: f64, 
+    multiplier: f64,
+    has_join: bool,
+    has_agg: bool,
+    has_window: bool,
+) {
+    RESOURCE_ESTIMATE_DATA_MB.set(data_mb);
+    RESOURCE_ESTIMATE_MEMORY_MB.set(memory_mb);
+    RESOURCE_ESTIMATE_CPU_MILLICORES.set(cpu_millicores);
+    RESOURCE_ESTIMATE_MULTIPLIER.set(multiplier);
+    
+    RESOURCE_ALLOC_MEMORY_MB
+        .with_label_values(&[
+            if has_join { "true" } else { "false" },
+            if has_agg { "true" } else { "false" },
+            if has_window { "true" } else { "false" },
+        ])
+        .observe(memory_mb);
+    
+    RESOURCE_ALLOC_CPU_MILLICORES
+        .with_label_values(&[
+            if has_join { "true" } else { "false" },
+            if has_agg { "true" } else { "false" },
+            if has_window { "true" } else { "false" },
+        ])
+        .observe(cpu_millicores);
+}
+

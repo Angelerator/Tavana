@@ -133,13 +133,24 @@ data:
         },
         {
           "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
-          "description": "Total bytes of data scanned across all queries. Useful for understanding data throughput.",
-          "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }, "unit": "decbytes" } },
-          "gridPos": { "h": 4, "w": 5, "x": 19, "y": 1 },
+          "description": "Total bytes of data scanned across all queries since service started. Resets on restart.",
+          "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }, { "color": "green", "value": 1073741824 }, { "color": "yellow", "value": 10737418240 }] }, "unit": "decbytes" } },
+          "gridPos": { "h": 4, "w": 3, "x": 19, "y": 1 },
           "id": 9,
           "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
           "targets": [{ "expr": "tavana_data_scanned_bytes_total", "legendFormat": "Scanned", "refId": "A" }],
-          "title": "Total Data Scanned",
+          "title": "Total Data",
+          "type": "stat"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "description": "Total number of queries processed since service started, by status (success/error).",
+          "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }, "unit": "short" } },
+          "gridPos": { "h": 4, "w": 2, "x": 22, "y": 1 },
+          "id": 91,
+          "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+          "targets": [{ "expr": "sum(tavana_query_throughput_total)", "legendFormat": "Total", "refId": "A" }],
+          "title": "Queries",
           "type": "stat"
         },
         {
