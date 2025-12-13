@@ -105,9 +105,18 @@ impl DuckDbExecutor {
             params![],
         )?;
         
-        // Install and load extensions for cloud storage
-        connection.execute("INSTALL httpfs", params![])?;
-        connection.execute("LOAD httpfs", params![])?;
+        // Enable auto-install for httpfs extension (required for S3 access)
+        // Kind cluster should have network egress enabled
+        connection.execute("SET autoinstall_known_extensions = true", params![])?;
+        connection.execute("SET autoload_known_extensions = true", params![])?;
+        
+        // Pre-install httpfs for S3/HTTP support
+        if let Err(e) = connection.execute("INSTALL httpfs", params![]) {
+            tracing::warn!("Could not install httpfs: {} (might already be installed)", e);
+        }
+        if let Err(e) = connection.execute("LOAD httpfs", params![]) {
+            tracing::warn!("Could not load httpfs: {}", e);
+        }
         
         Ok(connection)
     }

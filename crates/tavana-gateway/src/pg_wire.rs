@@ -1,34 +1,53 @@
 //! PostgreSQL wire protocol implementation
 //!
 //! Enables Tableau, PowerBI, and other BI tools to connect natively.
-//! Forwards queries to DuckDB worker service for execution.
+//! Routes queries using the same logic as HTTP API:
+//! - Small queries → Worker Pool (HPA managed)
+//! - Large queries → Ephemeral Pods (right-sized, isolated)
 
+use crate::adaptive::AdaptiveController;
 use crate::auth::AuthService;
+use crate::k8s_client::K8sQueryClient;
+use crate::metrics;
+use crate::query_router::{QueryRouter, QueryTarget};
 use crate::worker_client::WorkerClient;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
 /// PostgreSQL wire protocol server
 ///
 /// Implements the PostgreSQL wire protocol (pg_wire) to allow BI tools like
-/// Tableau and PowerBI to connect directly. Queries are forwarded to the
-/// DuckDB worker service for execution.
+/// Tableau and PowerBI to connect directly. Routes queries using the same
+/// hybrid routing logic as the HTTP API.
 pub struct PgWireServer {
     addr: SocketAddr,
     auth_service: Arc<AuthService>,
     worker_client: Arc<WorkerClient>,
+    query_router: Arc<QueryRouter>,
+    k8s_client: Arc<K8sQueryClient>,
+    adaptive_controller: Arc<AdaptiveController>,
 }
 
 impl PgWireServer {
-    pub fn new(port: u16, auth_service: Arc<AuthService>, worker_addr: String) -> Self {
+    pub fn new(
+        port: u16,
+        auth_service: Arc<AuthService>,
+        worker_client: Arc<WorkerClient>,
+        query_router: Arc<QueryRouter>,
+        k8s_client: Arc<K8sQueryClient>,
+        adaptive_controller: Arc<AdaptiveController>,
+    ) -> Self {
         let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
-        let worker_client = Arc::new(WorkerClient::new(worker_addr));
         Self {
             addr,
             auth_service,
             worker_client,
+            query_router,
+            k8s_client,
+            adaptive_controller,
         }
     }
 
@@ -44,9 +63,19 @@ impl PgWireServer {
 
             let auth_service = self.auth_service.clone();
             let worker_client = self.worker_client.clone();
+            let query_router = self.query_router.clone();
+            let k8s_client = self.k8s_client.clone();
+            let adaptive_controller = self.adaptive_controller.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(socket, auth_service, worker_client).await {
+                if let Err(e) = handle_connection(
+                    socket,
+                    auth_service,
+                    worker_client,
+                    query_router,
+                    k8s_client,
+                    adaptive_controller,
+                ).await {
                     error!("Error handling PostgreSQL connection: {}", e);
                 }
             });
@@ -58,6 +87,9 @@ async fn handle_connection(
     mut socket: tokio::net::TcpStream,
     _auth_service: Arc<AuthService>,
     worker_client: Arc<WorkerClient>,
+    query_router: Arc<QueryRouter>,
+    k8s_client: Arc<K8sQueryClient>,
+    adaptive_controller: Arc<AdaptiveController>,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -233,15 +265,66 @@ async fn handle_connection(
                 let query = String::from_utf8_lossy(&query_buf).to_string();
                 info!("Executing query: {}", query);
 
-                // Execute query via worker
-                match execute_query_via_worker(&worker_client, &query, &user_id).await {
+                // Start timing the query execution
+                let start_time = Instant::now();
+
+                // Route query using the same logic as HTTP API
+                let estimate = query_router.route(&query).await;
+                info!(
+                    "PG Wire routing: {}MB data, threshold={}MB, target={:?}",
+                    estimate.data_size_mb, estimate.threshold_mb, estimate.target
+                );
+
+                // Execute based on routing decision
+                let result = match &estimate.target {
+                    QueryTarget::WorkerPool => {
+                        info!("PG Wire: Small query ({}MB < {}MB) → Worker Pool", estimate.data_size_mb, estimate.threshold_mb);
+                        execute_query_via_worker(&worker_client, &query, &user_id).await
+                    }
+                    QueryTarget::EphemeralPod { memory_mb, cpu_millicores } => {
+                        info!(
+                            "PG Wire: Large query ({}MB >= {}MB) → Ephemeral Pod ({}MB RAM, {}m CPU)",
+                            estimate.data_size_mb, estimate.threshold_mb, memory_mb, cpu_millicores
+                        );
+                        
+                        // Record ephemeral pod creation
+                        metrics::record_ephemeral_pod_created(*memory_mb as f64);
+                        
+                        if k8s_client.is_available() {
+                            execute_query_via_ephemeral_pod(
+                                &k8s_client,
+                                &worker_client,
+                                &adaptive_controller,
+                                &query,
+                                &user_id,
+                                *memory_mb,
+                                *cpu_millicores,
+                                start_time,
+                            ).await
+                        } else {
+                            warn!("K8s not available, falling back to worker pool");
+                            execute_query_via_worker(&worker_client, &query, &user_id).await
+                        }
+                    }
+                };
+
+                let route_label = match &estimate.target {
+                    QueryTarget::WorkerPool => "worker_pool",
+                    QueryTarget::EphemeralPod { .. } => "ephemeral_pod",
+                };
+
+                match result {
                     Ok(result) => {
-                        debug!("Query result: {} columns, {} rows", result.columns.len(), result.rows.len());
+                        let duration = start_time.elapsed().as_secs_f64();
+                        metrics::record_query_completed(route_label, "success", duration);
+                        debug!("Query result: {} columns, {} rows (took {:.2}s)", result.columns.len(), result.rows.len(), duration);
                         send_query_result(&mut socket, result).await?;
                         debug!("Query result sent successfully");
                     }
                     Err(e) => {
-                        warn!("Query execution failed: {}", e);
+                        let duration = start_time.elapsed().as_secs_f64();
+                        metrics::record_query_completed(route_label, "error", duration);
+                        warn!("Query execution failed (took {:.2}s): {}", duration, e);
                         send_error(&mut socket, &e.to_string()).await?;
                     }
                 }
@@ -289,7 +372,53 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Execute a query using the worker service
+/// Execute a query via ephemeral pod (for large queries)
+async fn execute_query_via_ephemeral_pod(
+    k8s_client: &K8sQueryClient,
+    worker_client: &WorkerClient,
+    _adaptive_controller: &AdaptiveController,
+    sql: &str,
+    user_id: &str,
+    memory_mb: u32,
+    cpu_millicores: u32,
+    start_time: Instant,
+) -> anyhow::Result<QueryExecutionResult> {
+    // Handle PostgreSQL-specific commands locally
+    if let Some(result) = handle_pg_specific_command(sql) {
+        return Ok(result);
+    }
+
+    info!("PG Wire: Creating ephemeral pod ({}MB RAM, {}m CPU) for query...", memory_mb, cpu_millicores);
+    
+    match k8s_client.execute_query(sql, user_id, memory_mb, cpu_millicores, 300).await {
+        Ok(result) => {
+            let elapsed = start_time.elapsed();
+            info!("PG Wire: Ephemeral pod query completed in {:.2}s", elapsed.as_secs_f64());
+            
+            // Record ephemeral pod completion
+            metrics::record_ephemeral_pod_completed(5.0, elapsed.as_secs_f64());
+            
+            // Convert K8s result to QueryExecutionResult
+            let row_count = result.rows.len();
+            Ok(QueryExecutionResult {
+                columns: result.columns,
+                rows: result.rows,
+                row_count,
+                command_tag: None,
+            })
+        }
+        Err(e) => {
+            warn!("PG Wire: Ephemeral pod failed ({}), falling back to worker pool", e);
+            // Record ephemeral pod failure and fall back
+            metrics::record_ephemeral_pod_failed();
+            
+            // Fallback to worker pool
+            execute_query_via_worker(worker_client, sql, user_id).await
+        }
+    }
+}
+
+/// Execute a query using the worker service (for small queries)
 async fn execute_query_via_worker(
     worker_client: &WorkerClient,
     sql: &str,
@@ -300,9 +429,6 @@ async fn execute_query_via_worker(
         return Ok(result);
     }
 
-    // For pg_wire connections, always use worker pool
-    // Full hybrid routing with ephemeral pods is handled via HTTP API
-    // This simplifies the synchronous pg_wire protocol handling
     info!("PG Wire: Executing query via worker pool");
     execute_via_worker_pool(worker_client, sql, user_id).await
 }
@@ -326,6 +452,9 @@ async fn execute_via_worker_pool(
         }),
         Err(e) => {
             warn!("Worker pool unavailable ({}), using local execution", e);
+            // Note: The caller (handle_connection) already records metrics,
+            // but if fallback is used, it will show up with "success" status
+            // if the fallback succeeds
             execute_local_fallback(sql).await
         }
     }

@@ -1,0 +1,39 @@
+                              # Kind cluster configuration with all Tavana ports exposed
+# Using higher port numbers to avoid conflicts with system services
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: tavana
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # Gateway - HTTP API (28080 to avoid 8080 conflicts)
+      - containerPort: 30080
+        hostPort: 28080
+        protocol: TCP
+      # Gateway - PostgreSQL Wire Protocol (25432 to avoid 5432 conflicts)
+      - containerPort: 30432
+        hostPort: 25432
+        protocol: TCP
+      # Gateway - Arrow Flight SQL
+      - containerPort: 30815
+        hostPort: 28815
+        protocol: TCP
+      # MinIO S3 API (29000 to avoid 9000 conflicts)
+      - containerPort: 30900
+        hostPort: 29000
+        protocol: TCP
+      # MinIO Console (29001 to avoid 9001 conflicts)
+      - containerPort: 30901
+        hostPort: 29001
+        protocol: TCP
+      # Grafana Dashboard
+      - containerPort: 30300
+        hostPort: 23001
+        protocol: TCP
+      # Prometheus Metrics (29090 to avoid 9090 conflicts)
+      - containerPort: 30090
+        hostPort: 29090
+        protocol: TCP
+  - role: worker
+  - role: worker
+
