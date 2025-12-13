@@ -4,7 +4,12 @@ metadata:
   name: gateway
   namespace: tavana
 spec:
-  replicas: 1
+  replicas: 2  # Run 2 replicas for high availability
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
   selector:
     matchLabels:
       app: tavana-gateway
@@ -14,6 +19,16 @@ spec:
         app: tavana-gateway
     spec:
       serviceAccountName: tavana-gateway
+      # Spread across nodes for better availability
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: tavana-gateway
+      # Graceful shutdown
+      terminationGracePeriodSeconds: 30
       containers:
         - name: gateway
           image: tavana-gateway:latest
@@ -36,21 +51,61 @@ spec:
               value: "0.05"  # 50MB minimum threshold
             - name: MAX_THRESHOLD_GB
               value: "0.5"   # 500MB maximum threshold
+            - name: LOG_LEVEL
+              value: "info"
           volumeMounts:
             - name: adaptive-config
               mountPath: /etc/tavana
               readOnly: true
           resources:
             requests:
-              memory: "128Mi"
-              cpu: "100m"
+              memory: "256Mi"
+              cpu: "200m"
             limits:
-              memory: "512Mi"
-              cpu: "1"
+              memory: "1Gi"  # Increased for handling large query results
+              cpu: "2"
+          # Startup probe: gives the service time to initialize (up to 60s)
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12  # 12 * 5s = 60s max startup time
+          # Readiness probe: determines if pod can receive traffic
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+          # Liveness probe: restarts pod if unresponsive
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
       volumes:
         - name: adaptive-config
           configMap:
             name: tavana-adaptive-config
+---
+# PodDisruptionBudget ensures at least 1 gateway is always available
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway-pdb
+  namespace: tavana
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: tavana-gateway
 ---
 apiVersion: v1
 kind: Service
