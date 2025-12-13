@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use tavana_common::proto;
 use tokio::sync::RwLock;
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
@@ -33,11 +33,23 @@ impl WorkerClient {
             }
         }
 
-        // Need to connect
+        // Connect with increased message size limits
+        // Note: HPA worker pool handles small/medium queries only (up to threshold)
+        // Large queries (10TB+) go to ephemeral pods, not here
         info!("Connecting to worker at {}", self.worker_addr);
-        let client =
-            proto::query_service_client::QueryServiceClient::connect(self.worker_addr.clone())
-                .await?;
+        const MAX_MESSAGE_SIZE: usize = 512 * 1024 * 1024; // 512MB - sufficient for HPA pool queries
+        
+        // HPA pool timeout: 10 minutes max (small/medium queries only)
+        // Large queries should be routed to ephemeral pods instead
+        let channel = Channel::from_shared(self.worker_addr.clone())?
+            .timeout(std::time::Duration::from_secs(600)) // 10 minutes
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .connect()
+            .await?;
+            
+        let client = proto::query_service_client::QueryServiceClient::new(channel)
+            .max_decoding_message_size(MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_MESSAGE_SIZE);
 
         // Cache the client
         {

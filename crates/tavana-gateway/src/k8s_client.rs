@@ -3,9 +3,9 @@
 //! Creates DuckDBQuery CRDs for queries >= 6GB threshold
 
 use anyhow::Result;
-use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use k8s_openapi::api::core::v1::Pod;
 use kube::{
-    api::{Api, DeleteParams, PostParams},
+    api::{Api, DeleteParams, LogParams, PostParams},
     Client, CustomResource,
 };
 use schemars::JsonSchema;
@@ -123,7 +123,7 @@ impl K8sQueryClient {
 
         // Create the CR
         let pp = PostParams::default();
-        let created = queries.create(&pp, &query_cr).await?;
+        let _created = queries.create(&pp, &query_cr).await?;
         info!("Created DuckDBQuery CR: {}", query_id);
 
         // Wait for completion
@@ -139,50 +139,115 @@ impl K8sQueryClient {
     }
 
     /// Wait for the query to complete and get results
+    /// 
+    /// This watches the pod directly instead of relying on the operator's CR status update,
+    /// which can be slow (5s reconciliation interval).
     async fn wait_for_completion(
         &self,
         queries: &Api<DuckDBQuery>,
         query_id: &str,
         timeout_seconds: u32,
     ) -> Result<EphemeralQueryResult> {
+        let client = self.client.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Kubernetes not available"))?;
+        
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(timeout_seconds as u64);
+        let pod_name = format!("duckdb-worker-{}", query_id);
+        let pods: Api<Pod> = Api::namespaced(client.clone(), &self.namespace);
+
+        info!("Waiting for pod {} to complete...", pod_name);
 
         loop {
             if start.elapsed() > timeout {
                 return Err(anyhow::anyhow!("Query timeout after {} seconds", timeout_seconds));
             }
 
-            match queries.get(query_id).await {
-                Ok(query) => {
-                    if let Some(status) = &query.status {
-                        match status.phase.as_str() {
-                            "Completed" => {
-                                info!("Query {} completed successfully", query_id);
-                                // Parse result from status
-                                if let Some(result_json) = &status.result {
-                                    return self.parse_result(result_json);
-                                } else {
-                                    return Ok(EphemeralQueryResult {
-                                        columns: vec![],
-                                        rows: vec![],
-                                        row_count: 0,
-                                    });
+            // Watch the pod directly for faster completion detection
+            match pods.get(&pod_name).await {
+                Ok(pod) => {
+                    if let Some(status) = &pod.status {
+                        let phase = status.phase.as_deref().unwrap_or("Unknown");
+                        
+                        match phase {
+                            "Succeeded" => {
+                                info!("Pod {} completed successfully, reading logs...", pod_name);
+                                
+                                // Read pod logs directly to get the result
+                                match pods.logs(&pod_name, &LogParams::default()).await {
+                                    Ok(logs) => {
+                                        info!("Pod logs length: {} bytes", logs.len());
+                                        
+                                        // Debug: show first few lines of logs
+                                        for (i, line) in logs.lines().enumerate().take(5) {
+                                            debug!("Log line {}: {} chars, starts_with='{}...'", 
+                                                i, line.len(), &line.chars().take(50).collect::<String>());
+                                        }
+                                        
+                                        // Find the JSON result line (starts with {"columns")
+                                        // Note: Worker outputs JSON via println() which should be clean
+                                        if let Some(json_line) = logs.lines()
+                                            .find(|line| line.trim().starts_with(r#"{"columns"#))
+                                        {
+                                            info!("Found result JSON: {} bytes", json_line.len());
+                                            return self.parse_result(json_line.trim());
+                                        }
+                                        
+                                        // Try to find any JSON line with "columns" key
+                                        if let Some(json_line) = logs.lines()
+                                            .find(|line| line.trim().starts_with('{') && line.contains(r#""columns""#))
+                                        {
+                                            info!("Found alternative JSON: {} bytes", json_line.len());
+                                            return self.parse_result(json_line.trim());
+                                        }
+                                        
+                                        warn!("No JSON result found in pod logs, sample: {}", 
+                                            logs.lines().last().unwrap_or("(empty)").chars().take(100).collect::<String>());
+                                        return Ok(EphemeralQueryResult {
+                                            columns: vec![],
+                                            rows: vec![],
+                                            row_count: 0,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to read pod logs: {}", e);
+                                        return Err(anyhow::anyhow!("Failed to read pod logs: {}", e));
+                                    }
                                 }
                             }
                             "Failed" => {
-                                let error = status.error.clone().unwrap_or_else(|| "Unknown error".to_string());
-                                error!("Query {} failed: {}", query_id, error);
-                                return Err(anyhow::anyhow!("Query failed: {}", error));
+                                // Check container status for error message
+                                let error_msg = status.container_statuses
+                                    .as_ref()
+                                    .and_then(|cs| cs.first())
+                                    .and_then(|c| c.state.as_ref())
+                                    .and_then(|s| s.terminated.as_ref())
+                                    .and_then(|t| t.message.clone())
+                                    .unwrap_or_else(|| "Pod failed".to_string());
+                                
+                                error!("Pod {} failed: {}", pod_name, error_msg);
+                                return Err(anyhow::anyhow!("Query pod failed: {}", error_msg));
                             }
-                            phase => {
-                                debug!("Query {} phase: {}", query_id, phase);
+                            _ => {
+                                debug!("Pod {} phase: {}", pod_name, phase);
+                            }
+                        }
+                    }
+                }
+                Err(kube::Error::Api(err)) if err.code == 404 => {
+                    // Pod not found yet, check CR status as fallback
+                    debug!("Pod {} not found yet, checking CR...", pod_name);
+                    if let Ok(query) = queries.get(query_id).await {
+                        if let Some(status) = &query.status {
+                            if status.phase == "Failed" {
+                                let error = status.error.clone().unwrap_or_else(|| "Unknown error".to_string());
+                                return Err(anyhow::anyhow!("Query failed: {}", error));
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("Error getting query status: {}", e);
+                    warn!("Error getting pod status: {}", e);
                 }
             }
 

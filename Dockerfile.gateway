@@ -1,5 +1,5 @@
-# Simple Gateway Dockerfile - using latest Rust that supports edition2024
-FROM rust:1.85-bookworm AS builder
+# Simple Gateway Dockerfile - using latest Rust
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /app
 

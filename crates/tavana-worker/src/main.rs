@@ -19,17 +19,21 @@ use tracing::{info, error};
 
 #[derive(Parser, Debug)]
 #[command(name = "tavana-worker")]
-#[command(about = "Tavana DuckDB Worker Service")]
+#[command(about = "Tavana DuckDB Worker Service - HPA pool for small/medium queries")]
 struct Args {
     /// gRPC server port
     #[arg(long, env = "GRPC_PORT", default_value = "50053")]
     grpc_port: u16,
 
     /// Maximum memory in GB for DuckDB
+    /// DuckDB recommends 1-4 GB per thread:
+    /// - Aggregation-heavy: 1-2 GB/thread
+    /// - Join-heavy: 3-4 GB/thread
+    /// Default: 8GB (for 4 threads with 2GB each)
     #[arg(long, env = "MAX_MEMORY_GB", default_value = "8")]
     max_memory_gb: u64,
 
-    /// Number of threads for DuckDB
+    /// Number of threads for DuckDB (defaults to all CPUs)
     #[arg(long, env = "THREADS")]
     threads: Option<u32>,
 
@@ -41,13 +45,22 @@ struct Args {
     #[arg(long, env = "LOG_LEVEL", default_value = "info")]
     log_level: String,
     
-    /// One-shot mode: execute query and exit
+    /// One-shot mode: execute query and exit (for ephemeral pods)
     #[arg(long, env = "ONE_SHOT", default_value = "false")]
     one_shot: bool,
     
     /// Connection pool size (parallel queries per worker)
+    /// For HPA workers handling multiple small queries
     #[arg(long, env = "POOL_SIZE", default_value = "4")]
     pool_size: usize,
+    
+    /// Temp directory for out-of-core processing (spill to disk)
+    #[arg(long, env = "DUCKDB_TEMP_DIR", default_value = "/tmp/duckdb")]
+    temp_dir: String,
+    
+    /// Max temp directory size for spilling (e.g., "100GB", "500GB")
+    #[arg(long, env = "DUCKDB_MAX_TEMP_SIZE", default_value = "100GB")]
+    max_temp_size: String,
 }
 
 #[tokio::main]
@@ -94,9 +107,15 @@ async fn main() -> anyhow::Result<()> {
     
     info!("Tavana Worker listening on {}", addr);
 
-    // Start gRPC server
+    // Start gRPC server with increased message size limits for large results
+    const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
+    
     Server::builder()
-        .add_service(QueryServiceServer::new(query_service))
+        .add_service(
+            QueryServiceServer::new(query_service)
+                .max_decoding_message_size(MAX_MESSAGE_SIZE)
+                .max_encoding_message_size(MAX_MESSAGE_SIZE)
+        )
         .serve_with_shutdown(addr, async {
             tokio::signal::ctrl_c().await.ok();
             info!("Shutting down Tavana Worker");
@@ -137,9 +156,41 @@ async fn run_one_shot(args: Args, query_sql: Option<String>) -> anyhow::Result<(
             info!("  Batches: {}", batches.len());
             info!("  Time: {:?}", elapsed);
             
-            // Print summary to stdout
-            println!("{{\"status\": \"success\", \"rows\": {}, \"batches\": {}, \"elapsed_ms\": {}}}", 
-                total_rows, batches.len(), elapsed.as_millis());
+            // Convert Arrow batches to JSON format expected by gateway
+            // Gateway expects: {"columns": [...], "column_types": [...], "rows": [[...], ...]}
+            if let Some(first_batch) = batches.first() {
+                let schema = first_batch.schema();
+                let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+                let column_types: Vec<String> = schema.fields().iter()
+                    .map(|f| format!("{:?}", f.data_type()))
+                    .collect();
+                
+                // Convert rows to strings (limited for one-shot mode)
+                let mut rows: Vec<Vec<String>> = Vec::new();
+                for batch in &batches {
+                    for row_idx in 0..batch.num_rows().min(1000) { // Limit to 1000 rows
+                        let mut row: Vec<String> = Vec::new();
+                        for col_idx in 0..batch.num_columns() {
+                            let col = batch.column(col_idx);
+                            // Use duckdb's arrow display utility
+                            let val = duckdb::arrow::util::display::array_value_to_string(col, row_idx)
+                                .unwrap_or_else(|_| "NULL".to_string());
+                            row.push(val);
+                        }
+                        rows.push(row);
+                    }
+                }
+                
+                // Use serde_json for proper JSON serialization
+                let result = serde_json::json!({
+                    "columns": columns,
+                    "column_types": column_types,
+                    "rows": rows
+                });
+                println!("{}", result);
+            } else {
+                println!(r#"{{"columns":[],"column_types":[],"rows":[]}}"#);
+            }
             
             Ok(())
         }

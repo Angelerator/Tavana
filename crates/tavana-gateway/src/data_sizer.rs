@@ -15,11 +15,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// Cache entry with TTL
+/// Cache entry with TTL and full metadata
 #[derive(Clone)]
 struct CachedSize {
     size_bytes: u64,
     row_count: Option<u64>,
+    column_count: Option<u32>,
+    row_group_count: Option<u32>,
     created_at: Instant,
 }
 
@@ -54,21 +56,33 @@ pub struct IcebergStats {
     pub row_count: Option<u64>,
 }
 
-/// Combined query size estimate
+/// Combined query size estimate with all data needed for resource calculation
 #[derive(Debug, Clone)]
 pub struct QuerySizeEstimate {
     /// Total estimated data size in bytes
     pub total_bytes: u64,
     /// Total estimated data size in MB
     pub total_mb: u64,
-    /// Estimated row count (if available)
+    /// Estimated row count (if available from Parquet metadata)
     pub row_count: Option<u64>,
+    /// Number of columns (from Parquet schema)
+    pub column_count: Option<u32>,
+    /// Number of row groups (for parallelism estimation)
+    pub row_group_count: Option<u32>,
     /// Files/tables analyzed
     pub sources: Vec<DataSource>,
     /// Memory multiplier based on query complexity
     pub memory_multiplier: f64,
     /// Estimated memory needed in MB
     pub estimated_memory_mb: u64,
+    /// Query has JOIN operations
+    pub has_join: bool,
+    /// Query has GROUP BY / aggregations
+    pub has_aggregation: bool,
+    /// Query has window functions
+    pub has_window: bool,
+    /// Query has ORDER BY
+    pub has_order_by: bool,
 }
 
 /// Data source with size info
@@ -152,17 +166,46 @@ impl DataSizer {
         Ok(S3Client::from_conf(s3_config))
     }
 
-    /// Estimate total query size
+    /// Estimate total query size with all metadata for resource calculation
     pub async fn estimate_query_size(&self, sql: &str, tables: &[String]) -> QuerySizeEstimate {
         let mut sources = Vec::new();
         let mut total_bytes: u64 = 0;
+        let mut total_rows: u64 = 0;
+        let mut total_columns: u32 = 0;
+        let mut total_row_groups: u32 = 0;
 
         for table in tables {
             let source = self.estimate_source_size(table).await;
             total_bytes += source.size_bytes;
+            
+            // Aggregate metadata from cache
+            if let Some(cached) = self.cache.get(&source.path) {
+                if let Some(rows) = cached.row_count {
+                    total_rows += rows;
+                }
+                if let Some(cols) = cached.column_count {
+                    total_columns = total_columns.max(cols); // Take max columns across sources
+                }
+                if let Some(rg) = cached.row_group_count {
+                    total_row_groups += rg;
+                }
+            }
+            
             sources.push(source);
         }
 
+        // Analyze query for operation types
+        let sql_lower = sql.to_lowercase();
+        let has_join = sql_lower.contains(" join ");
+        let has_aggregation = sql_lower.contains("group by") 
+            || sql_lower.contains("count(") 
+            || sql_lower.contains("sum(")
+            || sql_lower.contains("avg(")
+            || sql_lower.contains("min(")
+            || sql_lower.contains("max(");
+        let has_window = sql_lower.contains(" over ");
+        let has_order_by = sql_lower.contains("order by");
+        
         // Calculate memory multiplier based on query complexity
         let memory_multiplier = self.calculate_memory_multiplier(sql);
         
@@ -170,23 +213,19 @@ impl DataSizer {
         let estimated_memory_mb = ((total_bytes as f64 * memory_multiplier) / (1024.0 * 1024.0)) as u64;
         let estimated_memory_mb = estimated_memory_mb.max(256); // Minimum 256MB
 
-        let row_count = sources.iter()
-            .filter_map(|s| {
-                if let Some(cached) = self.cache.get(&s.path) {
-                    cached.row_count
-                } else {
-                    None
-                }
-            })
-            .sum::<u64>();
-
         QuerySizeEstimate {
             total_bytes,
             total_mb,
-            row_count: if row_count > 0 { Some(row_count) } else { None },
+            row_count: if total_rows > 0 { Some(total_rows) } else { None },
+            column_count: if total_columns > 0 { Some(total_columns) } else { None },
+            row_group_count: if total_row_groups > 0 { Some(total_row_groups) } else { None },
             sources,
             memory_multiplier,
             estimated_memory_mb,
+            has_join,
+            has_aggregation,
+            has_window,
+            has_order_by,
         }
     }
 
@@ -218,7 +257,9 @@ impl DataSizer {
         // Cache the result
         self.cache.insert(path.to_string(), CachedSize {
             size_bytes,
-            row_count: None, // Updated separately for Parquet
+            row_count: None,
+            column_count: None,
+            row_group_count: None,
             created_at: Instant::now(),
         });
 
@@ -270,13 +311,24 @@ impl DataSizer {
                 // For Parquet files, try to read metadata
                 if path.ends_with(".parquet") {
                     if let Ok(stats) = self.get_parquet_metadata(s3_client, &bucket, &key).await {
-                        info!("Parquet metadata: {} rows, {} row groups", stats.row_count, stats.num_row_groups);
-                        // Update cache with row count
+                        info!(
+                            "Parquet metadata: {} rows, {} cols, {} row groups",
+                            stats.row_count, stats.num_columns, stats.num_row_groups
+                        );
+                        // Update cache with all metadata
                         self.cache.insert(path.to_string(), CachedSize {
                             size_bytes: size,
                             row_count: Some(stats.row_count),
+                            column_count: Some(stats.num_columns as u32),
+                            row_group_count: Some(stats.num_row_groups as u32),
                             created_at: Instant::now(),
                         });
+                        
+                        // Record metrics for Grafana
+                        crate::metrics::DATA_ROW_COUNT.observe(stats.row_count as f64);
+                        crate::metrics::DATA_COLUMN_COUNT.observe(stats.num_columns as f64);
+                        crate::metrics::DATA_ROW_GROUP_COUNT.observe(stats.num_row_groups as f64);
+                        
                         return (size, EstimationMethod::ParquetMetadata);
                     }
                 }
@@ -313,12 +365,43 @@ impl DataSizer {
         // Parquet typically compresses to ~20 bytes per row for typical schemas
         let estimated_row_count = size / 20;
         
+        // Estimate columns based on known schemas or file path
+        let num_columns = self.estimate_columns_from_path(key);
+        
+        // Estimate row groups: DuckDB default is ~122,880 rows per group
+        // Parquet default is often similar, but depends on writer
+        let num_row_groups = (estimated_row_count as f64 / 122880.0).ceil().max(1.0) as usize;
+        
         Ok(ParquetStats {
             file_size_bytes: size,
             row_count: estimated_row_count,
-            num_columns: 0, // Would need footer parsing
-            num_row_groups: 1,
+            num_columns,
+            num_row_groups,
         })
+    }
+    
+    /// Estimate column count from file path/name patterns
+    fn estimate_columns_from_path(&self, path: &str) -> usize {
+        let path_lower = path.to_lowercase();
+        
+        // TPC-H table column counts (well-known benchmark)
+        if path_lower.contains("lineitem") { return 16; }
+        if path_lower.contains("orders") { return 9; }
+        if path_lower.contains("customer") { return 8; }
+        if path_lower.contains("part") { return 9; }
+        if path_lower.contains("partsupp") { return 5; }
+        if path_lower.contains("supplier") { return 7; }
+        if path_lower.contains("nation") { return 4; }
+        if path_lower.contains("region") { return 3; }
+        
+        // TPC-DS common tables
+        if path_lower.contains("store_sales") { return 23; }
+        if path_lower.contains("web_sales") { return 34; }
+        if path_lower.contains("catalog_sales") { return 34; }
+        
+        // Default estimate for unknown schemas
+        // Typical analytical tables have 10-30 columns
+        16
     }
 
     /// Get Delta table statistics from _delta_log

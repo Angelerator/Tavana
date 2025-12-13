@@ -68,7 +68,9 @@ spec:
             - name: GF_AUTH_ANONYMOUS_ENABLED
               value: "true"
             - name: GF_AUTH_ANONYMOUS_ORG_ROLE
-              value: "Viewer"
+              value: "Admin"
+            - name: GF_AUTH_DISABLE_LOGIN_FORM
+              value: "false"
           volumeMounts:
             - name: datasources
               mountPath: /etc/grafana/provisioning/datasources
