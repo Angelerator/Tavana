@@ -148,13 +148,21 @@ async fn execute_via_worker_pool(
             // Record success metrics
             metrics::record_query_completed("worker_pool", "success", elapsed.as_secs_f64());
             
+            // Record data size metrics
+            // Estimate actual size from row count * avg row size (assume 100 bytes per row)
+            let estimated_bytes = result.total_rows as u64 * 100;
+            let actual_size_mb = (estimated_bytes as f64) / (1024.0 * 1024.0);
+            metrics::record_data_scanned(estimated_bytes);
+            metrics::record_actual_query_size(actual_size_mb);
+            if let Some(est) = estimated_size_mb {
+                metrics::record_estimation_accuracy(est as f64, actual_size_mb);
+            }
+            
             // Record to history for EMA calculation
-            // Estimate actual size from row count * avg row size
-            let actual_size_mb = (result.total_rows as u64 * 100) / (1024 * 1024); // Rough estimate
             adaptive_controller.get_history().record_query(QueryRecord {
                 timestamp: Utc::now(),
                 estimated_size_mb: estimated_size_mb.unwrap_or(0),
-                actual_size_mb,
+                actual_size_mb: actual_size_mb as u64,
                 execution_time_ms: elapsed.as_millis() as u64,
                 was_ephemeral: false,
                 success: true,
@@ -220,12 +228,20 @@ async fn execute_via_ephemeral_pod(
             metrics::record_query_completed("ephemeral_pod", "success", elapsed.as_secs_f64());
             metrics::record_ephemeral_pod_completed(5.0, elapsed.as_secs_f64()); // Assume 5s startup
             
+            // Record data size metrics
+            let estimated_bytes = result.row_count as u64 * 100; // Assume 100 bytes per row
+            let actual_size_mb = (estimated_bytes as f64) / (1024.0 * 1024.0);
+            metrics::record_data_scanned(estimated_bytes);
+            metrics::record_actual_query_size(actual_size_mb);
+            if let Some(est) = estimated_size_mb {
+                metrics::record_estimation_accuracy(est as f64, actual_size_mb);
+            }
+            
             // Record to history for EMA
-            let actual_size_mb = (result.row_count as u64 * 100) / (1024 * 1024);
             adaptive_controller.get_history().record_query(QueryRecord {
                 timestamp: Utc::now(),
                 estimated_size_mb: estimated_size_mb.unwrap_or(0),
-                actual_size_mb,
+                actual_size_mb: actual_size_mb as u64,
                 execution_time_ms: elapsed.as_millis() as u64,
                 was_ephemeral: true,
                 success: true,
