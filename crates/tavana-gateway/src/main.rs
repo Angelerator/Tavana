@@ -82,6 +82,14 @@ struct Args {
     #[arg(long, env = "BASE_THRESHOLD_GB", default_value = "2")]
     base_threshold_gb: f64,
     
+    /// Minimum threshold in GB (after adaptive factors)
+    #[arg(long, env = "MIN_THRESHOLD_GB", default_value = "0.5")]
+    min_threshold_gb: f64,
+    
+    /// Maximum threshold in GB (after adaptive factors)
+    #[arg(long, env = "MAX_THRESHOLD_GB", default_value = "20")]
+    max_threshold_gb: f64,
+    
     /// Timezone for time-based patterns (e.g., "UTC", "America/New_York", "Europe/London")
     #[arg(long, env = "TIMEZONE", default_value = "UTC")]
     timezone: String,
@@ -133,10 +141,13 @@ async fn main() -> anyhow::Result<()> {
     let adaptive_config = AdaptiveConfig {
         timezone: args.timezone.clone(),
         base_threshold_gb: args.base_threshold_gb,
+        min_threshold_gb: args.min_threshold_gb,
+        max_threshold_gb: args.max_threshold_gb,
         base_hpa_min: args.base_hpa_min,
         base_hpa_max: args.base_hpa_max,
         ..Default::default()
     };
+    info!("  Min/Max threshold: {}GB / {}GB", args.min_threshold_gb, args.max_threshold_gb);
     info!("  Timezone: {}", args.timezone);
     let adaptive_controller = Arc::new(
         AdaptiveController::new(adaptive_config, args.namespace.clone()).await
@@ -154,12 +165,29 @@ async fn main() -> anyhow::Result<()> {
     ));
     info!("QueryRouter initialized with real estimation");
 
-    // Start PostgreSQL wire protocol server
+    // Create worker client (shared between pg_wire and HTTP API)
+    let pg_worker_client = Arc::new(WorkerClient::new(args.worker_addr.clone()));
+    
+    // Create K8s client for ephemeral pods (shared)
+    let k8s_client = Arc::new(k8s_client::K8sQueryClient::new(args.namespace.clone()).await);
+    info!("K8s ephemeral pods: {}", if k8s_client.is_available() { "enabled" } else { "disabled (not in cluster)" });
+
+    // Start PostgreSQL wire protocol server with full hybrid routing support
     let pg_auth = auth_service.clone();
     let pg_port = args.pg_port;
-    let worker_addr = args.worker_addr.clone();
+    let pg_worker = pg_worker_client.clone();
+    let pg_router = query_router.clone();
+    let pg_k8s = k8s_client.clone();
+    let pg_adaptive = adaptive_controller.clone();
     let pg_handle = tokio::spawn(async move {
-        let server = PgWireServer::new(pg_port, pg_auth, worker_addr);
+        let server = PgWireServer::new(
+            pg_port,
+            pg_auth,
+            pg_worker,
+            pg_router,
+            pg_k8s,
+            pg_adaptive,
+        );
         if let Err(e) = server.start().await {
             tracing::error!("PostgreSQL server error: {}", e);
         }
@@ -175,15 +203,9 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Create worker client for HTTP API
-    let http_worker_client = Arc::new(WorkerClient::new(args.worker_addr.clone()));
-    
-    // Create K8s client for ephemeral pods
-    let k8s_client = Arc::new(k8s_client::K8sQueryClient::new(args.namespace.clone()).await);
-    info!("K8s ephemeral pods: {}", if k8s_client.is_available() { "enabled" } else { "disabled (not in cluster)" });
-    
+    // HTTP API uses the same shared clients
     let app_state = AppState {
-        worker_client: http_worker_client,
+        worker_client: pg_worker_client,
         k8s_client,
         query_router,
         adaptive_controller,
@@ -202,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/ready", get(ready))
         .route("/", get(root))
         .route("/api/query", post(execute_query))
+        .route("/api/export", post(http_api::export_query))  // For 10TB+ exports to S3
         .route("/api/adaptive", get(adaptive_state))
         .route("/metrics", get(prometheus_metrics))
         .layer(cors)

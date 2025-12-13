@@ -251,6 +251,109 @@ pub static CACHE_HITS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// RESOURCE ESTIMATION METRICS (for ML training data collection)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Last resource estimate: memory in MB
+pub static RESOURCE_ESTIMATE_MEMORY_MB: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_resource_estimate_memory_mb",
+        "Last calculated memory estimate in MB for ephemeral pod"
+    )
+    .unwrap()
+});
+
+/// Last resource estimate: CPU in millicores
+pub static RESOURCE_ESTIMATE_CPU_MILLICORES: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_resource_estimate_cpu_millicores",
+        "Last calculated CPU estimate in millicores for ephemeral pod"
+    )
+    .unwrap()
+});
+
+/// Last resource estimate: data size in MB
+pub static RESOURCE_ESTIMATE_DATA_MB: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_resource_estimate_data_mb",
+        "Last estimated data size in MB"
+    )
+    .unwrap()
+});
+
+/// Last resource estimate: memory multiplier
+pub static RESOURCE_ESTIMATE_MULTIPLIER: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_resource_estimate_multiplier",
+        "Last calculated memory multiplier from query complexity"
+    )
+    .unwrap()
+});
+
+/// Resource allocation histogram: memory by query type
+pub static RESOURCE_ALLOC_MEMORY_MB: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "tavana_resource_alloc_memory_mb",
+        "Memory allocated to queries by operation type",
+        &["has_join", "has_agg", "has_window"],
+        vec![1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0, 131072.0]
+    )
+    .unwrap()
+});
+
+/// Resource allocation histogram: CPU by query type
+pub static RESOURCE_ALLOC_CPU_MILLICORES: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "tavana_resource_alloc_cpu_millicores",
+        "CPU allocated to queries by operation type",
+        &["has_join", "has_agg", "has_window"],
+        vec![1000.0, 2000.0, 4000.0, 8000.0, 16000.0, 32000.0, 64000.0, 128000.0]
+    )
+    .unwrap()
+});
+
+/// Data characteristics: row count
+pub static DATA_ROW_COUNT: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "tavana_data_row_count",
+        "Row count from data sources",
+        vec![1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0, 100000000.0, 1000000000.0]
+    )
+    .unwrap()
+});
+
+/// Data characteristics: column count
+pub static DATA_COLUMN_COUNT: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "tavana_data_column_count",
+        "Column count from data sources",
+        vec![5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0]
+    )
+    .unwrap()
+});
+
+/// Data characteristics: row group count
+pub static DATA_ROW_GROUP_COUNT: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "tavana_data_row_group_count",
+        "Row group count from Parquet files",
+        vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]
+    )
+    .unwrap()
+});
+
+/// Actual vs estimated resource ratio (for ML model accuracy tracking)
+pub static RESOURCE_ACTUAL_VS_ESTIMATED: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "tavana_resource_actual_vs_estimated",
+        "Ratio of actual to estimated resources",
+        &["resource_type"],
+        vec![0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 5.0]
+    )
+    .unwrap()
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -279,9 +382,20 @@ pub fn init_metrics() {
     let _ = &*ESTIMATION_METHOD_TOTAL;
     let _ = &*S3_HEAD_LATENCY_SECONDS;
     let _ = &*CACHE_HITS_TOTAL;
+    // Resource estimation metrics
+    let _ = &*RESOURCE_ESTIMATE_MEMORY_MB;
+    let _ = &*RESOURCE_ESTIMATE_CPU_MILLICORES;
+    let _ = &*RESOURCE_ESTIMATE_DATA_MB;
+    let _ = &*RESOURCE_ESTIMATE_MULTIPLIER;
+    let _ = &*RESOURCE_ALLOC_MEMORY_MB;
+    let _ = &*RESOURCE_ALLOC_CPU_MILLICORES;
+    let _ = &*DATA_ROW_COUNT;
+    let _ = &*DATA_COLUMN_COUNT;
+    let _ = &*DATA_ROW_GROUP_COUNT;
+    let _ = &*RESOURCE_ACTUAL_VS_ESTIMATED;
 
     // Set initial values
-    ADAPTIVE_THRESHOLD_MB.set(6144.0); // 6GB default
+    ADAPTIVE_THRESHOLD_MB.set(2048.0); // 2GB default
     ADAPTIVE_HPA_MIN.set(2.0);
     ADAPTIVE_HPA_MAX.set(10.0);
 }
@@ -358,5 +472,10 @@ pub fn record_ephemeral_pod_completed(startup_secs: f64, duration_secs: f64) {
     EPHEMERAL_PODS_ACTIVE.dec();
     EPHEMERAL_POD_STARTUP_SECONDS.observe(startup_secs);
     EPHEMERAL_POD_DURATION_SECONDS.observe(duration_secs);
+}
+
+/// Record ephemeral pod failure (decrements active count)
+pub fn record_ephemeral_pod_failed() {
+    EPHEMERAL_PODS_ACTIVE.dec();
 }
 

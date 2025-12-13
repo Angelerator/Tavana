@@ -108,6 +108,9 @@ pub struct DuckDBQueryStatus {
     /// Location of query results
     pub result_location: Option<String>,
     
+    /// Query result JSON (for small results)
+    pub result: Option<String>,
+    
     /// Start time of query execution
     pub start_time: Option<String>,
     

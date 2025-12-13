@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use kube::Client;
+use serde::Deserialize;
 use tracing::{debug, warn};
 
 /// Cluster load metrics
@@ -36,11 +37,33 @@ impl Default for ClusterMetrics {
     }
 }
 
+/// Prometheus query response structures
+#[derive(Debug, Deserialize)]
+struct PrometheusResponse {
+    status: String,
+    data: PrometheusData,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrometheusData {
+    #[serde(rename = "resultType")]
+    result_type: String,
+    result: Vec<PrometheusResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrometheusResult {
+    #[serde(default)]
+    metric: serde_json::Value,
+    value: (f64, String),
+}
+
 /// Metrics collector for cluster load
 pub struct LoadMetricsCollector {
     k8s_client: Option<Client>,
     prometheus_url: Option<String>,
     namespace: String,
+    http_client: reqwest::Client,
 }
 
 impl LoadMetricsCollector {
@@ -56,10 +79,16 @@ impl LoadMetricsCollector {
 
         let prometheus_url = std::env::var("PROMETHEUS_URL").ok();
 
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+
         Self {
             k8s_client,
             prometheus_url,
             namespace,
+            http_client,
         }
     }
 
@@ -84,33 +113,88 @@ impl LoadMetricsCollector {
         ClusterMetrics::default()
     }
 
+    /// Query Prometheus for a single value
+    async fn query_prometheus(&self, base_url: &str, query: &str) -> Result<f64> {
+        let url = format!("{}/api/v1/query?query={}", base_url, urlencoding::encode(query));
+        
+        let response = self.http_client
+            .get(&url)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("Prometheus query failed with status: {}", response.status());
+        }
+
+        let prom_response: PrometheusResponse = response.json().await?;
+        
+        if prom_response.status != "success" {
+            anyhow::bail!("Prometheus query status: {}", prom_response.status);
+        }
+
+        if let Some(result) = prom_response.data.result.first() {
+            let value: f64 = result.value.1.parse()?;
+            return Ok(value);
+        }
+
+        anyhow::bail!("No results from Prometheus query")
+    }
+
     /// Fetch metrics from Prometheus
     async fn fetch_from_prometheus(&self, base_url: &str) -> Result<ClusterMetrics> {
-        // Query CPU utilization
+        debug!("Fetching metrics from Prometheus at {}", base_url);
+
+        // Query CPU utilization (rate of CPU usage for worker pods)
         let cpu_query = format!(
-            "{}/api/v1/query?query=avg(container_cpu_usage_seconds_total{{namespace=\"{}\",pod=~\"worker-.*\"}})",
-            base_url, self.namespace
+            r#"avg(sum by (pod) (rate(container_cpu_usage_seconds_total{{namespace="{}",pod=~"worker-.*",container!="",container!="POD"}}[5m])) / on(pod) sum by (pod) (kube_pod_container_resource_limits{{namespace="{}",pod=~"worker-.*",resource="cpu"}})) or vector(0)"#,
+            self.namespace, self.namespace
         );
 
         // Query memory utilization
         let mem_query = format!(
-            "{}/api/v1/query?query=avg(container_memory_usage_bytes{{namespace=\"{}\",pod=~\"worker-.*\"}})/avg(container_spec_memory_limit_bytes{{namespace=\"{}\",pod=~\"worker-.*\"}})",
-            base_url, self.namespace, self.namespace
+            r#"avg(sum by (pod) (container_memory_working_set_bytes{{namespace="{}",pod=~"worker-.*",container!="",container!="POD"}}) / on(pod) sum by (pod) (kube_pod_container_resource_limits{{namespace="{}",pod=~"worker-.*",resource="memory"}})) or vector(0)"#,
+            self.namespace, self.namespace
         );
 
-        // For simplicity, we'll use estimated values
-        // In production, you'd actually make HTTP requests to Prometheus
-        debug!("Would query Prometheus at: {}", cpu_query);
-        debug!("Would query Prometheus at: {}", mem_query);
+        // Query ready replicas
+        let replicas_query = format!(
+            r#"count(kube_pod_status_phase{{namespace="{}",pod=~"worker-.*",phase="Running"}} == 1) or vector(0)"#,
+            self.namespace
+        );
 
-        // Placeholder - return moderate utilization
+        // Query desired replicas from deployment
+        let desired_query = format!(
+            r#"kube_deployment_spec_replicas{{namespace="{}",deployment="worker"}} or vector(2)"#,
+            self.namespace
+        );
+
+        // Execute queries in parallel
+        let (cpu_result, mem_result, replicas_result, desired_result) = tokio::join!(
+            self.query_prometheus(base_url, &cpu_query),
+            self.query_prometheus(base_url, &mem_query),
+            self.query_prometheus(base_url, &replicas_query),
+            self.query_prometheus(base_url, &desired_query)
+        );
+
+        let cpu_utilization = cpu_result.unwrap_or(0.5).min(1.0).max(0.0);
+        let memory_utilization = mem_result.unwrap_or(0.5).min(1.0).max(0.0);
+        let ready_replicas = replicas_result.unwrap_or(2.0) as u32;
+        let desired_replicas = desired_result.unwrap_or(2.0) as u32;
+
+        let combined_utilization = cpu_utilization.max(memory_utilization);
+
+        debug!(
+            "Prometheus metrics: cpu={:.2}, mem={:.2}, ready={}, desired={}",
+            cpu_utilization, memory_utilization, ready_replicas, desired_replicas
+        );
+
         Ok(ClusterMetrics {
-            cpu_utilization: 0.5,
-            memory_utilization: 0.5,
-            combined_utilization: 0.5,
-            ready_replicas: 2,
-            desired_replicas: 2,
-            queue_depth: 0,
+            cpu_utilization,
+            memory_utilization,
+            combined_utilization,
+            ready_replicas,
+            desired_replicas,
+            queue_depth: 0, // TODO: Add queue depth metric
         })
     }
 
@@ -135,10 +219,18 @@ impl LoadMetricsCollector {
             0.5
         };
 
+        // If all pods are ready, assume moderate utilization
+        // If some pods are not ready, we're likely under high load
+        let estimated_load = if ready_replicas >= desired_replicas {
+            0.5 // Healthy state, moderate load
+        } else {
+            0.8 // Some pods not ready, likely high load
+        };
+
         Ok(ClusterMetrics {
-            cpu_utilization: 1.0 - utilization, // Inverse as approximation
-            memory_utilization: 1.0 - utilization,
-            combined_utilization: 1.0 - utilization,
+            cpu_utilization: estimated_load,
+            memory_utilization: estimated_load,
+            combined_utilization: estimated_load,
             ready_replicas,
             desired_replicas,
             queue_depth: 0,
@@ -150,4 +242,3 @@ impl LoadMetricsCollector {
         config.load_response.get_factors(metrics.combined_utilization)
     }
 }
-

@@ -20,8 +20,24 @@ const SAMPLE_QUERIES = [
     sql: 'SELECT * FROM generate_series(1, 10) as t(num);',
   },
   {
-    name: 'System Info',
-    sql: "SELECT 'Tavana' as platform, 'DuckDB' as engine, current_date as today;",
+    name: 'TPC-H Lineitem (10 rows)',
+    sql: "SELECT * FROM read_parquet('s3://tavana-data/tpch/sf_1/lineitem.parquet') LIMIT 10;",
+  },
+  {
+    name: 'TPC-H Count',
+    sql: "SELECT count(*) as total_rows FROM read_parquet('s3://tavana-data/tpch/sf_1/lineitem.parquet');",
+  },
+  {
+    name: 'TPC-H Aggregation',
+    sql: `SELECT 
+  l_returnflag, 
+  l_linestatus,
+  count(*) as count,
+  sum(l_quantity) as sum_qty,
+  avg(l_extendedprice) as avg_price
+FROM read_parquet('s3://tavana-data/tpch/sf_1/lineitem.parquet')
+GROUP BY l_returnflag, l_linestatus
+ORDER BY l_returnflag, l_linestatus;`,
   },
 ]
 

@@ -28,6 +28,18 @@ spec:
           envFrom:
             - configMapRef:
                 name: tavana-config
+          env:
+            # For testing: very low threshold to trigger ephemeral pods
+            - name: BASE_THRESHOLD_GB
+              value: "0.1"  # 100MB base threshold
+            - name: MIN_THRESHOLD_GB
+              value: "0.05"  # 50MB minimum threshold
+            - name: MAX_THRESHOLD_GB
+              value: "0.5"   # 500MB maximum threshold
+          volumeMounts:
+            - name: adaptive-config
+              mountPath: /etc/tavana
+              readOnly: true
           resources:
             requests:
               memory: "128Mi"
@@ -35,6 +47,10 @@ spec:
             limits:
               memory: "512Mi"
               cpu: "1"
+      volumes:
+        - name: adaptive-config
+          configMap:
+            name: tavana-adaptive-config
 ---
 apiVersion: v1
 kind: Service

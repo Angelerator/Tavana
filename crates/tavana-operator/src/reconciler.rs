@@ -4,7 +4,7 @@ use crate::crd::{DuckDBQuery, DuckDBQueryStatus, QueryPhase};
 use k8s_openapi::api::core::v1::{Container, Pod, PodSpec, ResourceRequirements, SecurityContext};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::{
-    api::{Api, Patch, PatchParams, PostParams},
+    api::{Api, LogParams, Patch, PatchParams, PostParams},
     runtime::controller::{Action, Controller},
     Client, Resource, ResourceExt,
 };
@@ -86,8 +86,32 @@ pub async fn reconcile(
                                     }
                                 }
                                 "Succeeded" => {
+                                    // Try to read pod logs to get query result
+                                    let result_json = match pods.logs(pod_name, &LogParams::default()).await {
+                                        Ok(logs) => {
+                                            info!("Pod logs length: {} bytes", logs.len());
+                                            // Worker outputs JSON on the last line
+                                            // Find the line that starts with {"columns
+                                            if let Some(json_line) = logs.lines()
+                                                .find(|line| line.starts_with(r#"{"columns"#))
+                                            {
+                                                info!("Found result JSON: {} bytes", json_line.len());
+                                                Some(json_line.to_string())
+                                            } else {
+                                                // Fallback: empty result
+                                                info!("No JSON result found in logs, using empty result");
+                                                Some(r#"{"columns":[],"column_types":[],"rows":[]}"#.to_string())
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to read pod logs: {}", e);
+                                            Some(r#"{"columns":[],"column_types":[],"rows":[]}"#.to_string())
+                                        }
+                                    };
+                                    
                                     let new_status = DuckDBQueryStatus {
                                         phase: QueryPhase::Succeeded,
+                                        result: result_json,
                                         completion_time: Some(chrono::Utc::now().to_rfc3339()),
                                         ..status
                                     };
@@ -198,12 +222,40 @@ fn create_worker_pod(query: &DuckDBQuery, image: &str, namespace: &str) -> Pod {
                 security_context: Some(SecurityContext {
                     run_as_non_root: Some(true),
                     run_as_user: Some(1000),
-                    read_only_root_filesystem: Some(true),
+                    read_only_root_filesystem: Some(false), // DuckDB needs writable home dir
                     allow_privilege_escalation: Some(false),
                     ..Default::default()
                 }),
+                volume_mounts: Some(vec![
+                    k8s_openapi::api::core::v1::VolumeMount {
+                        name: "duckdb-temp".to_string(),
+                        mount_path: "/tmp".to_string(),
+                        ..Default::default()
+                    },
+                    k8s_openapi::api::core::v1::VolumeMount {
+                        name: "duckdb-home".to_string(),
+                        mount_path: "/home/tavana".to_string(),
+                        ..Default::default()
+                    },
+                ]),
                 ..Default::default()
             }],
+            volumes: Some(vec![
+                k8s_openapi::api::core::v1::Volume {
+                    name: "duckdb-temp".to_string(),
+                    empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource {
+                        // Use memory-backed tmpfs for better performance
+                        medium: Some("Memory".to_string()),
+                        size_limit: Some(Quantity(format!("{}Mi", resources.memory_mb / 4))),
+                    }),
+                    ..Default::default()
+                },
+                k8s_openapi::api::core::v1::Volume {
+                    name: "duckdb-home".to_string(),
+                    empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource::default()),
+                    ..Default::default()
+                },
+            ]),
             security_context: Some(k8s_openapi::api::core::v1::PodSecurityContext {
                 fs_group: Some(1000),
                 run_as_non_root: Some(true),

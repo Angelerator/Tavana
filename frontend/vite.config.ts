@@ -13,7 +13,9 @@ export default defineConfig({
     port: 3000,
     proxy: {
       '/api': {
-        target: 'http://localhost:8080',
+        // Use Kind's mapped port (30080 -> 28080) for direct access
+        // Or use 8080 if running kubectl port-forward
+        target: process.env.GATEWAY_URL || 'http://localhost:28080',
         changeOrigin: true,
       },
     },

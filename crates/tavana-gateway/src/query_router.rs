@@ -264,45 +264,137 @@ impl QueryRouter {
     }
 
     /// Determine routing target
+    /// 
+    /// Small queries (< threshold) → HPA Worker Pool (shared, fast startup)
+    /// Large queries (>= threshold) → Ephemeral Pod (isolated, right-sized)
     fn determine_target(&self, estimate: &QuerySizeEstimate, threshold_mb: u64) -> QueryTarget {
         if estimate.total_mb < threshold_mb {
             debug!(
-                "Query classified as SMALL ({}MB < {}MB threshold)",
+                "Query classified as SMALL ({}MB < {}MB threshold) → HPA Worker Pool",
                 estimate.total_mb, threshold_mb
             );
             QueryTarget::WorkerPool
         } else {
-            let memory_mb = estimate.estimated_memory_mb.max(512) as u32;
-            let cpu_millicores = self.calculate_cpu_millicores(estimate);
+            // Large query → Ephemeral Pod with resources calculated from actual data
+            let resources = self.calculate_resources_from_data(estimate);
 
             debug!(
-                "Query classified as LARGE ({}MB >= {}MB threshold) -> {}MB RAM, {}m CPU",
-                estimate.total_mb, threshold_mb, memory_mb, cpu_millicores
+                "Query classified as LARGE ({}MB >= {}MB threshold) → Ephemeral Pod: {}MB RAM, {}m CPU",
+                estimate.total_mb, threshold_mb, resources.memory_mb, resources.cpu_millicores
             );
 
             QueryTarget::EphemeralPod {
-                memory_mb,
-                cpu_millicores,
+                memory_mb: resources.memory_mb,
+                cpu_millicores: resources.cpu_millicores,
             }
         }
     }
 
-    /// Calculate CPU millicores based on data size and complexity
-    fn calculate_cpu_millicores(&self, estimate: &QuerySizeEstimate) -> u32 {
-        let base_cpu = 1000; // 1 core base
-
-        let size_factor = if estimate.total_mb > 10000 {
-            2.0
-        } else if estimate.total_mb > 1000 {
-            1.5
-        } else {
-            1.0
+    /// Calculate resources based on actual data characteristics
+    /// 
+    /// Uses real data from:
+    /// - File size (from S3 HEAD)
+    /// - Row count (from Parquet metadata)
+    /// - Column count (from Parquet schema)
+    /// - Query complexity (joins, aggregations, window functions)
+    /// 
+    /// Formula designed for ML model replacement later
+    fn calculate_resources_from_data(&self, estimate: &QuerySizeEstimate) -> ResourceEstimate {
+        // === MEMORY CALCULATION ===
+        // Based on DuckDB memory model:
+        // 1. Streaming execution needs minimal memory for simple queries
+        // 2. Blocking operators (JOIN, GROUP BY, ORDER BY, WINDOW) need more
+        // 3. DuckDB recommends 1-4 GB per thread
+        
+        let data_bytes = estimate.total_mb as f64 * 1024.0 * 1024.0;
+        let row_count = estimate.row_count.unwrap_or(estimate.total_mb * 10000) as f64; // Estimate if not available
+        let column_count = estimate.column_count.unwrap_or(16) as f64;
+        
+        // Base memory: function of data characteristics
+        // Memory = data_size * compression_ratio * working_set_factor
+        let compression_ratio = 0.3; // Parquet is typically 3-10x compressed
+        let decompressed_size_mb = (data_bytes * compression_ratio) / (1024.0 * 1024.0);
+        
+        // Working set factor based on operation type
+        let operation_factor = estimate.memory_multiplier; // Already calculated from query analysis
+        
+        // Row-based memory: each row needs ~8 bytes per column for intermediate processing
+        let row_memory_mb = (row_count * column_count * 8.0) / (1024.0 * 1024.0);
+        
+        // Total memory estimate
+        let base_memory_mb = decompressed_size_mb * operation_factor + row_memory_mb * 0.1;
+        
+        // Apply safety margin (DuckDB will spill if needed)
+        let memory_mb = (base_memory_mb * 1.5).max(1024.0); // Minimum 1GB
+        
+        // === CPU CALCULATION ===
+        // Based on DuckDB threading model:
+        // - Parallelism at row group level
+        // - More data = more parallelism potential
+        // - Complex operations benefit from more threads
+        
+        let row_groups = estimate.row_group_count.unwrap_or(
+            (row_count / 122880.0).max(1.0) as u32 // DuckDB default row group size
+        );
+        
+        // CPUs scale with parallelism potential
+        let parallelism_factor = (row_groups as f64).sqrt(); // Diminishing returns
+        let complexity_factor = operation_factor.sqrt(); // Complex ops benefit from more CPU
+        
+        // Base cores from data size (1 core per ~1GB)
+        let data_cores = (estimate.total_mb as f64 / 1024.0).max(1.0);
+        
+        // Calculate CPU cores with caps for Kind/local clusters
+        // In production, this can be adjusted via env vars
+        let max_cpu_cores = std::env::var("MAX_EPHEMERAL_CPU_CORES")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(2.0);  // Default: 2 cores max for Kind
+        
+        let cpu_cores = (data_cores * parallelism_factor * complexity_factor)
+            .max(1.0)
+            .min(max_cpu_cores);  // Cap at max
+        let cpu_millicores = (cpu_cores * 1000.0) as u32;
+        
+        // === FEATURE VECTOR FOR FUTURE ML ===
+        // These features can be used by an ML model later
+        let features = ResourceFeatures {
+            data_size_mb: estimate.total_mb,
+            row_count: estimate.row_count,
+            column_count: estimate.column_count,
+            row_group_count: estimate.row_group_count,
+            has_join: estimate.has_join,
+            has_aggregation: estimate.has_aggregation,
+            has_window: estimate.has_window,
+            has_order_by: estimate.has_order_by,
+            memory_multiplier: estimate.memory_multiplier,
+            source_count: estimate.sources.len() as u32,
         };
-
-        let complexity_factor = estimate.memory_multiplier.min(2.0);
-
-        let cpu = (base_cpu as f64 * size_factor * complexity_factor) as u32;
-        cpu.clamp(500, 8000) // 0.5 to 8 cores
+        
+        // Log for monitoring and future ML training data collection
+        info!(
+            "Resource calculation: data={}MB, rows={:?}, cols={:?}, row_groups={:?}, \
+             multiplier={:.2} → memory={}MB, cpu={}m",
+            estimate.total_mb,
+            estimate.row_count,
+            estimate.column_count,
+            estimate.row_group_count,
+            estimate.memory_multiplier,
+            memory_mb as u32,
+            cpu_millicores
+        );
+        
+        // Record metrics for Grafana
+        metrics::RESOURCE_ESTIMATE_MEMORY_MB.set(memory_mb);
+        metrics::RESOURCE_ESTIMATE_CPU_MILLICORES.set(cpu_millicores as f64);
+        metrics::RESOURCE_ESTIMATE_DATA_MB.set(estimate.total_mb as f64);
+        metrics::RESOURCE_ESTIMATE_MULTIPLIER.set(estimate.memory_multiplier);
+        
+        ResourceEstimate {
+            memory_mb: memory_mb.clamp(1024.0, 512.0 * 1024.0) as u32, // 1GB - 512GB
+            cpu_millicores: cpu_millicores.clamp(1000, 128000), // 1 - 128 cores
+            features,
+        }
     }
 
     /// Estimate CPU cores from size estimate
@@ -390,6 +482,30 @@ impl QueryRouter {
         }
         None
     }
+}
+
+/// Calculated resource requirements for ephemeral pod
+#[derive(Debug, Clone)]
+pub struct ResourceEstimate {
+    pub memory_mb: u32,
+    pub cpu_millicores: u32,
+    pub features: ResourceFeatures,
+}
+
+/// Feature vector for ML model (future use)
+/// All data needed to train an ML model for resource prediction
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResourceFeatures {
+    pub data_size_mb: u64,
+    pub row_count: Option<u64>,
+    pub column_count: Option<u32>,
+    pub row_group_count: Option<u32>,
+    pub has_join: bool,
+    pub has_aggregation: bool,
+    pub has_window: bool,
+    pub has_order_by: bool,
+    pub memory_multiplier: f64,
+    pub source_count: u32,
 }
 
 #[cfg(test)]

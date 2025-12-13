@@ -1,5 +1,5 @@
-# Worker Dockerfile
-FROM rust:1.85-bookworm AS builder
+# Worker Dockerfile - Simple version without network-dependent extensions
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /app
 
@@ -17,9 +17,27 @@ RUN cargo build --release -p tavana-worker
 # Runtime image
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user with home directory (for DuckDB temp files and extensions)
+RUN useradd -m -u 1000 -s /bin/bash tavana && \
+    mkdir -p /home/tavana/.duckdb/extensions/v1.2.2/linux_arm64 /tmp/duckdb && \
+    chown -R tavana:tavana /home/tavana /tmp/duckdb
+
+# Pre-download DuckDB extensions (httpfs for S3 support, parquet for file reading)
+# This avoids needing network access at runtime
+RUN curl -L "http://extensions.duckdb.org/v1.2.2/linux_arm64/httpfs.duckdb_extension.gz" | gunzip > /home/tavana/.duckdb/extensions/v1.2.2/linux_arm64/httpfs.duckdb_extension && \
+    curl -L "http://extensions.duckdb.org/v1.2.2/linux_arm64/parquet.duckdb_extension.gz" | gunzip > /home/tavana/.duckdb/extensions/v1.2.2/linux_arm64/parquet.duckdb_extension && \
+    chmod 644 /home/tavana/.duckdb/extensions/v1.2.2/linux_arm64/*.duckdb_extension && \
+    chown -R tavana:tavana /home/tavana/.duckdb
 
 COPY --from=builder /app/target/release/tavana-worker /usr/local/bin/
+
+USER tavana
+WORKDIR /home/tavana
+
+ENV HOME=/home/tavana
+ENV TEMP_DIR=/tmp/duckdb
 
 EXPOSE 50053
 

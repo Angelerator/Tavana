@@ -1,0 +1,181 @@
+{
+  "id": null,
+  "uid": "tavana-main",
+  "title": "Tavana - Complete Dashboard",
+  "tags": ["tavana"],
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "refresh": "5s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Query Routing Split",
+      "type": "piechart",
+      "gridPos": {"h": 8, "w": 6, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "tavana_queries_routed_total", "legendFormat": "{{target}}", "refId": "A"}
+      ],
+      "options": {"pieType": "pie", "legend": {"displayMode": "table", "placement": "right"}}
+    },
+    {
+      "id": 2,
+      "title": "Current Threshold (MB)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 6, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "tavana_adaptive_threshold_mb", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "decmbytes", "color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "blue", "value": null}]}}}
+    },
+    {
+      "id": 3,
+      "title": "Memory Estimate (MB)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 10, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "tavana_resource_estimate_memory_mb", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "decmbytes", "color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 8192}, {"color": "red", "value": 32768}]}}}
+    },
+    {
+      "id": 4,
+      "title": "CPU Estimate (cores)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 14, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "tavana_resource_estimate_cpu_millicores / 1000", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "none", "decimals": 1, "color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 8}, {"color": "red", "value": 32}]}}}
+    },
+    {
+      "id": 5,
+      "title": "Data Size Estimate (MB)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 18, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "tavana_resource_estimate_data_mb", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "decmbytes", "color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "blue", "value": null}, {"color": "yellow", "value": 5000}, {"color": "red", "value": 20000}]}}}
+    },
+    {
+      "id": 6,
+      "title": "HPA Min/Max Replicas",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 6, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "tavana_adaptive_hpa_min_replicas", "legendFormat": "min", "refId": "A"},
+        {"expr": "tavana_adaptive_hpa_max_replicas", "legendFormat": "max", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "green", "value": null}]}}}
+    },
+    {
+      "id": 7,
+      "title": "Memory Multiplier",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 10, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "tavana_resource_estimate_multiplier", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"decimals": 2, "color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 2}, {"color": "red", "value": 4}]}}}
+    },
+    {
+      "id": 8,
+      "title": "Queries/sec",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 14, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "sum(rate(tavana_queries_routed_total[1m]))", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps", "color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "green", "value": null}]}}}
+    },
+    {
+      "id": 9,
+      "title": "Ephemeral Pods Active",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 18, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "tavana_ephemeral_pods_active", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 5}, {"color": "red", "value": 10}]}}}
+    },
+    {
+      "id": 10,
+      "title": "Threshold Over Time",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "tavana_adaptive_threshold_mb", "legendFormat": "Threshold (MB)", "refId": "A"},
+        {"expr": "tavana_resource_estimate_data_mb", "legendFormat": "Last Data Size", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "decmbytes", "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}}}
+    },
+    {
+      "id": 11,
+      "title": "Resource Estimates Over Time",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "tavana_resource_estimate_memory_mb", "legendFormat": "Memory (MB)", "refId": "A"},
+        {"expr": "tavana_resource_estimate_cpu_millicores / 10", "legendFormat": "CPU (x10)", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}}}
+    },
+    {
+      "id": 12,
+      "title": "Adaptive Factors",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "tavana_adaptive_factor", "legendFormat": "{{factor_type}}", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "line", "lineWidth": 2}}}
+    },
+    {
+      "id": 13,
+      "title": "Query Latency",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "histogram_quantile(0.5, rate(tavana_query_latency_seconds_bucket[5m]))", "legendFormat": "p50 {{route}}", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, rate(tavana_query_latency_seconds_bucket[5m]))", "legendFormat": "p95 {{route}}", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"drawStyle": "line", "lineWidth": 2}}}
+    },
+    {
+      "id": 14,
+      "title": "Data Characteristics",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "sum(increase(tavana_data_row_count_sum[5m]))", "legendFormat": "Rows processed", "refId": "A"},
+        {"expr": "sum(increase(tavana_data_column_count_sum[5m]))", "legendFormat": "Columns seen", "refId": "B"}
+      ],
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "bars", "lineWidth": 1, "fillOpacity": 50}}}
+    },
+    {
+      "id": 15,
+      "title": "Estimation Methods Used",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "targets": [
+        {"expr": "rate(tavana_estimation_method_total[5m])", "legendFormat": "{{method}}", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"custom": {"drawStyle": "bars", "lineWidth": 1, "fillOpacity": 50, "stacking": {"mode": "normal"}}}}
+    }
+  ]
+}

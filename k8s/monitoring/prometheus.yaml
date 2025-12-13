@@ -54,6 +54,63 @@ data:
             replacement: $1:$2
             target_label: __address__
 
+      # cAdvisor container metrics from kubelet
+      - job_name: 'kubernetes-cadvisor'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+        metric_relabel_configs:
+          # Only keep metrics for tavana namespace
+          - source_labels: [namespace]
+            regex: tavana
+            action: keep
+          # Drop high-cardinality metrics we don't need
+          - source_labels: [__name__]
+            regex: container_tasks_state|container_memory_failures_total
+            action: drop
+
+      # Kubelet metrics for resource usage
+      - job_name: 'kubernetes-kubelet'
+        scheme: https
+        tls_config:
+          ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          insecure_skip_verify: true
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/${1}/proxy/metrics
+
+      # kube-state-metrics for pod state information
+      - job_name: 'kube-state-metrics'
+        static_configs:
+          - targets: ['kube-state-metrics.kube-system.svc.cluster.local:8080']
+        metric_relabel_configs:
+          # Only keep metrics for tavana namespace
+          - source_labels: [namespace]
+            regex: tavana
+            action: keep
+
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -132,12 +189,12 @@ metadata:
   name: prometheus
 rules:
   - apiGroups: [""]
-    resources: ["nodes", "nodes/proxy", "services", "endpoints", "pods"]
+    resources: ["nodes", "nodes/proxy", "nodes/metrics", "services", "endpoints", "pods"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["extensions", "networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["get", "list", "watch"]
-  - nonResourceURLs: ["/metrics"]
+  - nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
     verbs: ["get"]
 
 ---
@@ -153,4 +210,3 @@ subjects:
   - kind: ServiceAccount
     name: prometheus
     namespace: tavana
-

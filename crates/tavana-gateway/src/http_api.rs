@@ -304,6 +304,89 @@ pub async fn adaptive_state(State(state): State<AppState>) -> impl IntoResponse 
     (StatusCode::OK, Json(response))
 }
 
+/// Export request for large query results (10TB+)
+#[derive(Debug, Deserialize)]
+pub struct ExportRequest {
+    pub sql: String,
+    pub output_path: String, // e.g., "s3://bucket/path/output.parquet"
+    #[serde(default)]
+    pub format: ExportFormat,
+    #[serde(default)]
+    pub partition_by: Vec<String>,
+    #[serde(default = "default_user")]
+    pub user_id: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    #[default]
+    Parquet,
+    Csv,
+    Json,
+}
+
+/// Export response
+#[derive(Debug, Serialize)]
+pub struct ExportResponse {
+    pub output_path: String,
+    pub message: String,
+    pub execution_time_ms: u64,
+}
+
+/// Export large query results directly to S3/cloud storage
+/// 
+/// For 10TB+ queries where streaming results to client isn't feasible,
+/// export directly to object storage.
+pub async fn export_query(
+    State(state): State<AppState>,
+    Json(request): Json<ExportRequest>,
+) -> impl IntoResponse {
+    info!("Export request to {}: {}", request.output_path, request.sql);
+    
+    let start = std::time::Instant::now();
+    
+    // Build COPY TO query
+    let format_options = match request.format {
+        ExportFormat::Parquet if !request.partition_by.is_empty() => {
+            format!(
+                "FORMAT PARQUET, COMPRESSION 'ZSTD', PARTITION_BY ({})",
+                request.partition_by.join(", ")
+            )
+        }
+        ExportFormat::Parquet => "FORMAT PARQUET, COMPRESSION 'ZSTD'".to_string(),
+        ExportFormat::Csv => "FORMAT CSV, HEADER true".to_string(),
+        ExportFormat::Json => "FORMAT JSON".to_string(),
+    };
+    
+    let export_sql = format!(
+        "COPY ({}) TO '{}' ({})",
+        request.sql, request.output_path, format_options
+    );
+    
+    // Execute export via worker
+    match state.worker_client.execute_query(&export_sql, &request.user_id).await {
+        Ok(_) => {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            info!("Export completed in {}ms to {}", duration_ms, request.output_path);
+            
+            (StatusCode::OK, Json(ExportResponse {
+                output_path: request.output_path,
+                message: "Export completed successfully".to_string(),
+                execution_time_ms: duration_ms,
+            }))
+        }
+        Err(e) => {
+            error!("Export failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(ExportResponse {
+                output_path: request.output_path,
+                message: format!("Export failed: {}", e),
+                execution_time_ms: start.elapsed().as_millis() as u64,
+            }))
+        }
+    }
+}
+
 /// Health check endpoint
 pub async fn health() -> &'static str {
     "OK"
@@ -316,5 +399,5 @@ pub async fn ready() -> &'static str {
 
 /// Root endpoint
 pub async fn root() -> &'static str {
-    "Tavana Gateway - Cloud-Agnostic DuckDB Query Platform"
+    "Tavana Gateway - Cloud-Agnostic DuckDB Query Platform (Supports up to 10TB queries)"
 }
