@@ -324,7 +324,7 @@ async fn handle_connection(
                         let estimated_mb = estimated_bytes as f64 / (1024.0 * 1024.0);
                         metrics::record_data_scanned(estimated_bytes);
                         metrics::record_actual_query_size(estimated_mb);
-                        metrics::record_estimation_accuracy(estimate.data_size_mb, estimated_mb);
+                        metrics::record_estimation_accuracy(estimate.data_size_mb as f64, estimated_mb);
                         
                         debug!("Query result: {} columns, {} rows, ~{:.2}MB (took {:.2}s)", 
                             result.columns.len(), result.rows.len(), estimated_mb, duration);
