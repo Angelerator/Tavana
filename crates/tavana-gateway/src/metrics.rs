@@ -354,6 +354,120 @@ pub static RESOURCE_ACTUAL_VS_ESTIMATED: Lazy<HistogramVec> = Lazy::new(|| {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PRE-SIZING METRICS (K8s v1.35 In-Place Resource Updates)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Total number of worker pre-sizing operations
+pub static WORKER_PRESIZE_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "tavana_worker_presize_total",
+        "Total worker pre-sizing operations by result",
+        &["result"]  // "success", "failed", "skipped"
+    )
+    .unwrap()
+});
+
+/// Memory requested during pre-sizing (MB)
+pub static WORKER_PRESIZE_MEMORY_MB: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "tavana_worker_presize_memory_mb",
+        "Memory requested during worker pre-sizing in MB",
+        vec![256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0, 131072.0, 262144.0, 409600.0]
+    )
+    .unwrap()
+});
+
+/// CPU requested during pre-sizing (cores)
+pub static WORKER_PRESIZE_CPU_CORES: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "tavana_worker_presize_cpu_cores",
+        "CPU cores requested during worker pre-sizing",
+        vec![0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0]
+    )
+    .unwrap()
+});
+
+/// Pre-sizing latency (time to resize worker pod)
+pub static WORKER_PRESIZE_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "tavana_worker_presize_latency_seconds",
+        "Time taken to pre-size worker pod",
+        vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
+    )
+    .unwrap()
+});
+
+/// Current worker pool status
+pub static WORKER_POOL_STATUS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "tavana_worker_pool_status",
+        "Worker pool status by state",
+        &["state"]  // "total", "busy", "idle", "resizing"
+    )
+    .unwrap()
+});
+
+/// Pre-sizing memory utilization ratio (actual_used / pre_sized)
+pub static PRESIZE_MEMORY_UTILIZATION: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "tavana_presize_memory_utilization",
+        "Ratio of actual memory used vs pre-sized memory",
+        vec![0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 5.0]
+    )
+    .unwrap()
+});
+
+/// Pre-sizing multiplier used
+pub static PRESIZE_MULTIPLIER_USED: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "tavana_presize_multiplier_used",
+        "Pre-sizing multiplier applied to estimated data size",
+        vec![0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0]
+    )
+    .unwrap()
+});
+
+/// In-place resize events by type
+pub static INPLACE_RESIZE_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "tavana_inplace_resize_total",
+        "In-place resize events by direction",
+        &["direction"]  // "scale_up", "scale_down", "initial"
+    )
+    .unwrap()
+});
+
+/// Memory before resize (for tracking deltas)
+pub static RESIZE_MEMORY_DELTA_MB: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "tavana_resize_memory_delta_mb",
+        "Memory change during resize (MB, can be negative for scale-down)",
+        vec![-4096.0, -2048.0, -1024.0, -512.0, 0.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0]
+    )
+    .unwrap()
+});
+
+/// Elastic scale-up events during query execution
+pub static ELASTIC_SCALEUP_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "tavana_elastic_scaleup_total",
+        "Elastic scale-up events during query execution",
+        &["trigger"]  // "memory_pressure", "oom_risk", "cpu_throttle"
+    )
+    .unwrap()
+});
+
+/// VPA recommendations vs actual allocation
+pub static VPA_RECOMMENDATION_MB: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "tavana_vpa_recommendation_mb",
+        "VPA memory recommendations in MB",
+        &["type"]  // "target", "lower_bound", "upper_bound", "uncapped_target"
+    )
+    .unwrap()
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -393,11 +507,29 @@ pub fn init_metrics() {
     let _ = &*DATA_COLUMN_COUNT;
     let _ = &*DATA_ROW_GROUP_COUNT;
     let _ = &*RESOURCE_ACTUAL_VS_ESTIMATED;
+    // Pre-sizing metrics (K8s v1.35)
+    let _ = &*WORKER_PRESIZE_TOTAL;
+    let _ = &*WORKER_PRESIZE_MEMORY_MB;
+    let _ = &*WORKER_PRESIZE_CPU_CORES;
+    let _ = &*WORKER_PRESIZE_LATENCY_SECONDS;
+    let _ = &*WORKER_POOL_STATUS;
+    let _ = &*PRESIZE_MEMORY_UTILIZATION;
+    let _ = &*PRESIZE_MULTIPLIER_USED;
+    let _ = &*INPLACE_RESIZE_TOTAL;
+    let _ = &*RESIZE_MEMORY_DELTA_MB;
+    let _ = &*ELASTIC_SCALEUP_TOTAL;
+    let _ = &*VPA_RECOMMENDATION_MB;
 
     // Set initial values
     ADAPTIVE_THRESHOLD_MB.set(2048.0); // 2GB default
     ADAPTIVE_HPA_MIN.set(2.0);
-    ADAPTIVE_HPA_MAX.set(10.0);
+    ADAPTIVE_HPA_MAX.set(100.0);
+    
+    // Initialize worker pool status
+    WORKER_POOL_STATUS.with_label_values(&["total"]).set(0.0);
+    WORKER_POOL_STATUS.with_label_values(&["busy"]).set(0.0);
+    WORKER_POOL_STATUS.with_label_values(&["idle"]).set(0.0);
+    WORKER_POOL_STATUS.with_label_values(&["resizing"]).set(0.0);
 }
 
 /// Encode all metrics as Prometheus text format
@@ -527,5 +659,59 @@ pub fn record_resource_estimation(
             if has_window { "true" } else { "false" },
         ])
         .observe(cpu_millicores);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PRE-SIZING HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Record worker pre-sizing operation
+pub fn record_worker_presize(result: &str, memory_mb: f64, cpu_cores: f64, latency_secs: f64) {
+    WORKER_PRESIZE_TOTAL.with_label_values(&[result]).inc();
+    if result == "success" {
+        WORKER_PRESIZE_MEMORY_MB.observe(memory_mb);
+        WORKER_PRESIZE_CPU_CORES.observe(cpu_cores);
+    }
+    WORKER_PRESIZE_LATENCY_SECONDS.observe(latency_secs);
+}
+
+/// Update worker pool status
+pub fn update_worker_pool_status(total: i32, busy: i32, idle: i32, resizing: i32) {
+    WORKER_POOL_STATUS.with_label_values(&["total"]).set(total as f64);
+    WORKER_POOL_STATUS.with_label_values(&["busy"]).set(busy as f64);
+    WORKER_POOL_STATUS.with_label_values(&["idle"]).set(idle as f64);
+    WORKER_POOL_STATUS.with_label_values(&["resizing"]).set(resizing as f64);
+}
+
+/// Record pre-sizing memory utilization after query completes
+pub fn record_presize_memory_utilization(presized_mb: f64, actual_used_mb: f64) {
+    if presized_mb > 0.0 {
+        let utilization = actual_used_mb / presized_mb;
+        PRESIZE_MEMORY_UTILIZATION.observe(utilization);
+    }
+}
+
+/// Record the pre-sizing multiplier used
+pub fn record_presize_multiplier(multiplier: f64) {
+    PRESIZE_MULTIPLIER_USED.observe(multiplier);
+}
+
+/// Record in-place resize event
+pub fn record_inplace_resize(direction: &str, memory_delta_mb: f64) {
+    INPLACE_RESIZE_TOTAL.with_label_values(&[direction]).inc();
+    RESIZE_MEMORY_DELTA_MB.observe(memory_delta_mb);
+}
+
+/// Record elastic scale-up during query execution
+pub fn record_elastic_scaleup(trigger: &str) {
+    ELASTIC_SCALEUP_TOTAL.with_label_values(&[trigger]).inc();
+}
+
+/// Update VPA recommendations
+pub fn update_vpa_recommendations(target_mb: f64, lower_bound_mb: f64, upper_bound_mb: f64, uncapped_mb: f64) {
+    VPA_RECOMMENDATION_MB.with_label_values(&["target"]).set(target_mb);
+    VPA_RECOMMENDATION_MB.with_label_values(&["lower_bound"]).set(lower_bound_mb);
+    VPA_RECOMMENDATION_MB.with_label_values(&["upper_bound"]).set(upper_bound_mb);
+    VPA_RECOMMENDATION_MB.with_label_values(&["uncapped_target"]).set(uncapped_mb);
 }
 

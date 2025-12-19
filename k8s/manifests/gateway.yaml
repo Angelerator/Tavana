@@ -34,7 +34,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: gateway
-          image: tavana-gateway:latest
+          image: tavana-gateway:presizing-metrics
           imagePullPolicy: Never
           ports:
             - containerPort: 15432
