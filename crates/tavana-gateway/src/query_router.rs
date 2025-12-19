@@ -104,13 +104,16 @@ impl QueryRouter {
             });
         }
 
+        // Calculate CPU cores estimate for metrics
+        let cpu_cores = self.estimate_cpu_cores(size_estimate.total_mb, has_join, has_aggregation);
+
         // Try pre-sizing if pool manager is available and enabled
         let (target, required_memory_mb, was_resized) = if let Some(ref pm) = self.pool_manager {
             if pm.is_enabled() {
                 // Calculate required memory using pool manager's formula
                 let required_memory = pm.calculate_memory_mb(size_estimate.total_mb);
 
-                match pm.get_presized_worker(required_memory).await {
+                match pm.get_presized_worker(required_memory, cpu_cores).await {
                     Ok(worker) => {
                         info!(
                             "Pre-sized worker {} to {}MB for query (data={}MB, resized={})",
@@ -171,9 +174,9 @@ impl QueryRouter {
     }
 
     /// Release a worker after query completion
-    pub async fn release_worker(&self, worker_name: &str) {
+    pub async fn release_worker(&self, worker_name: &str, actual_memory_used_mb: Option<u64>) {
         if let Some(ref pm) = self.pool_manager {
-            pm.release_worker(worker_name).await;
+            pm.release_worker(worker_name, actual_memory_used_mb).await;
         }
     }
 

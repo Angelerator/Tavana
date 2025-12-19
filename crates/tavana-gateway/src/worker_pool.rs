@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::metrics;
+
 /// Configuration for pre-sizing
 #[derive(Clone, Debug)]
 pub struct PreSizingConfig {
@@ -231,11 +233,20 @@ impl WorkerPoolManager {
     pub async fn get_presized_worker(
         &self,
         required_memory_mb: u64,
+        required_cpu_cores: f32,
     ) -> Result<PreSizedWorker, anyhow::Error> {
+        let start = Instant::now();
+        
         // Refresh worker list
         self.refresh_workers().await?;
         
         let mut workers = self.workers.write().await;
+        
+        // Update worker pool status metrics
+        let total = workers.len() as i32;
+        let busy = workers.values().filter(|w| w.busy).count() as i32;
+        let idle = total - busy;
+        metrics::update_worker_pool_status(total, busy, idle, 0);
         
         // Find an idle worker
         let idle_worker = workers
@@ -246,6 +257,7 @@ impl WorkerPoolManager {
         let worker = match idle_worker {
             Some(w) => w,
             None => {
+                metrics::record_worker_presize("failed", 0.0, 0.0, start.elapsed().as_secs_f64());
                 return Err(anyhow::anyhow!("No idle workers available"));
             }
         };
@@ -263,14 +275,29 @@ impl WorkerPoolManager {
                 worker_name, current_memory, required_memory_mb
             );
             
+            // Update resizing count
+            metrics::update_worker_pool_status(total, busy, idle - 1, 1);
+            
             // Perform in-place resize
-            self.resize_worker(&worker_name, required_memory_mb).await?;
-            worker.current_memory_mb = required_memory_mb;
+            match self.resize_worker(&worker_name, required_memory_mb).await {
+                Ok(_) => {
+                    worker.current_memory_mb = required_memory_mb;
+                    let memory_delta = required_memory_mb as f64 - current_memory as f64;
+                    metrics::record_inplace_resize("scale_up", memory_delta);
+                }
+                Err(e) => {
+                    warn!("Failed to resize worker {}: {}", worker_name, e);
+                    metrics::record_worker_presize("failed", required_memory_mb as f64, required_cpu_cores as f64, start.elapsed().as_secs_f64());
+                    metrics::update_worker_pool_status(total, busy, idle, 0);
+                    return Err(e);
+                }
+            }
         } else {
             debug!(
                 "Worker {} already has sufficient memory ({}MB >= {}MB)",
                 worker_name, current_memory, required_memory_mb
             );
+            metrics::record_worker_presize("skipped", current_memory as f64, required_cpu_cores as f64, start.elapsed().as_secs_f64());
         }
         
         // Mark as busy
@@ -278,21 +305,49 @@ impl WorkerPoolManager {
         worker.last_used = Instant::now();
         
         let address = format!("http://{}:{}", worker_ip, self.worker_port);
+        let final_memory = required_memory_mb.max(current_memory);
+        
+        // Record successful pre-sizing
+        if needs_resize {
+            metrics::record_worker_presize("success", final_memory as f64, required_cpu_cores as f64, start.elapsed().as_secs_f64());
+        }
+        
+        // Update pool status after allocation
+        let busy_now = workers.values().filter(|w| w.busy).count() as i32;
+        let idle_now = total - busy_now;
+        metrics::update_worker_pool_status(total, busy_now, idle_now, 0);
+        
+        // Record pre-sizing multiplier used
+        metrics::record_presize_multiplier(self.config.memory_multiplier);
         
         Ok(PreSizedWorker {
             name: worker_name,
             address,
-            memory_mb: required_memory_mb.max(current_memory),
+            memory_mb: final_memory,
             resized: needs_resize,
         })
     }
     
     /// Release a worker (mark as idle)
-    pub async fn release_worker(&self, worker_name: &str) {
+    pub async fn release_worker(&self, worker_name: &str, actual_memory_used_mb: Option<u64>) {
         let mut workers = self.workers.write().await;
         if let Some(worker) = workers.get_mut(worker_name) {
+            // Record memory utilization if we have actual usage data
+            if let Some(actual_mb) = actual_memory_used_mb {
+                metrics::record_presize_memory_utilization(
+                    worker.current_memory_mb as f64,
+                    actual_mb as f64,
+                );
+            }
+            
             worker.busy = false;
             debug!("Released worker {}", worker_name);
+            
+            // Update pool status after release
+            let total = workers.len() as i32;
+            let busy = workers.values().filter(|w| w.busy).count() as i32;
+            let idle = total - busy;
+            metrics::update_worker_pool_status(total, busy, idle, 0);
         }
     }
     

@@ -11,12 +11,12 @@ data:
       evaluation_interval: 15s
 
     scrape_configs:
-      # Gateway metrics
+      # Gateway metrics - Pre-sizing and query routing metrics
       - job_name: 'tavana-gateway'
         static_configs:
           - targets: ['gateway:8080']
         metrics_path: /metrics
-        scrape_interval: 10s
+        scrape_interval: 5s  # Fast scrape for real-time pre-sizing monitoring
 
       # Worker metrics (if exposed)
       - job_name: 'tavana-worker'
