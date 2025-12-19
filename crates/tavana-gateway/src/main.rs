@@ -6,10 +6,11 @@
 //! - REST API (for management)
 //! - Prometheus metrics (/metrics)
 //!
-//! Simplified architecture:
-//! - All queries go to HPA+VPA managed worker pool
-//! - No ephemeral pods or adaptive thresholds
-//! - K8s v1.35 handles scaling automatically
+//! Query-aware pre-sizing architecture:
+//! - Estimate query size before execution
+//! - Pre-size worker to 50% of data size (configurable)
+//! - K8s v1.35 in-place resize for instant scaling
+//! - HPA+VPA for automatic scaling
 
 mod auth;
 mod data_sizer;
@@ -21,6 +22,7 @@ mod query;
 mod query_router;
 mod telemetry;
 mod worker_client;
+mod worker_pool;
 
 use crate::auth::AuthService;
 use crate::data_sizer::DataSizer;
@@ -29,6 +31,7 @@ use crate::http_api::{execute_query, health, prometheus_metrics, ready, root, Ap
 use crate::pg_wire::PgWireServer;
 use crate::query_router::QueryRouter;
 use crate::worker_client::WorkerClient;
+use crate::worker_pool::{PreSizingConfig, WorkerPoolManager};
 use axum::{
     routing::{get, post},
     Router,
@@ -37,7 +40,7 @@ use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "tavana-gateway")]
@@ -59,7 +62,7 @@ struct Args {
     #[arg(long, env = "CATALOG_ADDR", default_value = "http://localhost:50052")]
     catalog_addr: String,
 
-    /// Worker service address
+    /// Worker service address (fallback when pre-sizing unavailable)
     #[arg(long, env = "WORKER_ADDR", default_value = "http://localhost:50053")]
     worker_addr: String,
 
@@ -100,15 +103,40 @@ async fn main() -> anyhow::Result<()> {
     // Initialize shared auth service
     let auth_service = Arc::new(AuthService::new());
 
-    // Initialize DataSizer for data estimation (for metrics)
+    // Initialize DataSizer for data estimation
     let data_sizer = Arc::new(DataSizer::new().await);
     info!("DataSizer initialized");
 
-    // Initialize QueryRouter (simplified - all queries to worker pool)
-    let query_router = Arc::new(QueryRouter::new(data_sizer.clone()));
-    info!("QueryRouter initialized - all queries go to worker pool");
+    // Initialize WorkerPoolManager for pre-sizing
+    let pre_sizing_config = PreSizingConfig::from_env();
+    info!(
+        "Pre-sizing config: enabled={}, multiplier={}, min={}MB, max={}MB",
+        pre_sizing_config.enabled,
+        pre_sizing_config.memory_multiplier,
+        pre_sizing_config.min_memory_mb,
+        pre_sizing_config.max_memory_mb
+    );
 
-    // Create worker client
+    let pool_manager = match WorkerPoolManager::new(pre_sizing_config.clone()).await {
+        Ok(pm) => {
+            info!("WorkerPoolManager initialized - query-aware pre-sizing enabled");
+            Some(Arc::new(pm))
+        }
+        Err(e) => {
+            warn!("Failed to initialize WorkerPoolManager: {} - pre-sizing disabled", e);
+            None
+        }
+    };
+
+    // Initialize QueryRouter with or without pre-sizing
+    let query_router = if let Some(ref pm) = pool_manager {
+        Arc::new(QueryRouter::with_pool_manager(data_sizer.clone(), pm.clone()))
+    } else {
+        Arc::new(QueryRouter::new(data_sizer.clone()))
+    };
+    info!("QueryRouter initialized");
+
+    // Create worker client (fallback for when pre-sizing is unavailable)
     let worker_client = Arc::new(WorkerClient::new(args.worker_addr.clone()));
 
     // Start PostgreSQL wire protocol server
@@ -158,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(app_state);
 
     info!("HTTP server listening on {}", http_addr);
-    info!("  /api/query - Execute queries via worker pool");
+    info!("  /api/query - Execute queries with query-aware pre-sizing");
     info!("  /metrics - Prometheus metrics");
 
     let http_handle = tokio::spawn(async move {
@@ -167,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     info!("Tavana Gateway started successfully");
-    info!("Architecture: HPA+VPA managed worker pool (K8s v1.35)");
+    info!("Architecture: Query-aware pre-sizing with K8s v1.35 in-place resize");
 
     // Wait for shutdown signal
     tokio::select! {

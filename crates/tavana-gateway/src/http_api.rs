@@ -1,10 +1,10 @@
 //! HTTP REST API for query execution and management
 //!
-//! Simplified: All queries go to HPA+VPA managed worker pool
+//! Uses query-aware pre-sizing to resize workers before query execution.
 
-use crate::query_router::QueryRouter;
-use crate::worker_client::WorkerClient;
 use crate::metrics;
+use crate::query_router::{QueryRouter, QueryTarget};
+use crate::worker_client::WorkerClient;
 use axum::{
     extract::{Json, State},
     http::StatusCode,
@@ -12,7 +12,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{error, info};
+use tavana_common::proto;
+use tonic::transport::Channel;
+use tracing::{error, info, warn};
 
 /// Application state shared across HTTP handlers
 #[derive(Clone)]
@@ -44,6 +46,10 @@ pub struct QueryResponse {
     pub bytes_scanned: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_size_mb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_memory_mb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_resized: Option<bool>,
 }
 
 /// Error response
@@ -53,7 +59,7 @@ pub struct ErrorResponse {
     pub code: String,
 }
 
-/// Execute a SQL query via worker pool
+/// Execute a SQL query with query-aware pre-sizing
 pub async fn execute_query(
     State(state): State<AppState>,
     Json(request): Json<QueryRequest>,
@@ -62,44 +68,170 @@ pub async fn execute_query(
 
     let estimate = state.query_router.route(&request.sql).await;
     let start_time = std::time::Instant::now();
-    
+
+    // Extract worker info for releasing later
+    let worker_name = match &estimate.target {
+        QueryTarget::PreSizedWorker { worker_name, .. } => Some(worker_name.clone()),
+        QueryTarget::WorkerPool => None,
+    };
+
     info!(
-        "Query: {}MB data → Worker Pool (method={})",
-        estimate.data_size_mb, estimate.estimation_method
+        "Query: {}MB data, {}MB memory, resized={}, target={:?}",
+        estimate.data_size_mb,
+        estimate.required_memory_mb,
+        estimate.was_resized,
+        match &estimate.target {
+            QueryTarget::WorkerPool => "WorkerPool".to_string(),
+            QueryTarget::PreSizedWorker { worker_name, .. } => format!("PreSized({})", worker_name),
+        }
     );
-    
-    // All queries go to worker pool
-    match state.worker_client.execute_query(&request.sql, &request.user_id).await {
-        Ok(result) => {
+
+    // Execute query based on target
+    let result = match &estimate.target {
+        QueryTarget::PreSizedWorker { address, .. } => {
+            execute_on_presized_worker(address, &request.sql, &request.user_id).await
+        }
+        QueryTarget::WorkerPool => {
+            execute_on_worker_pool(&state.worker_client, &request.sql, &request.user_id).await
+        }
+    };
+
+    // Release worker after query
+    if let Some(name) = worker_name {
+        state.query_router.release_worker(&name).await;
+    }
+
+    let route_label = match &estimate.target {
+        QueryTarget::PreSizedWorker { .. } => "presized_worker",
+        QueryTarget::WorkerPool => "worker_pool",
+    };
+
+    match result {
+        Ok((columns, column_types, rows, total_rows)) => {
             let elapsed = start_time.elapsed();
-            
-            metrics::record_query_completed("worker_pool", "success", elapsed.as_secs_f64());
-            
-            let estimated_bytes = result.total_rows as u64 * 100;
+            metrics::record_query_completed(route_label, "success", elapsed.as_secs_f64());
+
+            let estimated_bytes = total_rows as u64 * 100;
             metrics::record_data_scanned(estimated_bytes);
             metrics::record_actual_query_size((estimated_bytes as f64) / (1024.0 * 1024.0));
-            
+
             let response = QueryResponse {
-                columns: result.columns.iter().map(|c| c.name.clone()).collect(),
-                column_types: result.columns.iter().map(|c| c.type_name.clone()).collect(),
-                rows: result.rows,
-                row_count: result.total_rows as usize,
+                columns,
+                column_types,
+                rows,
+                row_count: total_rows,
                 execution_time_ms: elapsed.as_millis() as u64,
                 bytes_scanned: estimated_bytes,
                 estimated_size_mb: Some(estimate.data_size_mb),
+                required_memory_mb: Some(estimate.required_memory_mb),
+                worker_resized: Some(estimate.was_resized),
             };
             (StatusCode::OK, Json(response)).into_response()
         }
         Err(e) => {
             let elapsed = start_time.elapsed();
-            metrics::record_query_completed("worker_pool", "error", elapsed.as_secs_f64());
-            
+            metrics::record_query_completed(route_label, "error", elapsed.as_secs_f64());
+
             error!("Query failed: {}", e);
             let error_response = ErrorResponse {
                 error: e.to_string(),
                 code: "QUERY_ERROR".to_string(),
             };
             (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response)).into_response()
+        }
+    }
+}
+
+/// Execute query on a specific pre-sized worker
+async fn execute_on_presized_worker(
+    worker_addr: &str,
+    sql: &str,
+    user_id: &str,
+) -> Result<(Vec<String>, Vec<String>, Vec<Vec<String>>, usize), anyhow::Error> {
+    info!("Executing on pre-sized worker: {}", worker_addr);
+
+    const MAX_MESSAGE_SIZE: usize = 512 * 1024 * 1024;
+
+    let channel = Channel::from_shared(worker_addr.to_string())?
+        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .connect()
+        .await?;
+
+    let mut client = proto::query_service_client::QueryServiceClient::new(channel)
+        .max_decoding_message_size(MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_MESSAGE_SIZE);
+
+    let query_id = uuid::Uuid::new_v4().to_string();
+
+    let request = proto::ExecuteQueryRequest {
+        query_id,
+        sql: sql.to_string(),
+        user: Some(proto::UserIdentity {
+            user_id: user_id.to_string(),
+            tenant_id: "default".to_string(),
+            scopes: vec!["query:execute".to_string()],
+            claims: Default::default(),
+        }),
+        options: Some(proto::QueryOptions {
+            timeout_seconds: 300,
+            max_rows: 10000,
+            max_bytes: 0,
+            enable_profiling: false,
+            session_params: Default::default(),
+        }),
+        allocated_resources: None,
+    };
+
+    let response = client.execute_query(request).await?;
+    let mut stream = response.into_inner();
+
+    let mut columns: Vec<String> = Vec::new();
+    let mut column_types: Vec<String> = Vec::new();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut total_rows: u64 = 0;
+
+    while let Some(batch) = stream.message().await? {
+        match batch.result {
+            Some(proto::query_result_batch::Result::Metadata(meta)) => {
+                columns = meta.columns;
+                column_types = meta.column_types;
+                total_rows = meta.total_rows;
+            }
+            Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
+                if !batch.data.is_empty() {
+                    if let Ok(batch_rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data)
+                    {
+                        rows.extend(batch_rows);
+                    }
+                }
+            }
+            Some(proto::query_result_batch::Result::Error(err)) => {
+                return Err(anyhow::anyhow!("{}: {}", err.code, err.message));
+            }
+            _ => {}
+        }
+    }
+
+    Ok((columns, column_types, rows, total_rows as usize))
+}
+
+/// Execute query on default worker pool (fallback)
+async fn execute_on_worker_pool(
+    worker_client: &WorkerClient,
+    sql: &str,
+    user_id: &str,
+) -> Result<(Vec<String>, Vec<String>, Vec<Vec<String>>, usize), anyhow::Error> {
+    match worker_client.execute_query(sql, user_id).await {
+        Ok(result) => Ok((
+            result.columns.iter().map(|c| c.name.clone()).collect(),
+            result.columns.iter().map(|c| c.type_name.clone()).collect(),
+            result.rows,
+            result.total_rows as usize,
+        )),
+        Err(e) => {
+            warn!("Worker pool error: {}", e);
+            Err(e)
         }
     }
 }
@@ -150,9 +282,9 @@ pub async fn export_query(
     Json(request): Json<ExportRequest>,
 ) -> impl IntoResponse {
     info!("Export request to {}: {}", request.output_path, request.sql);
-    
+
     let start = std::time::Instant::now();
-    
+
     let format_options = match request.format {
         ExportFormat::Parquet if !request.partition_by.is_empty() => {
             format!(
@@ -164,30 +296,43 @@ pub async fn export_query(
         ExportFormat::Csv => "FORMAT CSV, HEADER true".to_string(),
         ExportFormat::Json => "FORMAT JSON".to_string(),
     };
-    
+
     let export_sql = format!(
         "COPY ({}) TO '{}' ({})",
         request.sql, request.output_path, format_options
     );
-    
-    match state.worker_client.execute_query(&export_sql, &request.user_id).await {
+
+    match state
+        .worker_client
+        .execute_query(&export_sql, &request.user_id)
+        .await
+    {
         Ok(_) => {
             let duration_ms = start.elapsed().as_millis() as u64;
-            info!("Export completed in {}ms to {}", duration_ms, request.output_path);
-            
-            (StatusCode::OK, Json(ExportResponse {
-                output_path: request.output_path,
-                message: "Export completed successfully".to_string(),
-                execution_time_ms: duration_ms,
-            }))
+            info!(
+                "Export completed in {}ms to {}",
+                duration_ms, request.output_path
+            );
+
+            (
+                StatusCode::OK,
+                Json(ExportResponse {
+                    output_path: request.output_path,
+                    message: "Export completed successfully".to_string(),
+                    execution_time_ms: duration_ms,
+                }),
+            )
         }
         Err(e) => {
             error!("Export failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(ExportResponse {
-                output_path: request.output_path,
-                message: format!("Export failed: {}", e),
-                execution_time_ms: start.elapsed().as_millis() as u64,
-            }))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ExportResponse {
+                    output_path: request.output_path,
+                    message: format!("Export failed: {}", e),
+                    execution_time_ms: start.elapsed().as_millis() as u64,
+                }),
+            )
         }
     }
 }
@@ -204,5 +349,5 @@ pub async fn ready() -> &'static str {
 
 /// Root endpoint
 pub async fn root() -> &'static str {
-    "Tavana Gateway - HPA+VPA Managed Worker Pool (K8s v1.35)"
+    "Tavana Gateway - Query-Aware Pre-Sizing (K8s v1.35)"
 }

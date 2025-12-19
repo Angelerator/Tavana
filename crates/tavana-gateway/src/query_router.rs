@@ -1,35 +1,38 @@
-//! Query Router - Routes all queries to the HPA+VPA managed worker pool
+//! Query Router - Routes queries to pre-sized workers
 //!
-//! Simplified architecture:
-//! - All queries go to worker pool (no ephemeral pods)
-//! - HPA scales pod count based on load
-//! - VPA scales pod resources based on query size
-//! - K8s v1.35 in-place resize allows seamless vertical scaling
+//! Query-aware pre-sizing architecture:
+//! 1. Estimate query data size
+//! 2. Calculate required memory (data_size × 0.5)
+//! 3. Find idle worker and pre-size if needed (K8s v1.35 in-place resize)
+//! 4. Route query to pre-sized worker
 
 use regex::Regex;
 use sqlparser::ast::{SetExpr, Statement, TableFactor};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::data_sizer::{DataSizer, EstimationMethod};
 use crate::metrics;
+use crate::worker_pool::{PreSizedWorker, WorkerPoolManager};
 
-/// Query execution target - always worker pool now
+/// Query execution target
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryTarget {
-    /// Route to HPA+VPA managed worker pool
+    /// Route to HPA+VPA managed worker pool (default service)
     WorkerPool,
+    /// Route to a specific pre-sized worker (pod IP)
+    PreSizedWorker { address: String, worker_name: String },
 }
 
-/// Estimated query resources (for metrics/logging)
+/// Estimated query resources
 #[derive(Debug, Clone)]
 pub struct QueryEstimate {
     /// Estimated data size in MB
     pub data_size_mb: u64,
-    /// Estimated memory needed in MB
-    pub memory_mb: u64,
+    /// Required memory in MB (after applying multiplier)
+    pub required_memory_mb: u64,
     /// Estimated CPU cores needed
     pub cpu_cores: f32,
     /// Tables/files referenced
@@ -38,40 +41,58 @@ pub struct QueryEstimate {
     pub has_aggregation: bool,
     /// Has joins
     pub has_join: bool,
-    /// Routing decision (always WorkerPool)
+    /// Routing decision
     pub target: QueryTarget,
     /// Estimation method used
     pub estimation_method: String,
+    /// Whether worker was resized
+    pub was_resized: bool,
 }
 
-/// Query Router for worker pool execution
+/// Query Router with pre-sizing support
 pub struct QueryRouter {
-    /// Data sizer for size estimation (for metrics)
+    /// Data sizer for size estimation
     data_sizer: Arc<DataSizer>,
+    /// Worker pool manager for pre-sizing
+    pool_manager: Option<Arc<WorkerPoolManager>>,
 }
 
 impl QueryRouter {
-    /// Create a new query router
+    /// Create a new query router without pre-sizing
     pub fn new(data_sizer: Arc<DataSizer>) -> Self {
-        Self { data_sizer }
+        Self {
+            data_sizer,
+            pool_manager: None,
+        }
     }
 
-    /// Analyze and route a query (always to worker pool)
+    /// Create a new query router with pre-sizing support
+    pub fn with_pool_manager(
+        data_sizer: Arc<DataSizer>,
+        pool_manager: Arc<WorkerPoolManager>,
+    ) -> Self {
+        Self {
+            data_sizer,
+            pool_manager: Some(pool_manager),
+        }
+    }
+
+    /// Analyze, pre-size, and route a query
     pub async fn route(&self, sql: &str) -> QueryEstimate {
         // Parse SQL to extract table references
         let tables = self.extract_tables(sql);
         let (has_aggregation, has_join) = self.analyze_query_complexity(sql);
 
-        // Get data size estimate (for metrics/logging, not routing)
+        // Get data size estimate
         let size_estimate = self.data_sizer.estimate_query_size(sql, &tables).await;
 
-        // All queries go to worker pool
-        let target = QueryTarget::WorkerPool;
+        let estimation_method = size_estimate
+            .sources
+            .first()
+            .map(|s| format!("{:?}", s.estimation_method))
+            .unwrap_or_else(|| "unknown".to_string());
 
-        // Record metrics
-        metrics::record_query_routed("worker_pool", size_estimate.total_mb as f64);
-
-        // Record estimation method
+        // Record estimation method metrics
         for source in &size_estimate.sources {
             metrics::record_estimation_method(match source.estimation_method {
                 EstimationMethod::S3Head => "s3_head",
@@ -83,40 +104,84 @@ impl QueryRouter {
             });
         }
 
-        let estimation_method = size_estimate
-            .sources
-            .first()
-            .map(|s| format!("{:?}", s.estimation_method))
-            .unwrap_or_else(|| "unknown".to_string());
+        // Try pre-sizing if pool manager is available and enabled
+        let (target, required_memory_mb, was_resized) = if let Some(ref pm) = self.pool_manager {
+            if pm.is_enabled() {
+                // Calculate required memory using pool manager's formula
+                let required_memory = pm.calculate_memory_mb(size_estimate.total_mb);
+
+                match pm.get_presized_worker(required_memory).await {
+                    Ok(worker) => {
+                        info!(
+                            "Pre-sized worker {} to {}MB for query (data={}MB, resized={})",
+                            worker.name, worker.memory_mb, size_estimate.total_mb, worker.resized
+                        );
+                        metrics::record_query_routed("presized_worker", size_estimate.total_mb as f64);
+                        (
+                            QueryTarget::PreSizedWorker {
+                                address: worker.address,
+                                worker_name: worker.name,
+                            },
+                            worker.memory_mb,
+                            worker.resized,
+                        )
+                    }
+                    Err(e) => {
+                        warn!("Failed to get pre-sized worker: {}, falling back to pool", e);
+                        metrics::record_query_routed("worker_pool", size_estimate.total_mb as f64);
+                        (QueryTarget::WorkerPool, size_estimate.estimated_memory_mb, false)
+                    }
+                }
+            } else {
+                // Pre-sizing disabled
+                metrics::record_query_routed("worker_pool", size_estimate.total_mb as f64);
+                (QueryTarget::WorkerPool, size_estimate.estimated_memory_mb, false)
+            }
+        } else {
+            // No pool manager
+            metrics::record_query_routed("worker_pool", size_estimate.total_mb as f64);
+            (QueryTarget::WorkerPool, size_estimate.estimated_memory_mb, false)
+        };
 
         let estimate = QueryEstimate {
             data_size_mb: size_estimate.total_mb,
-            memory_mb: size_estimate.estimated_memory_mb,
+            required_memory_mb,
             cpu_cores: self.estimate_cpu_cores(size_estimate.total_mb, has_join, has_aggregation),
             tables,
             has_aggregation,
             has_join,
             target,
             estimation_method,
+            was_resized,
         };
 
         info!(
-            "Query routed to WorkerPool: data={}MB, memory={}MB, method={}, tables={:?}",
+            "Query routed: data={}MB, memory={}MB, method={}, target={:?}, resized={}",
             estimate.data_size_mb,
-            estimate.memory_mb,
+            estimate.required_memory_mb,
             estimate.estimation_method,
-            estimate.tables
+            match &estimate.target {
+                QueryTarget::WorkerPool => "WorkerPool".to_string(),
+                QueryTarget::PreSizedWorker { worker_name, .. } => format!("PreSized({})", worker_name),
+            },
+            estimate.was_resized
         );
 
         estimate
     }
 
-    /// Synchronous route for simpler cases
+    /// Release a worker after query completion
+    pub async fn release_worker(&self, worker_name: &str) {
+        if let Some(ref pm) = self.pool_manager {
+            pm.release_worker(worker_name).await;
+        }
+    }
+
+    /// Synchronous route for simpler cases (no pre-sizing)
     pub fn route_sync(&self, sql: &str) -> QueryEstimate {
         let tables = self.extract_tables(sql);
         let (has_aggregation, has_join) = self.analyze_query_complexity(sql);
 
-        // Simple size estimation
         let data_size_mb = self.estimate_size_sync(&tables, sql);
         let memory_mb = self.estimate_memory(data_size_mb, has_join, has_aggregation);
         let cpu_cores = self.estimate_cpu_cores(data_size_mb, has_join, has_aggregation);
@@ -125,13 +190,14 @@ impl QueryRouter {
 
         QueryEstimate {
             data_size_mb,
-            memory_mb,
+            required_memory_mb: memory_mb,
             cpu_cores,
             tables,
             has_aggregation,
             has_join,
             target: QueryTarget::WorkerPool,
             estimation_method: "sync".to_string(),
+            was_resized: false,
         }
     }
 
@@ -139,7 +205,6 @@ impl QueryRouter {
     fn extract_tables(&self, sql: &str) -> Vec<String> {
         let mut tables = Vec::new();
 
-        // Parse SQL
         let dialect = GenericDialect {};
         if let Ok(statements) = Parser::parse_sql(&dialect, sql) {
             for stmt in &statements {
@@ -156,13 +221,10 @@ impl QueryRouter {
             }
         }
 
-        // Also extract from raw SQL for DuckDB functions
         self.extract_tables_from_sql(sql, &mut tables);
-
         tables
     }
 
-    /// Extract table from TableFactor
     fn extract_table_factor(&self, factor: &TableFactor, tables: &mut Vec<String>) {
         match factor {
             TableFactor::Table { name, .. } => {
@@ -175,7 +237,6 @@ impl QueryRouter {
         }
     }
 
-    /// Extract tables from raw SQL (for DuckDB functions)
     fn extract_tables_from_sql(&self, sql: &str, tables: &mut Vec<String>) {
         let patterns = [
             r"read_csv_auto\s*\(\s*'([^']+)'",
@@ -201,98 +262,58 @@ impl QueryRouter {
         }
     }
 
-    /// Analyze query complexity
     fn analyze_query_complexity(&self, sql: &str) -> (bool, bool) {
         let sql_upper = sql.to_uppercase();
-
         let has_join = sql_upper.contains(" JOIN ");
-
         let has_aggregation = sql_upper.contains("GROUP BY")
             || sql_upper.contains("SUM(")
             || sql_upper.contains("COUNT(")
             || sql_upper.contains("AVG(")
             || sql_upper.contains("MIN(")
             || sql_upper.contains("MAX(");
-
         (has_aggregation, has_join)
     }
 
-    /// Estimate CPU cores needed
     fn estimate_cpu_cores(&self, data_size_mb: u64, has_join: bool, has_aggregation: bool) -> f32 {
         let mut cores: f32 = 1.0;
-
-        if data_size_mb > 1000 {
-            cores += 1.0;
-        }
-        if has_join {
-            cores += 1.0;
-        }
-        if has_aggregation {
-            cores += 0.5;
-        }
-
+        if data_size_mb > 1000 { cores += 1.0; }
+        if has_join { cores += 1.0; }
+        if has_aggregation { cores += 0.5; }
         cores.min(8.0)
     }
 
-    /// Simple size estimation for sync path
     fn estimate_size_sync(&self, tables: &[String], sql: &str) -> u64 {
         let mut total_mb: u64 = 0;
-
         for table in tables {
             if table.starts_with("s3://") || table.contains(".parquet") || table.contains(".csv") {
-                total_mb += 100; // Default estimate
+                total_mb += 100;
             } else {
                 total_mb += 50;
             }
         }
-
-        // Check for LIMIT
         if let Some(limit) = self.extract_limit(sql) {
             if limit < 10000 {
                 total_mb = (total_mb / 10).max(10);
             }
         }
-
         total_mb.max(10)
     }
 
-    /// Estimate memory based on data size and complexity
     fn estimate_memory(&self, data_size_mb: u64, has_join: bool, has_aggregation: bool) -> u64 {
         let mut multiplier = 2.0;
-
-        if has_join {
-            multiplier *= 1.5;
-        }
-        if has_aggregation {
-            multiplier *= 1.2;
-        }
-
+        if has_join { multiplier *= 1.5; }
+        if has_aggregation { multiplier *= 1.2; }
         let memory = (data_size_mb as f64 * multiplier) as u64;
         memory.max(256)
     }
 
-    /// Extract LIMIT value
     fn extract_limit(&self, sql: &str) -> Option<u64> {
         let sql_upper = sql.to_uppercase();
         if let Some(pos) = sql_upper.find("LIMIT") {
             let after = &sql[pos + 5..];
-            let num_str: String = after
-                .trim()
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
+            let num_str: String = after.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
             return num_str.parse().ok();
         }
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_complexity_analysis() {
-        // Create a minimal router for testing would require mocking DataSizer
     }
 }
