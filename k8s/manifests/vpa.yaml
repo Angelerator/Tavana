@@ -1,0 +1,35 @@
+# Vertical Pod Autoscaler for Tavana Worker Pool
+# Automatically adjusts pod resources based on actual usage
+# Uses K8s v1.35 in-place resize (no pod restarts)
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: worker-vpa
+  namespace: tavana
+  labels:
+    app: tavana
+    component: worker
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+  updatePolicy:
+    # Auto: VPA automatically applies recommended resources
+    # With K8s v1.35 in-place resize, this happens without pod restarts
+    updateMode: Auto
+  resourcePolicy:
+    containerPolicies:
+      - containerName: worker
+        # Minimum resources - pods start small
+        minAllowed:
+          memory: 256Mi
+          cpu: 100m
+        # Maximum resources - can grow up to 400GB for large queries
+        maxAllowed:
+          memory: 400Gi
+          cpu: 64
+        # Control how VPA makes recommendations
+        controlledResources: ["cpu", "memory"]
+        controlledValues: RequestsAndLimits
+
