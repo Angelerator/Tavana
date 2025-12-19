@@ -1,3 +1,6 @@
+# Tavana Gateway Deployment
+# Simplified: No adaptive config, all queries go to worker pool
+# Uses K8s v1.35 in-place resize
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -44,35 +47,30 @@ spec:
             - configMapRef:
                 name: tavana-config
           env:
-            # For testing: very low threshold to trigger ephemeral pods
-            - name: BASE_THRESHOLD_GB
-              value: "0.1"  # 100MB base threshold
-            - name: MIN_THRESHOLD_GB
-              value: "0.05"  # 50MB minimum threshold
-            - name: MAX_THRESHOLD_GB
-              value: "0.5"   # 500MB maximum threshold
             - name: LOG_LEVEL
               value: "info"
-          volumeMounts:
-            - name: adaptive-config
-              mountPath: /etc/tavana
-              readOnly: true
           resources:
             requests:
               memory: "256Mi"
-              cpu: "200m"
+              cpu: "100m"
             limits:
-              memory: "1Gi"  # Increased for handling large query results
+              memory: "2Gi"
               cpu: "2"
-          # Startup probe: gives the service time to initialize (up to 60s)
+          # K8s v1.35: In-place resize policy
+          resizePolicy:
+            - resourceName: memory
+              restartPolicy: NotRequired
+            - resourceName: cpu
+              restartPolicy: NotRequired
+          # Startup probe
           startupProbe:
             httpGet:
               path: /health
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 5
-            failureThreshold: 12  # 12 * 5s = 60s max startup time
-          # Readiness probe: determines if pod can receive traffic
+            failureThreshold: 12
+          # Readiness probe
           readinessProbe:
             httpGet:
               path: /health
@@ -81,7 +79,7 @@ spec:
             periodSeconds: 10
             successThreshold: 1
             failureThreshold: 3
-          # Liveness probe: restarts pod if unresponsive
+          # Liveness probe
           livenessProbe:
             httpGet:
               path: /health
@@ -90,10 +88,6 @@ spec:
             periodSeconds: 20
             timeoutSeconds: 5
             failureThreshold: 3
-      volumes:
-        - name: adaptive-config
-          configMap:
-            name: tavana-adaptive-config
 ---
 # PodDisruptionBudget ensures at least 1 gateway is always available
 apiVersion: policy/v1
