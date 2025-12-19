@@ -1,16 +1,18 @@
 //! PostgreSQL wire protocol implementation
 //!
 //! Enables Tableau, PowerBI, DBeaver and other BI tools to connect natively.
-//! All queries are routed to the HPA+VPA managed worker pool.
+//! Uses query-aware pre-sizing to resize workers before query execution.
 
 use crate::auth::AuthService;
 use crate::metrics;
-use crate::query_router::QueryRouter;
+use crate::query_router::{QueryRouter, QueryTarget};
 use crate::worker_client::WorkerClient;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
+use tavana_common::proto;
 use tokio::net::TcpListener;
+use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
 /// PostgreSQL wire protocol server
@@ -223,17 +225,52 @@ async fn handle_connection(
 
                 let start_time = Instant::now();
 
-                // Route query (all go to worker pool now)
+                // Route query with pre-sizing
                 let estimate = query_router.route(&query).await;
-                info!("Query routed: {}MB data → Worker Pool", estimate.data_size_mb);
+                
+                // Extract worker info for releasing later
+                let worker_name = match &estimate.target {
+                    QueryTarget::PreSizedWorker { worker_name, .. } => Some(worker_name.clone()),
+                    QueryTarget::WorkerPool => None,
+                };
 
-                // Execute via worker pool
-                let result = execute_query_via_worker(&worker_client, &query, &user_id).await;
+                info!(
+                    "Query routed: {}MB data, {}MB memory, resized={}, target={:?}",
+                    estimate.data_size_mb,
+                    estimate.required_memory_mb,
+                    estimate.was_resized,
+                    match &estimate.target {
+                        QueryTarget::WorkerPool => "WorkerPool".to_string(),
+                        QueryTarget::PreSizedWorker { worker_name, .. } => format!("PreSized({})", worker_name),
+                    }
+                );
+
+                // Execute query based on target
+                let result = match &estimate.target {
+                    QueryTarget::PreSizedWorker { address, .. } => {
+                        // Execute on specific pre-sized worker
+                        execute_query_on_worker(address, &query, &user_id).await
+                    }
+                    QueryTarget::WorkerPool => {
+                        // Fallback to default worker pool
+                        execute_query_via_worker(&worker_client, &query, &user_id).await
+                    }
+                };
+
+                // Release worker after query
+                if let Some(name) = worker_name {
+                    query_router.release_worker(&name).await;
+                }
+
+                let route_label = match &estimate.target {
+                    QueryTarget::PreSizedWorker { .. } => "presized_worker",
+                    QueryTarget::WorkerPool => "worker_pool",
+                };
 
                 match result {
                     Ok(result) => {
                         let duration = start_time.elapsed().as_secs_f64();
-                        metrics::record_query_completed("worker_pool", "success", duration);
+                        metrics::record_query_completed(route_label, "success", duration);
                         
                         let estimated_bytes = (result.rows.len() * result.columns.len() * 50) as u64;
                         let estimated_mb = estimated_bytes as f64 / (1024.0 * 1024.0);
@@ -246,7 +283,7 @@ async fn handle_connection(
                     }
                     Err(e) => {
                         let duration = start_time.elapsed().as_secs_f64();
-                        metrics::record_query_completed("worker_pool", "error", duration);
+                        metrics::record_query_completed(route_label, "error", duration);
                         warn!("Query execution failed: {}", e);
                         send_error(&mut socket, &e.to_string()).await?;
                     }
@@ -279,13 +316,99 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Execute a query using the worker service
+/// Execute query on a specific pre-sized worker by address
+async fn execute_query_on_worker(
+    worker_addr: &str,
+    sql: &str,
+    user_id: &str,
+) -> anyhow::Result<QueryExecutionResult> {
+    // Handle PostgreSQL-specific commands locally
+    if let Some(result) = handle_pg_specific_command(sql) {
+        return Ok(result);
+    }
+
+    info!("Executing query on pre-sized worker: {}", worker_addr);
+
+    // Connect directly to the pre-sized worker
+    const MAX_MESSAGE_SIZE: usize = 512 * 1024 * 1024;
+    
+    let channel = Channel::from_shared(worker_addr.to_string())?
+        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .connect()
+        .await?;
+
+    let mut client = proto::query_service_client::QueryServiceClient::new(channel)
+        .max_decoding_message_size(MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_MESSAGE_SIZE);
+
+    let query_id = uuid::Uuid::new_v4().to_string();
+
+    let request = proto::ExecuteQueryRequest {
+        query_id: query_id.clone(),
+        sql: sql.to_string(),
+        user: Some(proto::UserIdentity {
+            user_id: user_id.to_string(),
+            tenant_id: "default".to_string(),
+            scopes: vec!["query:execute".to_string()],
+            claims: Default::default(),
+        }),
+        options: Some(proto::QueryOptions {
+            timeout_seconds: 300,
+            max_rows: 10000,
+            max_bytes: 0,
+            enable_profiling: false,
+            session_params: Default::default(),
+        }),
+        allocated_resources: None,
+    };
+
+    let response = client.execute_query(request).await?;
+    let mut stream = response.into_inner();
+
+    let mut columns: Vec<(String, String)> = Vec::new();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut total_rows: u64 = 0;
+
+    while let Some(batch) = stream.message().await? {
+        match batch.result {
+            Some(proto::query_result_batch::Result::Metadata(meta)) => {
+                columns = meta
+                    .columns
+                    .iter()
+                    .zip(meta.column_types.iter())
+                    .map(|(name, type_name)| (name.clone(), type_name.clone()))
+                    .collect();
+                total_rows = meta.total_rows;
+            }
+            Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
+                if !batch.data.is_empty() {
+                    if let Ok(batch_rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                        rows.extend(batch_rows);
+                    }
+                }
+            }
+            Some(proto::query_result_batch::Result::Error(err)) => {
+                return Err(anyhow::anyhow!("{}: {}", err.code, err.message));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(QueryExecutionResult {
+        columns,
+        rows,
+        row_count: total_rows as usize,
+        command_tag: None,
+    })
+}
+
+/// Execute a query using the default worker service (fallback)
 async fn execute_query_via_worker(
     worker_client: &WorkerClient,
     sql: &str,
     user_id: &str,
 ) -> anyhow::Result<QueryExecutionResult> {
-    // Handle PostgreSQL-specific commands locally
     if let Some(result) = handle_pg_specific_command(sql) {
         return Ok(result);
     }
@@ -308,7 +431,6 @@ async fn execute_query_via_worker(
     }
 }
 
-/// Handle PostgreSQL-specific commands that DuckDB doesn't support
 fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
     let sql_upper = sql.to_uppercase();
     let sql_trimmed = sql_upper.trim();
@@ -340,48 +462,23 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
     }
 
     if sql_trimmed.starts_with("RESET ") {
-        return Some(QueryExecutionResult {
-            columns: vec![],
-            rows: vec![],
-            row_count: 0,
-            command_tag: Some("RESET".to_string()),
-        });
+        return Some(QueryExecutionResult { columns: vec![], rows: vec![], row_count: 0, command_tag: Some("RESET".to_string()) });
     }
 
     if sql_trimmed == "BEGIN" || sql_trimmed.starts_with("BEGIN ") {
-        return Some(QueryExecutionResult {
-            columns: vec![],
-            rows: vec![],
-            row_count: 0,
-            command_tag: Some("BEGIN".to_string()),
-        });
+        return Some(QueryExecutionResult { columns: vec![], rows: vec![], row_count: 0, command_tag: Some("BEGIN".to_string()) });
     }
 
     if sql_trimmed == "COMMIT" {
-        return Some(QueryExecutionResult {
-            columns: vec![],
-            rows: vec![],
-            row_count: 0,
-            command_tag: Some("COMMIT".to_string()),
-        });
+        return Some(QueryExecutionResult { columns: vec![], rows: vec![], row_count: 0, command_tag: Some("COMMIT".to_string()) });
     }
 
     if sql_trimmed == "ROLLBACK" {
-        return Some(QueryExecutionResult {
-            columns: vec![],
-            rows: vec![],
-            row_count: 0,
-            command_tag: Some("ROLLBACK".to_string()),
-        });
+        return Some(QueryExecutionResult { columns: vec![], rows: vec![], row_count: 0, command_tag: Some("ROLLBACK".to_string()) });
     }
 
     if sql_trimmed.starts_with("DISCARD ") || sql_trimmed.starts_with("DEALLOCATE ") || sql_trimmed.starts_with("CLOSE ") {
-        return Some(QueryExecutionResult {
-            columns: vec![],
-            rows: vec![],
-            row_count: 0,
-            command_tag: Some("OK".to_string()),
-        });
+        return Some(QueryExecutionResult { columns: vec![], rows: vec![], row_count: 0, command_tag: Some("OK".to_string()) });
     }
 
     if sql_upper.contains("PG_CATALOG") || sql_upper.contains("INFORMATION_SCHEMA") {
@@ -400,7 +497,6 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
     None
 }
 
-/// Fallback local execution
 async fn execute_local_fallback(sql: &str) -> anyhow::Result<QueryExecutionResult> {
     let sql_upper = sql.to_uppercase();
 
@@ -437,10 +533,7 @@ struct QueryExecutionResult {
     command_tag: Option<String>,
 }
 
-async fn send_query_result(
-    socket: &mut tokio::net::TcpStream,
-    result: QueryExecutionResult,
-) -> anyhow::Result<()> {
+async fn send_query_result(socket: &mut tokio::net::TcpStream, result: QueryExecutionResult) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
 
     if result.columns.is_empty() {
@@ -449,7 +542,6 @@ async fn send_query_result(
         return Ok(());
     }
 
-    // Send RowDescription
     let mut row_desc = Vec::new();
     row_desc.push(b'T');
 
@@ -473,7 +565,6 @@ async fn send_query_result(
     row_desc.extend_from_slice(&fields_data);
     socket.write_all(&row_desc).await?;
 
-    // Send DataRows
     for row in &result.rows {
         let mut data_row = Vec::new();
         data_row.push(b'D');
@@ -498,7 +589,6 @@ async fn send_query_result(
 
     let tag = format!("SELECT {}", result.rows.len());
     send_command_complete(socket, &tag).await?;
-
     Ok(())
 }
 
@@ -565,11 +655,11 @@ fn extract_startup_param(msg: &[u8], key: &str) -> Option<String> {
 
 fn pg_type_oid(type_name: &str) -> u32 {
     match type_name.to_lowercase().as_str() {
-        "int4" | "integer" | "int" => 23,
-        "int8" | "bigint" => 20,
-        "int2" | "smallint" => 21,
-        "float4" | "real" => 700,
-        "float8" | "double" => 701,
+        "int4" | "integer" | "int" | "int32" => 23,
+        "int8" | "bigint" | "int64" => 20,
+        "int2" | "smallint" | "int16" => 21,
+        "float4" | "real" | "float" => 700,
+        "float8" | "double" | "float64" => 701,
         "bool" | "boolean" => 16,
         "timestamp" | "timestamptz" => 1184,
         "date" => 1082,
@@ -579,11 +669,11 @@ fn pg_type_oid(type_name: &str) -> u32 {
 
 fn pg_type_len(type_name: &str) -> i16 {
     match type_name.to_lowercase().as_str() {
-        "int4" | "integer" | "int" => 4,
-        "int8" | "bigint" => 8,
-        "int2" | "smallint" => 2,
-        "float4" | "real" => 4,
-        "float8" | "double" => 8,
+        "int4" | "integer" | "int" | "int32" => 4,
+        "int8" | "bigint" | "int64" => 8,
+        "int2" | "smallint" | "int16" => 2,
+        "float4" | "real" | "float" => 4,
+        "float8" | "double" | "float64" => 8,
         "bool" | "boolean" => 1,
         _ => -1,
     }
