@@ -259,7 +259,8 @@ async fn handle_connection(
 
                 // Release worker after query
                 if let Some(name) = worker_name {
-                    query_router.release_worker(&name).await;
+                    // TODO: Get actual memory usage from worker for better pre-sizing accuracy
+                    query_router.release_worker(&name, None).await;
                 }
 
                 let route_label = match &estimate.target {
