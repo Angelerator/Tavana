@@ -1,3 +1,6 @@
+# Tavana Worker Deployment
+# Uses K8s v1.35 features: in-place resize, restart rules
+# Managed by HPA (count) and VPA (size)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -7,8 +10,8 @@ metadata:
     app: tavana
     component: worker
 spec:
-  # Start with 1 replica, HPA will scale 1-10 based on load
-  replicas: 1
+  # Initial replicas - HPA takes over immediately
+  replicas: 2
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -31,36 +34,44 @@ spec:
           ports:
             - containerPort: 50053
           env:
-            # Connection pool size per worker (4 parallel queries)
+            # Connection pool size per worker
             - name: POOL_SIZE
               value: "4"
             - name: LOG_LEVEL
               value: "info"
-            # DuckDB memory and temp settings
+            # DuckDB settings - will be adjusted by VPA
             - name: MAX_MEMORY_GB
-              value: "3"  # Leave 1GB headroom from 4Gi limit
+              value: "0"  # 0 = auto-detect from container limits
             - name: DUCKDB_TEMP_DIR
               value: "/tmp/duckdb"
             - name: DUCKDB_MAX_TEMP_SIZE
-              value: "10GB"
+              value: "50GB"
           envFrom:
             - configMapRef:
                 name: tavana-config
+          # Start small - VPA will resize as needed
           resources:
             requests:
-              memory: "1Gi"  # Increased for stability
-              cpu: "500m"
+              memory: "256Mi"
+              cpu: "100m"
             limits:
-              memory: "4Gi"
-              cpu: "2"
-          # Startup probe: allow DuckDB to initialize (up to 60s)
+              memory: "400Gi"  # Max allowed by VPA
+              cpu: "64"
+          # K8s v1.35: In-place resize policy
+          # Allows VPA to resize without restarting the pod
+          resizePolicy:
+            - resourceName: memory
+              restartPolicy: NotRequired
+            - resourceName: cpu
+              restartPolicy: NotRequired
+          # Startup probe: allow DuckDB to initialize
           startupProbe:
             tcpSocket:
               port: 50053
             initialDelaySeconds: 5
             periodSeconds: 5
-            failureThreshold: 12  # 12 * 5s = 60s max startup time
-          # Readiness probe: check if worker can accept queries
+            failureThreshold: 12
+          # Readiness probe: worker can accept queries
           readinessProbe:
             tcpSocket:
               port: 50053
@@ -68,12 +79,12 @@ spec:
             periodSeconds: 10
             successThreshold: 1
             failureThreshold: 3
-          # Liveness probe: increased timeout for heavy queries
+          # Liveness probe: worker is responsive
           livenessProbe:
             tcpSocket:
               port: 50053
             initialDelaySeconds: 15
-            periodSeconds: 30  # Less frequent to avoid false positives during heavy queries
+            periodSeconds: 30
             timeoutSeconds: 10
             failureThreshold: 3
           volumeMounts:
@@ -82,7 +93,7 @@ spec:
       volumes:
         - name: duckdb-temp
           emptyDir:
-            sizeLimit: 10Gi
+            sizeLimit: 50Gi
 ---
 apiVersion: v1
 kind: Service
@@ -95,8 +106,11 @@ spec:
   ports:
     - port: 50053
       targetPort: 50053
+  # K8s v1.35: Prefer routing to workers on the same node
+  # Reduces network latency for query execution
+  trafficDistribution: PreferSameNode
 ---
-# PodDisruptionBudget for worker pool availability during HPA scaling
+# PodDisruptionBudget: ensure at least 1 worker available
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
