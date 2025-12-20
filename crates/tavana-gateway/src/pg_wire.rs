@@ -1,12 +1,12 @@
-//! PostgreSQL wire protocol implementation
+//! PostgreSQL wire protocol implementation with streaming support
 //!
 //! Enables Tableau, PowerBI, DBeaver and other BI tools to connect natively.
-//! Uses query-aware pre-sizing to resize workers before query execution.
+//! Uses true row-by-row streaming to handle unlimited result sizes without OOM.
 
 use crate::auth::AuthService;
 use crate::metrics;
 use crate::query_router::{QueryRouter, QueryTarget};
-use crate::worker_client::WorkerClient;
+use crate::worker_client::{WorkerClient, StreamingBatch};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,6 +14,9 @@ use tavana_common::proto;
 use tokio::net::TcpListener;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
+
+/// Maximum rows to buffer before flushing to client (backpressure control)
+const STREAMING_BATCH_SIZE: usize = 1000;
 
 /// PostgreSQL wire protocol server
 pub struct PgWireServer {
@@ -41,7 +44,7 @@ impl PgWireServer {
 
     /// Start the PostgreSQL wire protocol server
     pub async fn start(&self) -> anyhow::Result<()> {
-        info!("Starting PostgreSQL wire protocol server on {}", self.addr);
+        info!("Starting PostgreSQL wire protocol server on {} (streaming mode)", self.addr);
 
         let listener = TcpListener::bind(&self.addr).await?;
 
@@ -98,209 +101,144 @@ async fn handle_connection(
                 startup_msg[2],
                 startup_msg[3],
             ]);
-            debug!("Received special request code: {}", code);
-
             match code {
-                80877103 => { // SSL request
-                    debug!("SSL request - responding 'N'");
-                    socket.write_all(b"N").await?;
+                80877103 => {
+                    debug!("SSL negotiation requested, declining");
+                    socket.write_all(&[b'N']).await?;
                     socket.flush().await?;
                     continue;
                 }
-                80877104 => { // GSSAPI request
-                    debug!("GSSAPI request - responding 'N'");
-                    socket.write_all(b"N").await?;
+                80877104 => {
+                    debug!("GSSAPI negotiation requested, declining");
+                    socket.write_all(&[b'N']).await?;
                     socket.flush().await?;
                     continue;
                 }
-                80877102 => { // Cancel request
-                    info!("Received cancel request");
-                    return Ok(());
+                _ => {}
                 }
-                _ => break,
             }
-        } else {
             break;
         }
-    }
 
-    // Parse protocol version
-    if startup_msg.len() >= 4 {
-        let version = u32::from_be_bytes([
-            startup_msg[0],
-            startup_msg[1],
-            startup_msg[2],
-            startup_msg[3],
-        ]);
-        debug!("Protocol version: {}.{}", version >> 16, version & 0xFFFF);
-    }
+    // Extract user from startup message
+    let user_id = extract_startup_param(&startup_msg, "user").unwrap_or_else(|| "anonymous".to_string());
+    info!("PostgreSQL client connected as user: {}", user_id);
 
-    let user_id = extract_startup_param(&startup_msg, "user").unwrap_or("anonymous".to_string());
-    info!("User connecting: {}", user_id);
+    // Send AuthenticationOk (R)
+    socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
 
-    // Request cleartext password
-    let auth_cleartext = [b'R', 0, 0, 0, 8, 0, 0, 0, 3];
-    socket.write_all(&auth_cleartext).await?;
-    socket.flush().await?;
+    // Send common parameter status messages
+    send_parameter_status(&mut socket, "server_version", "15.0 (Tavana DuckDB)").await?;
+    send_parameter_status(&mut socket, "client_encoding", "UTF8").await?;
+    send_parameter_status(&mut socket, "server_encoding", "UTF8").await?;
+    send_parameter_status(&mut socket, "DateStyle", "ISO, MDY").await?;
+    send_parameter_status(&mut socket, "TimeZone", "UTC").await?;
+    send_parameter_status(&mut socket, "integer_datetimes", "on").await?;
+    send_parameter_status(&mut socket, "standard_conforming_strings", "on").await?;
 
-    // Read password message
-    let mut pwd_type = [0u8; 1];
-    match socket.read_exact(&mut pwd_type).await {
-        Ok(_) => {
-            if pwd_type[0] == b'p' {
-                let mut pwd_len_buf = [0u8; 4];
-                socket.read_exact(&mut pwd_len_buf).await?;
-                let pwd_len = u32::from_be_bytes(pwd_len_buf) as usize - 4;
-                let mut pwd_data = vec![0u8; pwd_len];
-                socket.read_exact(&mut pwd_data).await?;
-                info!("Password received, accepting");
-            } else {
-                let mut len_buf = [0u8; 4];
-                if socket.read_exact(&mut len_buf).await.is_ok() {
-                    let len = u32::from_be_bytes(len_buf) as usize;
-                    if len > 4 && len < 65536 {
-                        let mut discard = vec![0u8; len - 4];
-                        let _ = socket.read_exact(&mut discard).await;
-                    }
-                }
-            }
-        }
-        Err(_) => {}
-    }
-
-    // Send AuthenticationOk
-    let auth_ok = [b'R', 0, 0, 0, 8, 0, 0, 0, 0];
-    socket.write_all(&auth_ok).await?;
-    socket.flush().await?;
-
-    // Send ParameterStatus messages
-    for (key, value) in [
-        ("server_version", "15.0"),
-        ("server_encoding", "UTF8"),
-        ("client_encoding", "UTF8"),
-        ("DateStyle", "ISO, MDY"),
-        ("TimeZone", "UTC"),
-        ("application_name", ""),
-        ("integer_datetimes", "on"),
-        ("standard_conforming_strings", "on"),
-        ("IntervalStyle", "postgres"),
-        ("is_superuser", "on"),
-        ("session_authorization", "tavana"),
-    ] {
-        send_parameter_status(&mut socket, key, value).await?;
-    }
-
-    // Send BackendKeyData
-    let key_data = [b'K', 0, 0, 0, 12, 0, 0, 0, 1, 0, 0, 0, 1];
+    // Send BackendKeyData (K)
+    let pid = std::process::id();
+    let secret = pid.wrapping_mul(1103515245).wrapping_add(12345); // Simple PRNG
+    let mut key_data = vec![b'K', 0, 0, 0, 12];
+    key_data.extend_from_slice(&(pid as u32).to_be_bytes());
+    key_data.extend_from_slice(&secret.to_be_bytes());
     socket.write_all(&key_data).await?;
 
-    // Send ReadyForQuery
+    // Send ReadyForQuery (Z)
     let ready = [b'Z', 0, 0, 0, 5, b'I'];
     socket.write_all(&ready).await?;
     socket.flush().await?;
 
-    info!("PostgreSQL handshake completed for user {}", user_id);
+    // State for extended query protocol
+    let mut prepared_query: Option<String> = None;
 
     // Main query loop
     loop {
         let mut msg_type = [0u8; 1];
         if socket.read_exact(&mut msg_type).await.is_err() {
+            debug!("Client disconnected");
             break;
         }
 
         match msg_type[0] {
+            b'X' => {
+                debug!("Client sent Terminate message");
+                break;
+            }
             b'Q' => {
-                // Simple query
+                // Simple Query protocol - this is where DBeaver sends queries
                 socket.read_exact(&mut buf).await?;
                 let len = u32::from_be_bytes(buf) as usize - 4;
-                let mut query_buf = vec![0u8; len];
-                socket.read_exact(&mut query_buf).await?;
+                let mut query_bytes = vec![0u8; len];
+                socket.read_exact(&mut query_bytes).await?;
 
-                if query_buf.last() == Some(&0) {
-                    query_buf.pop();
-                }
+                // Remove null terminator
+                let query = String::from_utf8_lossy(&query_bytes)
+                    .trim_end_matches('\0')
+                    .to_string();
 
-                let query = String::from_utf8_lossy(&query_buf).to_string();
-                info!("Executing query: {}", query);
+                debug!("Received query: {}", &query[..query.len().min(100)]);
 
-                let start_time = Instant::now();
+                let start = Instant::now();
 
-                // Route query with pre-sizing
-                let estimate = query_router.route(&query).await;
-                
-                // Extract worker info for releasing later
-                let worker_name = match &estimate.target {
-                    QueryTarget::PreSizedWorker { worker_name, .. } => Some(worker_name.clone()),
-                    QueryTarget::WorkerPool => None,
-                };
-
-                info!(
-                    "Query routed: {}MB data, {}MB memory, resized={}, target={:?}",
-                    estimate.data_size_mb,
-                    estimate.required_memory_mb,
-                    estimate.was_resized,
-                    match &estimate.target {
-                        QueryTarget::WorkerPool => "WorkerPool".to_string(),
-                        QueryTarget::PreSizedWorker { worker_name, .. } => format!("PreSized({})", worker_name),
-                    }
-                );
-
-                // Execute query based on target
-                let result = match &estimate.target {
-                    QueryTarget::PreSizedWorker { address, .. } => {
-                        // Execute on specific pre-sized worker
-                        execute_query_on_worker(address, &query, &user_id).await
-                    }
-                    QueryTarget::WorkerPool => {
-                        // Fallback to default worker pool
-                        execute_query_via_worker(&worker_client, &query, &user_id).await
-                    }
-                };
-
-                // Release worker after query
-                if let Some(name) = worker_name {
-                    // TODO: Get actual memory usage from worker for better pre-sizing accuracy
-                    query_router.release_worker(&name, None).await;
-                }
-
-                let route_label = match &estimate.target {
-                    QueryTarget::PreSizedWorker { .. } => "presized_worker",
-                    QueryTarget::WorkerPool => "worker_pool",
-                };
+                // Route and execute query with streaming
+                let result = execute_query_streaming(
+                    &mut socket,
+                    &worker_client,
+                    &query_router,
+                    &query,
+                    &user_id,
+                ).await;
 
                 match result {
-                    Ok(result) => {
-                        let duration = start_time.elapsed().as_secs_f64();
-                        metrics::record_query_completed(route_label, "success", duration);
-                        
-                        let estimated_bytes = (result.rows.len() * result.columns.len() * 50) as u64;
-                        let estimated_mb = estimated_bytes as f64 / (1024.0 * 1024.0);
-                        metrics::record_data_scanned(estimated_bytes);
-                        metrics::record_actual_query_size(estimated_mb);
-                        
-                        debug!("Query result: {} columns, {} rows (took {:.2}s)", 
-                            result.columns.len(), result.rows.len(), duration);
-                        send_query_result(&mut socket, result).await?;
+                    Ok(row_count) => {
+                        info!(
+                            rows = row_count,
+                            time_ms = start.elapsed().as_millis(),
+                            "Query completed (streaming)"
+                        );
+                        metrics::record_query_completed("worker_pool", "success", start.elapsed().as_secs_f64());
+                        metrics::record_query_routed("worker_pool", 0.0);
                     }
                     Err(e) => {
-                        let duration = start_time.elapsed().as_secs_f64();
-                        metrics::record_query_completed(route_label, "error", duration);
-                        warn!("Query execution failed: {}", e);
+                        error!("Query error: {}", e);
                         send_error(&mut socket, &e.to_string()).await?;
+                        metrics::record_query_completed("worker_pool", "error", start.elapsed().as_secs_f64());
                     }
                 }
 
+                // Send ReadyForQuery
                 socket.write_all(&ready).await?;
                 socket.flush().await?;
             }
-            b'X' => {
-                info!("Client disconnected");
-                break;
+            b'P' => {
+                // Parse - store the prepared statement
+                let sql = handle_parse_extended(&mut socket, &mut buf).await?;
+                if let Some(query) = sql {
+                    prepared_query = Some(query);
+                }
             }
-            b'P' => handle_parse(&mut socket, &mut buf).await?,
             b'B' => handle_bind(&mut socket, &mut buf).await?,
             b'D' => handle_describe(&mut socket, &mut buf).await?,
-            b'E' => handle_execute(&mut socket, &mut buf, &worker_client, &user_id).await?,
+            b'E' => {
+                // Execute - run the prepared statement
+                let start = Instant::now();
+                if let Some(ref query) = prepared_query {
+                    handle_execute_extended(
+                        &mut socket,
+                        &mut buf,
+                        &worker_client,
+                        &query_router,
+                        query,
+                        &user_id,
+                    ).await?;
+                    metrics::record_query_completed("extended", "success", start.elapsed().as_secs_f64());
+                } else {
+                    // No prepared statement, just acknowledge
+                    handle_execute_empty(&mut socket, &mut buf).await?;
+                }
+                prepared_query = None;  // Clear after execution
+            }
             b'S' => {
                 socket.write_all(&ready).await?;
                 socket.flush().await?;
@@ -317,21 +255,56 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Execute query on a specific pre-sized worker by address
-async fn execute_query_on_worker(
+/// Execute query with TRUE STREAMING - rows are sent to client as they arrive
+/// This prevents OOM by never buffering the full result set
+async fn execute_query_streaming(
+    socket: &mut tokio::net::TcpStream,
+    worker_client: &WorkerClient,
+    query_router: &QueryRouter,
+    sql: &str,
+    user_id: &str,
+) -> anyhow::Result<usize> {
+    // Handle PostgreSQL-specific commands locally
+    if let Some(result) = handle_pg_specific_command(sql) {
+        send_query_result_immediate(socket, result).await?;
+        return Ok(0);
+    }
+
+    // Route query
+    let estimate = query_router.route(sql).await;
+    
+    info!(
+        data_mb = estimate.data_size_mb,
+        target = ?estimate.target,
+        "Query routed for streaming execution"
+    );
+
+    // Execute with streaming based on target
+    match estimate.target {
+        QueryTarget::PreSizedWorker { address, worker_name } => {
+            info!("Using pre-sized worker {} at {}", worker_name, address);
+            execute_query_streaming_to_worker(socket, &address, sql, user_id).await
+        }
+        QueryTarget::WorkerPool => {
+            // Use default worker client but with streaming
+            execute_query_streaming_default(socket, worker_client, sql, user_id).await
+        }
+    }
+}
+
+/// Stream query results directly to PostgreSQL client
+async fn execute_query_streaming_to_worker(
+    socket: &mut tokio::net::TcpStream,
     worker_addr: &str,
     sql: &str,
     user_id: &str,
-) -> anyhow::Result<QueryExecutionResult> {
-    // Handle PostgreSQL-specific commands locally
-    if let Some(result) = handle_pg_specific_command(sql) {
-        return Ok(result);
-    }
+) -> anyhow::Result<usize> {
+    use tokio::io::AsyncWriteExt;
+    
+    info!("Streaming query to worker: {}", worker_addr);
 
-    info!("Executing query on pre-sized worker: {}", worker_addr);
-
-    // Connect directly to the pre-sized worker
-    const MAX_MESSAGE_SIZE: usize = 512 * 1024 * 1024;
+    // Connect to worker
+    const MAX_MESSAGE_SIZE: usize = 512 * 1024 * 1024; // 512MB per gRPC message
     
     let channel = Channel::from_shared(worker_addr.to_string())?
         .timeout(std::time::Duration::from_secs(600))
@@ -355,8 +328,8 @@ async fn execute_query_on_worker(
             claims: Default::default(),
         }),
         options: Some(proto::QueryOptions {
-            timeout_seconds: 300,
-            max_rows: 10000,
+            timeout_seconds: 600,
+            max_rows: 0, // Unlimited - we stream
             max_bytes: 0,
             enable_profiling: false,
             session_params: Default::default(),
@@ -367,25 +340,38 @@ async fn execute_query_on_worker(
     let response = client.execute_query(request).await?;
     let mut stream = response.into_inner();
 
-    let mut columns: Vec<(String, String)> = Vec::new();
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut total_rows: u64 = 0;
+    let mut columns_sent = false;
+    let mut total_rows: usize = 0;
+    let mut batch_rows: usize = 0;
 
     while let Some(batch) = stream.message().await? {
         match batch.result {
             Some(proto::query_result_batch::Result::Metadata(meta)) => {
-                columns = meta
-                    .columns
-                    .iter()
-                    .zip(meta.column_types.iter())
-                    .map(|(name, type_name)| (name.clone(), type_name.clone()))
-                    .collect();
-                total_rows = meta.total_rows;
+                // Send RowDescription once
+                if !columns_sent {
+                    send_row_description(socket, &meta.columns, &meta.column_types).await?;
+                    columns_sent = true;
+                }
             }
             Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
                 if !batch.data.is_empty() {
-                    if let Ok(batch_rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
-                        rows.extend(batch_rows);
+                    if let Ok(rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                        for row in rows {
+                            send_data_row(socket, &row).await?;
+                            total_rows += 1;
+                            batch_rows += 1;
+                            
+                            // Flush every STREAMING_BATCH_SIZE rows for backpressure
+                            if batch_rows >= STREAMING_BATCH_SIZE {
+                                socket.flush().await?;
+                                batch_rows = 0;
+                            }
+                            
+                            // Log progress for very large queries
+                            if total_rows % 1_000_000 == 0 {
+                                info!("Streaming progress: {} rows sent", total_rows);
+                            }
+                        }
                     }
                 }
             }
@@ -396,24 +382,85 @@ async fn execute_query_on_worker(
         }
     }
 
-    Ok(QueryExecutionResult {
-        columns,
-        rows,
-        row_count: total_rows as usize,
-        command_tag: None,
-    })
+    // If no columns were sent (empty result), send empty row description
+    if !columns_sent {
+        send_row_description(socket, &[], &[]).await?;
+    }
+
+    // Send CommandComplete
+    let tag = format!("SELECT {}", total_rows);
+    send_command_complete(socket, &tag).await?;
+
+    Ok(total_rows)
 }
 
-/// Execute a query using the default worker service (fallback)
-async fn execute_query_via_worker(
+/// Stream query results using the default worker client
+async fn execute_query_streaming_default(
+    socket: &mut tokio::net::TcpStream,
+    worker_client: &WorkerClient,
+    sql: &str,
+    user_id: &str,
+) -> anyhow::Result<usize> {
+    use tokio::io::AsyncWriteExt;
+    
+    // For the default path, we still need to use the existing client
+    // but we'll stream the results to the client as they come
+    match worker_client.execute_query_streaming(sql, user_id).await {
+        Ok(mut stream) => {
+            let mut columns_sent = false;
+            let mut total_rows: usize = 0;
+            let mut batch_rows: usize = 0;
+
+            while let Some(batch) = stream.next().await {
+                match batch? {
+                    StreamingBatch::Metadata { columns, column_types } => {
+                        if !columns_sent {
+                            send_row_description(socket, &columns, &column_types).await?;
+                            columns_sent = true;
+                        }
+                    }
+                    StreamingBatch::Rows(rows) => {
+                        for row in rows {
+                            send_data_row(socket, &row).await?;
+                            total_rows += 1;
+                            batch_rows += 1;
+                            
+                            if batch_rows >= STREAMING_BATCH_SIZE {
+                                socket.flush().await?;
+                                batch_rows = 0;
+                            }
+                        }
+                    }
+                    StreamingBatch::Error(msg) => {
+                        return Err(anyhow::anyhow!("{}", msg));
+                    }
+                }
+            }
+
+            if !columns_sent {
+                send_row_description(socket, &[], &[]).await?;
+            }
+
+            let tag = format!("SELECT {}", total_rows);
+            send_command_complete(socket, &tag).await?;
+
+            Ok(total_rows)
+        }
+        Err(e) => {
+            // Fallback to non-streaming for compatibility
+            warn!("Streaming not available, falling back to buffered: {}", e);
+            let result = execute_query_buffered(worker_client, sql, user_id).await?;
+            send_query_result_immediate(socket, result).await
+        }
+    }
+}
+
+/// Buffered execution fallback
+async fn execute_query_buffered(
     worker_client: &WorkerClient,
     sql: &str,
     user_id: &str,
 ) -> anyhow::Result<QueryExecutionResult> {
-    if let Some(result) = handle_pg_specific_command(sql) {
-        return Ok(result);
-    }
-
     match worker_client.execute_query(sql, user_id).await {
         Ok(result) => Ok(QueryExecutionResult {
             columns: result
@@ -520,12 +567,14 @@ async fn execute_local_fallback(sql: &str) -> anyhow::Result<QueryExecutionResul
     }
 
     Ok(QueryExecutionResult {
-        columns: vec![("result".to_string(), "text".to_string())],
+            columns: vec![("result".to_string(), "text".to_string())],
         rows: vec![],
         row_count: 0,
         command_tag: None,
     })
 }
+
+// ===== PostgreSQL Wire Protocol Message Helpers =====
 
 struct QueryExecutionResult {
     columns: Vec<(String, String)>,
@@ -534,31 +583,32 @@ struct QueryExecutionResult {
     command_tag: Option<String>,
 }
 
-async fn send_query_result(socket: &mut tokio::net::TcpStream, result: QueryExecutionResult) -> anyhow::Result<()> {
+/// Send RowDescription message
+async fn send_row_description(
+    socket: &mut tokio::net::TcpStream,
+    columns: &[String],
+    column_types: &[String],
+) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
-
-    if result.columns.is_empty() {
-        let tag = result.command_tag.unwrap_or_else(|| format!("OK {}", result.row_count));
-        send_command_complete(socket, &tag).await?;
-        return Ok(());
-    }
 
     let mut row_desc = Vec::new();
     row_desc.push(b'T');
 
-    let field_count = result.columns.len() as i16;
+    let field_count = columns.len() as i16;
     let mut fields_data = Vec::new();
     fields_data.extend_from_slice(&field_count.to_be_bytes());
 
-    for (name, type_name) in &result.columns {
+    for (i, name) in columns.iter().enumerate() {
+        let type_name = column_types.get(i).map(|s| s.as_str()).unwrap_or("text");
+        
         fields_data.extend_from_slice(name.as_bytes());
         fields_data.push(0);
-        fields_data.extend_from_slice(&0u32.to_be_bytes());
-        fields_data.extend_from_slice(&0i16.to_be_bytes());
+        fields_data.extend_from_slice(&0u32.to_be_bytes()); // table OID
+        fields_data.extend_from_slice(&0i16.to_be_bytes()); // column attr
         fields_data.extend_from_slice(&pg_type_oid(type_name).to_be_bytes());
         fields_data.extend_from_slice(&pg_type_len(type_name).to_be_bytes());
-        fields_data.extend_from_slice(&(-1i32).to_be_bytes());
-        fields_data.extend_from_slice(&0i16.to_be_bytes());
+        fields_data.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
+        fields_data.extend_from_slice(&0i16.to_be_bytes()); // format code (text)
     }
 
     let len = (4 + fields_data.len()) as u32;
@@ -566,16 +616,25 @@ async fn send_query_result(socket: &mut tokio::net::TcpStream, result: QueryExec
     row_desc.extend_from_slice(&fields_data);
     socket.write_all(&row_desc).await?;
 
-    for row in &result.rows {
-        let mut data_row = Vec::new();
+    Ok(())
+}
+
+/// Send a single DataRow message
+async fn send_data_row(
+    socket: &mut tokio::net::TcpStream,
+    row: &[String],
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    
+    let mut data_row = Vec::with_capacity(5 + row.len() * 20);
         data_row.push(b'D');
 
-        let mut row_data = Vec::new();
+    let mut row_data = Vec::with_capacity(2 + row.len() * 20);
         row_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
 
         for value in row {
-            if value.is_empty() {
-                row_data.extend_from_slice(&(-1i32).to_be_bytes());
+        if value.is_empty() || value == "null" || value == "NULL" {
+                row_data.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
             } else {
                 row_data.extend_from_slice(&(value.len() as i32).to_be_bytes());
                 row_data.extend_from_slice(value.as_bytes());
@@ -586,11 +645,44 @@ async fn send_query_result(socket: &mut tokio::net::TcpStream, result: QueryExec
         data_row.extend_from_slice(&len.to_be_bytes());
         data_row.extend_from_slice(&row_data);
         socket.write_all(&data_row).await?;
+
+    Ok(())
+    }
+
+/// Send query result immediately (for small results)
+async fn send_query_result_immediate(
+    socket: &mut tokio::net::TcpStream,
+    result: QueryExecutionResult,
+) -> anyhow::Result<usize> {
+    use tokio::io::AsyncWriteExt;
+
+    if result.columns.is_empty() {
+        let tag = result.command_tag.unwrap_or_else(|| format!("OK {}", result.row_count));
+        send_command_complete(socket, &tag).await?;
+        return Ok(0);
+    }
+
+    // Send row description
+    let columns: Vec<String> = result.columns.iter().map(|(n, _)| n.clone()).collect();
+    let types: Vec<String> = result.columns.iter().map(|(_, t)| t.clone()).collect();
+    send_row_description(socket, &columns, &types).await?;
+
+    // Send data rows
+    let mut count = 0;
+    for row in &result.rows {
+        send_data_row(socket, row).await?;
+        count += 1;
+        
+        // Flush periodically
+        if count % STREAMING_BATCH_SIZE == 0 {
+            socket.flush().await?;
+        }
     }
 
     let tag = format!("SELECT {}", result.rows.len());
     send_command_complete(socket, &tag).await?;
-    Ok(())
+
+    Ok(result.rows.len())
 }
 
 async fn send_command_complete(socket: &mut tokio::net::TcpStream, tag: &str) -> anyhow::Result<()> {
@@ -615,6 +707,26 @@ async fn send_error(socket: &mut tokio::net::TcpStream, message: &str) -> anyhow
     fields.extend_from_slice(b"ERROR\0");
     fields.push(b'C');
     fields.extend_from_slice(b"42000\0");
+    fields.push(b'M');
+    fields.extend_from_slice(message.as_bytes());
+    fields.push(0);
+    fields.push(0);
+    let len = 4 + fields.len();
+    msg.extend_from_slice(&(len as u32).to_be_bytes());
+    msg.extend_from_slice(&fields);
+    socket.write_all(&msg).await?;
+    Ok(())
+}
+
+async fn send_notice(socket: &mut tokio::net::TcpStream, message: &str) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut msg = Vec::new();
+    msg.push(b'N'); // NoticeResponse
+    let mut fields = Vec::new();
+    fields.push(b'S');
+    fields.extend_from_slice(b"WARNING\0");
+    fields.push(b'C');
+    fields.extend_from_slice(b"01000\0"); // Warning code
     fields.push(b'M');
     fields.extend_from_slice(message.as_bytes());
     fields.push(0);
@@ -664,7 +776,7 @@ fn pg_type_oid(type_name: &str) -> u32 {
         "bool" | "boolean" => 16,
         "timestamp" | "timestamptz" => 1184,
         "date" => 1082,
-        _ => 25,
+        _ => 25, // TEXT
     }
 }
 
@@ -676,19 +788,43 @@ fn pg_type_len(type_name: &str) -> i16 {
         "float4" | "real" | "float" => 4,
         "float8" | "double" | "float64" => 8,
         "bool" | "boolean" => 1,
-        _ => -1,
+        _ => -1, // Variable length
     }
 }
 
-async fn handle_parse(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4]) -> anyhow::Result<()> {
+// ===== Extended Query Protocol Handlers =====
+
+/// Handle Parse message - extract and store the SQL query
+async fn handle_parse_extended(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4]) -> anyhow::Result<Option<String>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     socket.read_exact(buf).await?;
     let len = u32::from_be_bytes(*buf) as usize - 4;
     let mut data = vec![0u8; len];
     socket.read_exact(&mut data).await?;
-    socket.write_all(&[b'1', 0, 0, 0, 4]).await?;
+    
+    // Parse message format:
+    // - Statement name (null-terminated string)
+    // - Query string (null-terminated string)
+    // - Number of parameter types (Int16)
+    // - Parameter types (Int32 each)
+    
+    // Find the first null byte (end of statement name)
+    let stmt_end = data.iter().position(|&b| b == 0).unwrap_or(0);
+    // Find the second null byte (end of query)
+    let query_start = stmt_end + 1;
+    let query_end = data[query_start..].iter().position(|&b| b == 0).unwrap_or(data.len() - query_start) + query_start;
+    
+    let query = String::from_utf8_lossy(&data[query_start..query_end]).to_string();
+    debug!("Extended query protocol - Parse: {}", &query[..query.len().min(100)]);
+    
+    socket.write_all(&[b'1', 0, 0, 0, 4]).await?; // ParseComplete
     socket.flush().await?;
-    Ok(())
+    
+    if query.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(query))
+    }
 }
 
 async fn handle_bind(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4]) -> anyhow::Result<()> {
@@ -697,7 +833,7 @@ async fn handle_bind(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4]) -> a
     let len = u32::from_be_bytes(*buf) as usize - 4;
     let mut data = vec![0u8; len];
     socket.read_exact(&mut data).await?;
-    socket.write_all(&[b'2', 0, 0, 0, 4]).await?;
+    socket.write_all(&[b'2', 0, 0, 0, 4]).await?; // BindComplete
     socket.flush().await?;
     Ok(())
 }
@@ -708,12 +844,55 @@ async fn handle_describe(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4]) 
     let len = u32::from_be_bytes(*buf) as usize - 4;
     let mut data = vec![0u8; len];
     socket.read_exact(&mut data).await?;
-    socket.write_all(&[b'n', 0, 0, 0, 4]).await?;
+    socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
     socket.flush().await?;
     Ok(())
 }
 
-async fn handle_execute(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4], _worker_client: &WorkerClient, _user_id: &str) -> anyhow::Result<()> {
+/// Handle Execute message for extended query protocol - with actual query execution
+async fn handle_execute_extended(
+    socket: &mut tokio::net::TcpStream,
+    buf: &mut [u8; 4],
+    worker_client: &WorkerClient,
+    query_router: &QueryRouter,
+    sql: &str,
+    user_id: &str,
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt;
+    socket.read_exact(buf).await?;
+    let len = u32::from_be_bytes(*buf) as usize - 4;
+    let mut data = vec![0u8; len];
+    socket.read_exact(&mut data).await?;
+    
+    debug!("Extended query protocol - Execute: {}", &sql[..sql.len().min(100)]);
+    
+    // Execute the query using the same streaming logic as simple query
+    let result = execute_query_streaming(
+        socket,
+        worker_client,
+        query_router,
+        sql,
+        user_id,
+    ).await;
+    
+    match result {
+        Ok(row_count) => {
+            info!(rows = row_count, "Extended query completed (streaming)");
+        }
+        Err(e) => {
+            error!("Extended query error: {}", e);
+            send_error(socket, &e.to_string()).await?;
+        }
+    }
+    
+    Ok(())
+}
+
+/// Handle Execute message when there's no prepared statement
+async fn handle_execute_empty(
+    socket: &mut tokio::net::TcpStream,
+    buf: &mut [u8; 4],
+) -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
     socket.read_exact(buf).await?;
     let len = u32::from_be_bytes(*buf) as usize - 4;

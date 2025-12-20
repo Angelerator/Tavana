@@ -13,10 +13,16 @@ metadata:
   name: tavana-gateway-role
 rules:
   # Pod management for query-aware pre-sizing
-  # Allows gateway to list, watch, and patch worker pod resources
+  # Allows gateway to list, watch, and update worker pod resources
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "patch"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  
+  # Pod resize subresource for K8s 1.35+ in-place vertical scaling
+  # Required for InPlacePodVerticalScaling feature
+  - apiGroups: [""]
+    resources: ["pods/resize"]
+    verbs: ["get", "update", "patch"]
   
   # Pod logs for debugging (optional)
   - apiGroups: [""]

@@ -3,8 +3,29 @@
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: tavana
+
+# Enable K8s v1.35 features for in-place pod resizing (VPA without restart)
+featureGates:
+  InPlacePodVerticalScaling: true
+
 nodes:
   - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            feature-gates: "InPlacePodVerticalScaling=true"
+        controllerManager:
+          extraArgs:
+            feature-gates: "InPlacePodVerticalScaling=true"
+        scheduler:
+          extraArgs:
+            feature-gates: "InPlacePodVerticalScaling=true"
+      - |
+        kind: KubeletConfiguration
+        featureGates:
+          InPlacePodVerticalScaling: true
     extraPortMappings:
       # Gateway - HTTP API (28080 to avoid 8080 conflicts)
       - containerPort: 30080
@@ -35,5 +56,15 @@ nodes:
         hostPort: 29090
         protocol: TCP
   - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: KubeletConfiguration
+        featureGates:
+          InPlacePodVerticalScaling: true
   - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: KubeletConfiguration
+        featureGates:
+          InPlacePodVerticalScaling: true
 

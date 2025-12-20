@@ -1,11 +1,30 @@
 //! Worker gRPC client for forwarding queries to DuckDB workers
+//! Supports both buffered and streaming execution modes
 
 use std::sync::Arc;
 use tavana_common::proto;
 use tokio::sync::RwLock;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tracing::{debug, error, info};
 use uuid::Uuid;
+
+/// Streaming batch types for true row-by-row streaming
+pub enum StreamingBatch {
+    Metadata { columns: Vec<String>, column_types: Vec<String> },
+    Rows(Vec<Vec<String>>),
+    Error(String),
+}
+
+/// Stream wrapper for async iteration
+pub struct StreamingResult {
+    receiver: tokio::sync::mpsc::Receiver<Result<StreamingBatch, anyhow::Error>>,
+}
+
+impl StreamingResult {
+    pub async fn next(&mut self) -> Option<Result<StreamingBatch, anyhow::Error>> {
+        self.receiver.recv().await
+    }
+}
 
 /// Client for communicating with DuckDB worker service
 pub struct WorkerClient {
@@ -82,7 +101,7 @@ impl WorkerClient {
             }),
             options: Some(proto::QueryOptions {
                 timeout_seconds: 300,
-                max_rows: 10000,
+                max_rows: 0,  // 0 = unlimited rows (streaming)
                 max_bytes: 0,
                 enable_profiling: false,
                 session_params: Default::default(),
@@ -140,6 +159,79 @@ impl WorkerClient {
             rows,
             total_rows,
         })
+    }
+
+    /// Execute a query with TRUE STREAMING - returns results as they arrive
+    /// This is the preferred method for large result sets as it never buffers everything
+    pub async fn execute_query_streaming(
+        &self,
+        sql: &str,
+        user_id: &str,
+    ) -> Result<StreamingResult, anyhow::Error> {
+        let mut client = self.get_client().await?;
+
+        let query_id = Uuid::new_v4().to_string();
+        debug!("Executing streaming query {} for user {}", query_id, user_id);
+
+        let request = proto::ExecuteQueryRequest {
+            query_id: query_id.clone(),
+            sql: sql.to_string(),
+            user: Some(proto::UserIdentity {
+                user_id: user_id.to_string(),
+                tenant_id: "default".to_string(),
+                scopes: vec!["query:execute".to_string()],
+                claims: Default::default(),
+            }),
+            options: Some(proto::QueryOptions {
+                timeout_seconds: 600, // 10 minutes for large queries
+                max_rows: 0,  // 0 = unlimited rows (streaming)
+                max_bytes: 0,
+                enable_profiling: false,
+                session_params: Default::default(),
+            }),
+            allocated_resources: None,
+        };
+
+        let response = client.execute_query(request).await?;
+        let mut stream = response.into_inner();
+
+        // Create a channel for streaming results
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+
+        // Spawn a task to read from gRPC stream and forward to channel
+        tokio::spawn(async move {
+            while let Ok(Some(batch)) = stream.message().await {
+                let result = match batch.result {
+                    Some(proto::query_result_batch::Result::Metadata(meta)) => {
+                        Ok(StreamingBatch::Metadata {
+                            columns: meta.columns,
+                            column_types: meta.column_types,
+                        })
+                    }
+                    Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
+                        if !batch.data.is_empty() {
+                            match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                                Ok(rows) => Ok(StreamingBatch::Rows(rows)),
+                                Err(e) => Err(anyhow::anyhow!("Failed to decode batch: {}", e)),
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    Some(proto::query_result_batch::Result::Error(err)) => {
+                        Ok(StreamingBatch::Error(format!("{}: {}", err.code, err.message)))
+                    }
+                    _ => continue,
+                };
+
+                if tx.send(result).await.is_err() {
+                    // Receiver dropped, stop streaming
+                    break;
+                }
+            }
+        });
+
+        Ok(StreamingResult { receiver: rx })
     }
 }
 

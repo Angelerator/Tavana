@@ -41,7 +41,7 @@
           },
           "unit": "decmbytes"
         }
-      },
+        },
       "gridPos": { "h": 3, "w": 4, "x": 0, "y": 1 },
       "id": 1,
       "options": {
@@ -70,7 +70,7 @@
           },
           "unit": "short"
         }
-      },
+        },
       "gridPos": { "h": 3, "w": 3, "x": 4, "y": 1 },
       "id": 2,
       "options": {
@@ -99,7 +99,7 @@
           },
           "unit": "short"
         }
-      },
+        },
       "gridPos": { "h": 3, "w": 3, "x": 7, "y": 1 },
       "id": 3,
       "options": {
@@ -132,7 +132,7 @@
           },
           "unit": "short"
         }
-      },
+        },
       "gridPos": { "h": 3, "w": 3, "x": 10, "y": 1 },
       "id": 4,
       "options": {
@@ -165,7 +165,7 @@
           },
           "unit": "short"
         }
-      },
+        },
       "gridPos": { "h": 3, "w": 3, "x": 13, "y": 1 },
       "id": 5,
       "options": {
@@ -198,7 +198,7 @@
           },
           "unit": "qps"
         }
-      },
+        },
       "gridPos": { "h": 3, "w": 4, "x": 16, "y": 1 },
       "id": 6,
       "options": {
@@ -248,7 +248,7 @@
         { 
           "expr": "sum(rate(tavana_query_throughput_total{status=\"success\"}[5m])) / sum(rate(tavana_query_throughput_total[5m]))", 
           "legendFormat": "Success Rate", 
-          "refId": "A" 
+          "refId": "A"
         }
       ],
       "title": "Success Rate",
@@ -306,7 +306,7 @@
           {
             "matcher": { "id": "byName", "options": "Memory Used" },
             "properties": [{ "id": "unit", "value": "bytes" }]
-          },
+      },
           {
             "matcher": { "id": "byName", "options": "CPU Cores" },
             "properties": [{ "id": "decimals", "value": 2 }]
@@ -1003,7 +1003,7 @@
             "steps": [
               { "color": "green", "value": null }
             ]
-          },
+        },
           "unit": "percentunit",
           "min": 0,
           "max": 1

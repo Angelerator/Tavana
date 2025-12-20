@@ -26,11 +26,12 @@ struct Args {
     grpc_port: u16,
 
     /// Maximum memory in GB for DuckDB
+    /// Set to 0 for auto-detect from container limits (cgroups)
     /// DuckDB recommends 1-4 GB per thread:
     /// - Aggregation-heavy: 1-2 GB/thread
     /// - Join-heavy: 3-4 GB/thread
-    /// Default: 8GB (for 4 threads with 2GB each)
-    #[arg(long, env = "MAX_MEMORY_GB", default_value = "8")]
+    /// Default: 0 (auto-detect, use 80% of container limit)
+    #[arg(long, env = "MAX_MEMORY_GB", default_value = "0")]
     max_memory_gb: u64,
 
     /// Number of threads for DuckDB (defaults to all CPUs)
@@ -90,9 +91,18 @@ async fn main() -> anyhow::Result<()> {
         args.grpc_port, args.tls_enabled
     );
 
+    // Determine memory limit - auto-detect from container if not specified
+    let max_memory_bytes = if args.max_memory_gb == 0 {
+        let detected = detect_container_memory_limit();
+        info!("Auto-detected container memory limit: {}GB", detected / 1024 / 1024 / 1024);
+        detected
+    } else {
+        args.max_memory_gb * 1024 * 1024 * 1024
+    };
+
     // Create executor config with connection pool
     let executor_config = ExecutorConfig {
-        max_memory: args.max_memory_gb * 1024 * 1024 * 1024,
+        max_memory: max_memory_bytes,
         threads: args.threads.unwrap_or_else(|| num_cpus::get() as u32),
         enable_profiling: false,
         pool_size: args.pool_size,
@@ -134,9 +144,18 @@ async fn run_one_shot(args: Args, query_sql: Option<String>) -> anyhow::Result<(
     info!("One-shot mode: Executing query {}", query_id);
     info!("SQL: {}", sql);
     
+    // Determine memory limit - auto-detect from container if not specified
+    let max_memory_bytes = if args.max_memory_gb == 0 {
+        let detected = detect_container_memory_limit();
+        info!("Auto-detected container memory limit: {}GB", detected / 1024 / 1024 / 1024);
+        detected
+    } else {
+        args.max_memory_gb * 1024 * 1024 * 1024
+    };
+    
     // Create executor (single connection for one-shot mode)
     let executor_config = ExecutorConfig {
-        max_memory: args.max_memory_gb * 1024 * 1024 * 1024,
+        max_memory: max_memory_bytes,
         threads: args.threads.unwrap_or_else(|| num_cpus::get() as u32),
         enable_profiling: false,
         pool_size: 1, // One-shot mode only needs 1 connection
@@ -200,4 +219,56 @@ async fn run_one_shot(args: Args, query_sql: Option<String>) -> anyhow::Result<(
             Err(e)
         }
     }
+}
+
+/// Detect container memory limit from cgroups (v1 and v2)
+/// Returns 80% of the detected limit to leave headroom for the OS and other processes
+/// Falls back to 8GB if detection fails
+fn detect_container_memory_limit() -> u64 {
+    // Try cgroups v2 first (unified hierarchy)
+    if let Ok(contents) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        if let Ok(limit) = contents.trim().parse::<u64>() {
+            // Use 80% of container limit for DuckDB
+            let usable = (limit as f64 * 0.8) as u64;
+            info!("Detected cgroups v2 memory limit: {}GB, using {}GB (80%)", 
+                  limit / 1024 / 1024 / 1024, 
+                  usable / 1024 / 1024 / 1024);
+            return usable;
+        }
+    }
+    
+    // Try cgroups v1
+    if let Ok(contents) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+        if let Ok(limit) = contents.trim().parse::<u64>() {
+            // Check if it's the "unlimited" value (very large number)
+            if limit < 9_000_000_000_000_000_000 {
+                let usable = (limit as f64 * 0.8) as u64;
+                info!("Detected cgroups v1 memory limit: {}GB, using {}GB (80%)",
+                      limit / 1024 / 1024 / 1024,
+                      usable / 1024 / 1024 / 1024);
+                return usable;
+            }
+        }
+    }
+    
+    // Try reading from /proc/meminfo as fallback (total system memory)
+    if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
+        for line in contents.lines() {
+            if line.starts_with("MemTotal:") {
+                if let Some(kb_str) = line.split_whitespace().nth(1) {
+                    if let Ok(kb) = kb_str.parse::<u64>() {
+                        // Use 50% of total system memory as fallback
+                        let limit = kb * 1024;
+                        let usable = (limit as f64 * 0.5) as u64;
+                        info!("Using 50% of system memory: {}GB", usable / 1024 / 1024 / 1024);
+                        return usable;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Default fallback: 8GB
+    info!("Could not detect memory limit, using default 8GB");
+    8 * 1024 * 1024 * 1024
 }
