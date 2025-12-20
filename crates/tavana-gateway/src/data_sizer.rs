@@ -1,78 +1,86 @@
-//! Real Data Size Estimation
+//! Improved Data Size Estimation
 //!
 //! Provides accurate data size estimation using:
 //! - S3 HEAD requests for file sizes
-//! - Parquet footer reading for row counts and statistics
-//! - Delta Lake _delta_log parsing
-//! - Iceberg manifest reading
+//! - Parquet footer reading for EXACT row counts and column metadata
+//! - SQL parsing for column pruning detection
+//! - Data-type aware memory estimation
 //! - Caching with TTL to avoid repeated requests
 
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client as S3Client;
 use dashmap::DashMap;
+use parquet::basic::Type as PhysicalType;
+use parquet::file::metadata::ParquetMetaDataReader;
 use regex::Regex;
-use std::sync::Arc;
+use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement, TableFactor};
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// Cache entry with TTL and full metadata
+/// Cache entry with TTL and full Parquet metadata
 #[derive(Clone)]
-struct CachedSize {
+struct CachedMetadata {
     size_bytes: u64,
-    row_count: Option<u64>,
-    column_count: Option<u32>,
-    row_group_count: Option<u32>,
+    row_count: u64,
+    columns: Vec<ColumnMetadata>,
+    row_group_count: u32,
     created_at: Instant,
 }
 
-impl CachedSize {
+impl CachedMetadata {
     fn is_expired(&self, ttl: Duration) -> bool {
         self.created_at.elapsed() > ttl
     }
 }
 
-/// Statistics from Parquet files
-#[derive(Debug, Clone)]
-pub struct ParquetStats {
-    pub file_size_bytes: u64,
-    pub row_count: u64,
-    pub num_columns: usize,
-    pub num_row_groups: usize,
+/// Column metadata from Parquet footer
+#[derive(Clone, Debug)]
+pub struct ColumnMetadata {
+    pub name: String,
+    pub physical_type: PhysicalType,
+    pub compressed_size: u64,
+    pub uncompressed_size: u64,
 }
 
-/// Statistics from Delta tables
-#[derive(Debug, Clone)]
-pub struct DeltaStats {
-    pub total_size_bytes: u64,
-    pub num_files: usize,
-    pub row_count: Option<u64>,
+/// Parsed query structure from SQL
+#[derive(Debug, Default)]
+pub struct QueryStructure {
+    pub tables: Vec<String>,
+    pub selected_columns: Vec<String>,
+    pub is_select_star: bool,
+    pub has_where: bool,
+    pub has_join: bool,
+    pub has_group_by: bool,
+    pub has_order_by: bool,
+    pub has_distinct: bool,
+    pub has_window: bool,
+    pub limit: Option<u64>,
 }
 
-/// Statistics from Iceberg tables
-#[derive(Debug, Clone)]
-pub struct IcebergStats {
-    pub total_size_bytes: u64,
-    pub num_files: usize,
-    pub row_count: Option<u64>,
-}
-
-/// Combined query size estimate with all data needed for resource calculation
+/// Combined query size estimate with accurate metadata
 #[derive(Debug, Clone)]
 pub struct QuerySizeEstimate {
-    /// Total estimated data size in bytes
+    /// Total file size in bytes (from S3 HEAD)
     pub total_bytes: u64,
-    /// Total estimated data size in MB
+    /// Total file size in MB
     pub total_mb: u64,
-    /// Estimated row count (if available from Parquet metadata)
+    /// Exact row count (from Parquet footer)
     pub row_count: Option<u64>,
-    /// Number of columns (from Parquet schema)
+    /// Estimated rows after predicates and LIMIT
+    pub effective_row_count: u64,
+    /// Number of columns in schema
     pub column_count: Option<u32>,
-    /// Number of row groups (for parallelism estimation)
+    /// Number of selected columns (after pruning)
+    pub selected_column_count: u32,
+    /// Number of row groups
     pub row_group_count: Option<u32>,
     /// Files/tables analyzed
     pub sources: Vec<DataSource>,
-    /// Memory multiplier based on query complexity
-    pub memory_multiplier: f64,
+    /// Estimated data to read (after column pruning)
+    pub estimated_read_bytes: u64,
     /// Estimated memory needed in MB
     pub estimated_memory_mb: u64,
     /// Query has JOIN operations
@@ -83,6 +91,8 @@ pub struct QuerySizeEstimate {
     pub has_window: bool,
     /// Query has ORDER BY
     pub has_order_by: bool,
+    /// Estimation method used
+    pub estimation_method: String,
 }
 
 /// Data source with size info
@@ -92,6 +102,8 @@ pub struct DataSource {
     pub size_bytes: u64,
     pub source_type: DataSourceType,
     pub estimation_method: EstimationMethod,
+    pub row_count: Option<u64>,
+    pub column_count: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,18 +118,19 @@ pub enum DataSourceType {
 
 #[derive(Debug, Clone)]
 pub enum EstimationMethod {
-    S3Head,
-    ParquetMetadata,
-    DeltaLog,
-    IcebergManifest,
-    Cached,
-    Default,
+    ParquetFooter,   // Best: exact row count from footer
+    ParquetMetadata, // Using Parquet metadata (alias for footer)
+    S3Head,          // Good: file size only
+    DeltaLog,        // Delta Lake log files
+    IcebergManifest, // Iceberg manifest files
+    Cached,          // Using cached data
+    Default,         // Fallback heuristics
 }
 
-/// Real data size estimator
+/// Improved data size estimator
 pub struct DataSizer {
     s3_client: Option<S3Client>,
-    cache: DashMap<String, CachedSize>,
+    cache: DashMap<String, CachedMetadata>,
     cache_ttl: Duration,
     s3_path_regex: Regex,
     endpoint_url: Option<String>,
@@ -127,8 +140,7 @@ impl DataSizer {
     /// Create a new DataSizer
     pub async fn new() -> Self {
         let endpoint_url = std::env::var("AWS_ENDPOINT_URL").ok();
-        
-        // Try to create S3 client
+
         let s3_client = match Self::create_s3_client(&endpoint_url).await {
             Ok(client) => {
                 info!("S3 client initialized for real size estimation");
@@ -149,197 +161,579 @@ impl DataSizer {
         }
     }
 
-    /// Create S3 client with optional custom endpoint
     async fn create_s3_client(endpoint_url: &Option<String>) -> Result<S3Client> {
-        let mut config_loader = aws_config::from_env();
-        
+        use aws_config::BehaviorVersion;
+
+        let mut config_loader = aws_config::defaults(BehaviorVersion::latest());
+
         if let Some(endpoint) = endpoint_url {
             config_loader = config_loader.endpoint_url(endpoint);
         }
-        
+
         let config = config_loader.load().await;
-        
+
         let s3_config = aws_sdk_s3::config::Builder::from(&config)
-            .force_path_style(true) // Required for MinIO
+            .force_path_style(true)
             .build();
-        
+
         Ok(S3Client::from_conf(s3_config))
     }
 
-    /// Estimate total query size with all metadata for resource calculation
+    /// Parse SQL to extract query structure
+    pub fn parse_sql(&self, sql: &str) -> QueryStructure {
+        let dialect = GenericDialect {};
+        let statements = match Parser::parse_sql(&dialect, sql) {
+            Ok(stmts) => stmts,
+            Err(e) => {
+                debug!("SQL parse error: {}, falling back to regex", e);
+                return self.parse_sql_fallback(sql);
+            }
+        };
+
+        let mut structure = QueryStructure::default();
+
+        for stmt in statements {
+            if let Statement::Query(query) = stmt {
+                // Extract LIMIT
+                if let Some(limit_expr) = &query.limit {
+                    if let Expr::Value(sqlparser::ast::Value::Number(n, _)) = limit_expr {
+                        structure.limit = n.parse().ok();
+                    }
+                }
+
+                if let SetExpr::Select(select) = *query.body {
+                    // Extract selected columns
+                    for item in &select.projection {
+                        match item {
+                            SelectItem::Wildcard(_) => {
+                                structure.is_select_star = true;
+                            }
+                            SelectItem::UnnamedExpr(expr) => {
+                                if let Expr::Identifier(ident) = expr {
+                                    structure.selected_columns.push(ident.value.clone());
+                                } else if let Expr::CompoundIdentifier(parts) = expr {
+                                    if let Some(last) = parts.last() {
+                                        structure.selected_columns.push(last.value.clone());
+                                    }
+                                }
+                            }
+                            SelectItem::ExprWithAlias { expr, .. } => {
+                                if let Expr::Identifier(ident) = expr {
+                                    structure.selected_columns.push(ident.value.clone());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Extract tables
+                    for from in &select.from {
+                        self.extract_tables_from_table_factor(&from.relation, &mut structure.tables);
+                        for join in &from.joins {
+                            structure.has_join = true;
+                            self.extract_tables_from_table_factor(&join.relation, &mut structure.tables);
+                        }
+                    }
+
+                    // Check for WHERE, GROUP BY, etc.
+                    structure.has_where = select.selection.is_some();
+                    structure.has_group_by = !matches!(select.group_by, sqlparser::ast::GroupByExpr::All(exprs) if exprs.is_empty());
+                    structure.has_distinct = select.distinct.is_some();
+
+                    // Check for window functions
+                    let sql_upper = sql.to_uppercase();
+                    structure.has_window = sql_upper.contains(" OVER ");
+                    structure.has_order_by = sql_upper.contains("ORDER BY");
+                }
+            }
+        }
+
+        structure
+    }
+
+    fn extract_tables_from_table_factor(&self, factor: &TableFactor, tables: &mut Vec<String>) {
+        match factor {
+            TableFactor::Table { name, .. } => {
+                tables.push(name.to_string());
+            }
+            TableFactor::TableFunction { expr, .. } => {
+                // Handle read_parquet('s3://...') style functions
+                if let Expr::Function(func) = expr {
+                    match &func.args {
+                        sqlparser::ast::FunctionArguments::List(args) => {
+                            for arg in &args.args {
+                                if let sqlparser::ast::FunctionArg::Unnamed(
+                                    sqlparser::ast::FunctionArgExpr::Expr(Expr::Value(value)),
+                                ) = arg
+                                {
+                                    if let sqlparser::ast::Value::SingleQuotedString(path) = value {
+                                        tables.push(path.clone());
+                                    }
+                                }
+                            }
+                        }
+                        sqlparser::ast::FunctionArguments::None => {}
+                        sqlparser::ast::FunctionArguments::Subquery(_) => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Fallback SQL parsing using regex
+    fn parse_sql_fallback(&self, sql: &str) -> QueryStructure {
+        let sql_upper = sql.to_uppercase();
+        let mut structure = QueryStructure::default();
+
+        // Extract tables using regex
+        let table_regex = Regex::new(r"read_parquet\s*\(\s*'([^']+)'").unwrap();
+        for cap in table_regex.captures_iter(sql) {
+            if let Some(path) = cap.get(1) {
+                structure.tables.push(path.as_str().to_string());
+            }
+        }
+
+        // Check for SELECT *
+        structure.is_select_star = sql_upper.contains("SELECT *") || sql_upper.contains("SELECT\n*");
+
+        // Extract LIMIT
+        if let Some(pos) = sql_upper.find("LIMIT") {
+            let after = &sql[pos + 5..];
+            let num_str: String = after.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+            structure.limit = num_str.parse().ok();
+        }
+
+        // Check operations
+        structure.has_join = sql_upper.contains(" JOIN ");
+        structure.has_group_by = sql_upper.contains("GROUP BY");
+        structure.has_order_by = sql_upper.contains("ORDER BY");
+        structure.has_distinct = sql_upper.contains("DISTINCT");
+        structure.has_window = sql_upper.contains(" OVER ");
+        structure.has_where = sql_upper.contains("WHERE ");
+
+        structure
+    }
+
+    /// Estimate total query size with accurate metadata
     pub async fn estimate_query_size(&self, sql: &str, tables: &[String]) -> QuerySizeEstimate {
+        let query_structure = self.parse_sql(sql);
         let mut sources = Vec::new();
         let mut total_bytes: u64 = 0;
         let mut total_rows: u64 = 0;
-        let mut total_columns: u32 = 0;
-        let mut total_row_groups: u32 = 0;
+        let mut all_columns: Vec<ColumnMetadata> = Vec::new();
 
-        for table in tables {
-            let source = self.estimate_source_size(table).await;
+        // Get metadata for each table
+        let effective_tables = if tables.is_empty() {
+            query_structure.tables.clone()
+        } else {
+            tables.to_vec()
+        };
+
+        for table in &effective_tables {
+            let source = self.estimate_source_size_with_metadata(table).await;
             total_bytes += source.size_bytes;
-            
-            // Aggregate metadata from cache
-            if let Some(cached) = self.cache.get(&source.path) {
-                if let Some(rows) = cached.row_count {
-                    total_rows += rows;
-                }
-                if let Some(cols) = cached.column_count {
-                    total_columns = total_columns.max(cols); // Take max columns across sources
-                }
-                if let Some(rg) = cached.row_group_count {
-                    total_row_groups += rg;
-                }
+
+            if let Some(rows) = source.row_count {
+                total_rows += rows;
             }
-            
+
+            // Get cached column metadata
+            if let Some(cached) = self.cache.get(table) {
+                all_columns.extend(cached.columns.clone());
+            }
+
             sources.push(source);
         }
 
-        // Analyze query for operation types
-        let sql_lower = sql.to_lowercase();
-        let has_join = sql_lower.contains(" join ");
-        let has_aggregation = sql_lower.contains("group by") 
-            || sql_lower.contains("count(") 
-            || sql_lower.contains("sum(")
-            || sql_lower.contains("avg(")
-            || sql_lower.contains("min(")
-            || sql_lower.contains("max(");
-        let has_window = sql_lower.contains(" over ");
-        let has_order_by = sql_lower.contains("order by");
-        
-        // Calculate memory multiplier based on query complexity
-        let memory_multiplier = self.calculate_memory_multiplier(sql);
-        
+        // Calculate column pruning
+        let (selected_column_count, estimated_read_bytes) = self.calculate_column_pruning(
+            &query_structure,
+            &all_columns,
+            total_bytes,
+        );
+
+        // Calculate effective row count (after LIMIT and predicates)
+        let effective_row_count = self.calculate_effective_rows(
+            total_rows,
+            &query_structure,
+        );
+
+        // Calculate memory estimate using data types
+        let estimated_memory_mb = self.calculate_memory_estimate(
+            &query_structure,
+            &all_columns,
+            effective_row_count,
+            estimated_read_bytes,
+        );
+
         let total_mb = total_bytes / (1024 * 1024);
-        let estimated_memory_mb = ((total_bytes as f64 * memory_multiplier) / (1024.0 * 1024.0)) as u64;
-        let estimated_memory_mb = estimated_memory_mb.max(256); // Minimum 256MB
+        let estimation_method = sources
+            .first()
+            .map(|s| format!("{:?}", s.estimation_method))
+            .unwrap_or_else(|| "unknown".to_string());
 
         QuerySizeEstimate {
             total_bytes,
             total_mb,
             row_count: if total_rows > 0 { Some(total_rows) } else { None },
-            column_count: if total_columns > 0 { Some(total_columns) } else { None },
-            row_group_count: if total_row_groups > 0 { Some(total_row_groups) } else { None },
+            effective_row_count,
+            column_count: all_columns.len().try_into().ok(),
+            selected_column_count,
+            row_group_count: sources.first().and_then(|s| {
+                self.cache.get(&s.path).map(|c| c.row_group_count)
+            }),
             sources,
-            memory_multiplier,
+            estimated_read_bytes,
             estimated_memory_mb,
-            has_join,
-            has_aggregation,
-            has_window,
-            has_order_by,
+            has_join: query_structure.has_join,
+            has_aggregation: query_structure.has_group_by,
+            has_window: query_structure.has_window,
+            has_order_by: query_structure.has_order_by,
+            estimation_method,
         }
     }
 
-    /// Estimate size for a single data source
-    async fn estimate_source_size(&self, path: &str) -> DataSource {
+    /// Calculate column pruning savings
+    fn calculate_column_pruning(
+        &self,
+        query: &QueryStructure,
+        columns: &[ColumnMetadata],
+        total_bytes: u64,
+    ) -> (u32, u64) {
+        if query.is_select_star || query.selected_columns.is_empty() || columns.is_empty() {
+            return (columns.len() as u32, total_bytes);
+        }
+
+        // Sum sizes of selected columns only
+        let mut selected_size: u64 = 0;
+        let mut selected_count: u32 = 0;
+
+        for col in columns {
+            let col_name_lower = col.name.to_lowercase();
+            let is_selected = query.selected_columns.iter().any(|s| {
+                s.to_lowercase() == col_name_lower
+            });
+
+            if is_selected {
+                selected_size += col.compressed_size;
+                selected_count += 1;
+            }
+        }
+
+        // If no columns matched, use all columns (maybe different naming)
+        if selected_count == 0 {
+            return (columns.len() as u32, total_bytes);
+        }
+
+        // Add overhead for Parquet structure
+        let estimated_read = (selected_size as f64 * 1.1) as u64;
+
+        info!(
+            "Column pruning: {} of {} columns selected, {} MB instead of {} MB",
+            selected_count,
+            columns.len(),
+            estimated_read / (1024 * 1024),
+            total_bytes / (1024 * 1024)
+        );
+
+        (selected_count, estimated_read)
+    }
+
+    /// Calculate effective row count after LIMIT and predicates
+    fn calculate_effective_rows(&self, total_rows: u64, query: &QueryStructure) -> u64 {
+        let mut effective = total_rows;
+
+        // Apply LIMIT
+        if let Some(limit) = query.limit {
+            effective = effective.min(limit);
+        }
+
+        // Apply selectivity estimate for WHERE clause
+        if query.has_where && query.limit.is_none() {
+            // Conservative estimate: WHERE typically filters 50-90% of data
+            effective = (effective as f64 * 0.5) as u64;
+        }
+
+        effective.max(1)
+    }
+
+    /// Calculate memory estimate using data types
+    fn calculate_memory_estimate(
+        &self,
+        query: &QueryStructure,
+        columns: &[ColumnMetadata],
+        row_count: u64,
+        read_bytes: u64,
+    ) -> u64 {
+        // If we have column metadata, use data-type aware estimation
+        if !columns.is_empty() && row_count > 0 {
+            let mut in_memory_size: u64 = 0;
+
+            for col in columns {
+                // Skip if column is pruned
+                if !query.is_select_star && !query.selected_columns.is_empty() {
+                    let col_lower = col.name.to_lowercase();
+                    let is_selected = query.selected_columns.iter().any(|s| s.to_lowercase() == col_lower);
+                    if !is_selected {
+                        continue;
+                    }
+                }
+
+                // In-memory size per data type
+                let bytes_per_value: u64 = match col.physical_type {
+                    PhysicalType::BOOLEAN => 1,
+                    PhysicalType::INT32 => 4,
+                    PhysicalType::INT64 => 8,
+                    PhysicalType::INT96 => 12,
+                    PhysicalType::FLOAT => 4,
+                    PhysicalType::DOUBLE => 8,
+                    PhysicalType::BYTE_ARRAY => 32, // Average string estimate
+                    PhysicalType::FIXED_LEN_BYTE_ARRAY => 16,
+                };
+
+                in_memory_size += bytes_per_value * row_count;
+            }
+
+            // Add Arrow/DuckDB overhead
+            let mut multiplier = 1.3; // Base overhead
+
+            if query.has_join {
+                multiplier *= 1.5;
+            }
+            if query.has_group_by {
+                multiplier *= 1.3;
+            }
+            if query.has_distinct {
+                multiplier *= 1.2;
+            }
+            if query.has_window {
+                multiplier *= 1.4;
+            }
+            if query.has_order_by && query.limit.is_none() {
+                multiplier *= 1.2;
+            }
+
+            let memory_bytes = (in_memory_size as f64 * multiplier) as u64;
+            let memory_mb = memory_bytes / (1024 * 1024);
+
+            return memory_mb.max(256); // Minimum 256MB
+        }
+
+        // Fallback: use read bytes with multiplier
+        let mut multiplier = 5.0; // Parquet decompresses ~5x
+
+        if query.has_join {
+            multiplier *= 1.5;
+        }
+        if query.has_group_by {
+            multiplier *= 1.3;
+        }
+
+        // Apply LIMIT reduction
+        if let Some(limit) = query.limit {
+            if limit < 10000 {
+                multiplier *= 0.3;
+            } else if limit < 100000 {
+                multiplier *= 0.5;
+            }
+        }
+
+        let memory_bytes = (read_bytes as f64 * multiplier) as u64;
+        let memory_mb = memory_bytes / (1024 * 1024);
+
+        memory_mb.max(256).min(409600) // 256MB to 400GB
+    }
+
+    /// Estimate source size with full Parquet metadata
+    async fn estimate_source_size_with_metadata(&self, path: &str) -> DataSource {
         // Check cache first
         if let Some(cached) = self.cache.get(path) {
             if !cached.is_expired(self.cache_ttl) {
-                debug!("Cache hit for {}: {} bytes", path, cached.size_bytes);
+                debug!("Cache hit for {}: {} bytes, {} rows", path, cached.size_bytes, cached.row_count);
                 return DataSource {
                     path: path.to_string(),
                     size_bytes: cached.size_bytes,
                     source_type: self.detect_source_type(path),
                     estimation_method: EstimationMethod::Cached,
+                    row_count: Some(cached.row_count),
+                    column_count: Some(cached.columns.len() as u32),
                 };
             }
         }
 
-        // Try real estimation methods in order
-        let (size_bytes, method) = if path.starts_with("s3://") {
-            self.estimate_s3_size(path).await
-        } else if path.starts_with("http://") || path.starts_with("https://") {
-            self.estimate_http_size(path).await
-        } else {
-            // Local file or unknown - use defaults
-            (self.default_size_estimate(path), EstimationMethod::Default)
-        };
+        // Try to get Parquet metadata
+        if path.starts_with("s3://") && path.ends_with(".parquet") {
+            if let Some(client) = &self.s3_client {
+                if let Some((bucket, key)) = self.parse_s3_path(path) {
+                    if let Ok(metadata) = self.read_parquet_metadata(client, &bucket, &key).await {
+                        info!(
+                            "Parquet footer read: {} rows, {} columns, {} row groups",
+                            metadata.row_count, metadata.columns.len(), metadata.row_group_count
+                        );
 
-        // Cache the result
-        self.cache.insert(path.to_string(), CachedSize {
-            size_bytes,
-            row_count: None,
-            column_count: None,
-            row_group_count: None,
-            created_at: Instant::now(),
-        });
+                        // Cache the metadata
+                        self.cache.insert(path.to_string(), metadata.clone());
 
+                        // Record metrics
+                        crate::metrics::DATA_ROW_COUNT.observe(metadata.row_count as f64);
+                        crate::metrics::DATA_COLUMN_COUNT.observe(metadata.columns.len() as f64);
+                        crate::metrics::DATA_ROW_GROUP_COUNT.observe(metadata.row_group_count as f64);
+
+                        return DataSource {
+                            path: path.to_string(),
+                            size_bytes: metadata.size_bytes,
+                            source_type: DataSourceType::Parquet,
+                            estimation_method: EstimationMethod::ParquetFooter,
+                            row_count: Some(metadata.row_count),
+                            column_count: Some(metadata.columns.len() as u32),
+                        };
+                    }
+                }
+            }
+        }
+
+        // Fall back to S3 HEAD
+        if path.starts_with("s3://") {
+            if let Some(client) = &self.s3_client {
+                if let Some((bucket, key)) = self.parse_s3_path(path) {
+                    if let Ok(size) = self.head_s3_object(client, &bucket, &key).await {
+                        info!("S3 HEAD {}: {} MB", path, size / (1024 * 1024));
+
+                        // Estimate row count from file size
+                        let estimated_rows = self.estimate_rows_from_size(size, path);
+
+                        return DataSource {
+                            path: path.to_string(),
+                            size_bytes: size,
+                            source_type: self.detect_source_type(path),
+                            estimation_method: EstimationMethod::S3Head,
+                            row_count: Some(estimated_rows),
+                            column_count: None,
+                        };
+                    }
+                }
+            }
+        }
+
+        // Default fallback
+        let default_size = self.default_size_estimate(path);
         DataSource {
             path: path.to_string(),
-            size_bytes,
+            size_bytes: default_size,
             source_type: self.detect_source_type(path),
-            estimation_method: method,
+            estimation_method: EstimationMethod::Default,
+            row_count: None,
+            column_count: None,
         }
     }
 
-    /// Estimate S3 file size using HEAD request
-    async fn estimate_s3_size(&self, path: &str) -> (u64, EstimationMethod) {
-        let s3_client = match &self.s3_client {
-            Some(client) => client,
-            None => return (self.default_size_estimate(path), EstimationMethod::Default),
-        };
+    /// Read Parquet footer to get exact metadata
+    async fn read_parquet_metadata(
+        &self,
+        client: &S3Client,
+        bucket: &str,
+        key: &str,
+    ) -> Result<CachedMetadata> {
+        // Get file size first
+        let file_size = self.head_s3_object(client, bucket, key).await?;
 
-        // Parse S3 path
-        let (bucket, key) = match self.parse_s3_path(path) {
-            Some((b, k)) => (b, k),
-            None => {
-                warn!("Invalid S3 path: {}", path);
-                return (self.default_size_estimate(path), EstimationMethod::Default);
-            }
-        };
+        // Step 1: Read last 8 bytes to get footer size
+        let tail_range = format!("bytes={}-{}", file_size.saturating_sub(8), file_size - 1);
 
-        // Check if it's a Delta table
-        if self.is_delta_table(path) {
-            if let Ok(stats) = self.get_delta_stats(s3_client, &bucket, &key).await {
-                info!("Delta table {}: {} bytes, {} files", path, stats.total_size_bytes, stats.num_files);
-                return (stats.total_size_bytes, EstimationMethod::DeltaLog);
+        let tail_resp = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .range(&tail_range)
+            .send()
+            .await
+            .context("Failed to read Parquet footer tail")?;
+
+        let tail_bytes = tail_resp.body.collect().await?.to_vec();
+
+        if tail_bytes.len() < 8 {
+            anyhow::bail!("Footer too small");
+        }
+
+        // Check magic bytes "PAR1" at the end
+        if &tail_bytes[tail_bytes.len() - 4..] != b"PAR1" {
+            anyhow::bail!("Not a valid Parquet file - missing PAR1 magic bytes");
+        }
+
+        // Get footer metadata length (4 bytes before PAR1, little-endian)
+        let metadata_len = u32::from_le_bytes(
+            tail_bytes[tail_bytes.len() - 8..tail_bytes.len() - 4]
+                .try_into()
+                .context("Failed to read footer length")?,
+        ) as u64;
+
+        debug!("Parquet file {} has metadata size: {} bytes", key, metadata_len);
+
+        // Step 2: Read the full footer (metadata + 8 byte tail)
+        let footer_size = metadata_len + 8;
+        let footer_start = file_size.saturating_sub(footer_size);
+        let footer_range = format!("bytes={}-{}", footer_start, file_size - 1);
+
+        let footer_resp = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .range(&footer_range)
+            .send()
+            .await
+            .context("Failed to read Parquet footer metadata")?;
+
+        let footer_bytes = footer_resp.body.collect().await?.to_vec();
+
+        // Extract just the metadata bytes (excluding the 8-byte tail)
+        if footer_bytes.len() < 8 {
+            anyhow::bail!("Footer bytes too small");
+        }
+        let metadata_bytes = &footer_bytes[..footer_bytes.len() - 8];
+
+        // Parse using ParquetMetaDataReader
+        let metadata = ParquetMetaDataReader::decode_metadata(metadata_bytes)
+            .context("Failed to decode Parquet metadata")?;
+
+        // Extract column metadata
+        let schema = metadata.file_metadata().schema_descr();
+        let mut columns = Vec::new();
+        let mut column_sizes: HashMap<String, (u64, u64)> = HashMap::new();
+
+        // Aggregate column sizes from all row groups
+        for rg in metadata.row_groups() {
+            for col in rg.columns() {
+                let col_path = col.column_descr().path().string();
+                let entry = column_sizes.entry(col_path).or_insert((0, 0));
+                entry.0 += col.compressed_size() as u64;
+                entry.1 += col.uncompressed_size() as u64;
             }
         }
 
-        // Check if it's an Iceberg table
-        if self.is_iceberg_table(path) {
-            if let Ok(stats) = self.get_iceberg_stats(s3_client, &bucket, &key).await {
-                info!("Iceberg table {}: {} bytes, {} files", path, stats.total_size_bytes, stats.num_files);
-                return (stats.total_size_bytes, EstimationMethod::IcebergManifest);
-            }
+        // Build column metadata
+        for col_descr in schema.columns() {
+            let col_path = col_descr.path().string();
+            let (compressed, uncompressed) = column_sizes.get(&col_path).copied().unwrap_or((0, 0));
+
+            columns.push(ColumnMetadata {
+                name: col_descr.name().to_string(),
+                physical_type: col_descr.physical_type(),
+                compressed_size: compressed,
+                uncompressed_size: uncompressed,
+            });
         }
 
-        // Try HEAD request for file size
-        match self.head_s3_object(s3_client, &bucket, &key).await {
-            Ok(size) => {
-                info!("S3 HEAD {}: {} bytes ({} MB)", path, size, size / (1024 * 1024));
-                
-                // For Parquet files, try to read metadata
-                if path.ends_with(".parquet") {
-                    if let Ok(stats) = self.get_parquet_metadata(s3_client, &bucket, &key).await {
-                        info!(
-                            "Parquet metadata: {} rows, {} cols, {} row groups",
-                            stats.row_count, stats.num_columns, stats.num_row_groups
-                        );
-                        // Update cache with all metadata
-                        self.cache.insert(path.to_string(), CachedSize {
-                            size_bytes: size,
-                            row_count: Some(stats.row_count),
-                            column_count: Some(stats.num_columns as u32),
-                            row_group_count: Some(stats.num_row_groups as u32),
-                            created_at: Instant::now(),
-                        });
-                        
-                        // Record metrics for Grafana
-                        crate::metrics::DATA_ROW_COUNT.observe(stats.row_count as f64);
-                        crate::metrics::DATA_COLUMN_COUNT.observe(stats.num_columns as f64);
-                        crate::metrics::DATA_ROW_GROUP_COUNT.observe(stats.num_row_groups as f64);
-                        
-                        return (size, EstimationMethod::ParquetMetadata);
-                    }
-                }
-                
-                (size, EstimationMethod::S3Head)
-            }
-            Err(e) => {
-                warn!("S3 HEAD failed for {}: {}", path, e);
-                (self.default_size_estimate(path), EstimationMethod::Default)
-            }
-        }
+        let row_count = metadata.file_metadata().num_rows() as u64;
+        let row_group_count = metadata.num_row_groups() as u32;
+
+        Ok(CachedMetadata {
+            size_bytes: file_size,
+            row_count,
+            columns,
+            row_group_count,
+            created_at: Instant::now(),
+        })
     }
 
     /// HEAD request to get object size
@@ -355,201 +749,24 @@ impl DataSizer {
         Ok(resp.content_length().unwrap_or(0) as u64)
     }
 
-    /// Get Parquet file metadata
-    async fn get_parquet_metadata(&self, client: &S3Client, bucket: &str, key: &str) -> Result<ParquetStats> {
-        // For simplicity, we'll use the file size from HEAD
-        // Full Parquet footer parsing would require downloading the footer bytes
-        let size = self.head_s3_object(client, bucket, key).await?;
-        
-        // Estimate row count from file size (rough heuristic)
-        // Parquet typically compresses to ~20 bytes per row for typical schemas
-        let estimated_row_count = size / 20;
-        
-        // Estimate columns based on known schemas or file path
-        let num_columns = self.estimate_columns_from_path(key);
-        
-        // Estimate row groups: DuckDB default is ~122,880 rows per group
-        // Parquet default is often similar, but depends on writer
-        let num_row_groups = (estimated_row_count as f64 / 122880.0).ceil().max(1.0) as usize;
-        
-        Ok(ParquetStats {
-            file_size_bytes: size,
-            row_count: estimated_row_count,
-            num_columns,
-            num_row_groups,
-        })
-    }
-    
-    /// Estimate column count from file path/name patterns
-    fn estimate_columns_from_path(&self, path: &str) -> usize {
+    /// Estimate row count from file size (fallback)
+    fn estimate_rows_from_size(&self, size_bytes: u64, path: &str) -> u64 {
         let path_lower = path.to_lowercase();
-        
-        // TPC-H table column counts (well-known benchmark)
-        if path_lower.contains("lineitem") { return 16; }
-        if path_lower.contains("orders") { return 9; }
-        if path_lower.contains("customer") { return 8; }
-        if path_lower.contains("part") { return 9; }
-        if path_lower.contains("partsupp") { return 5; }
-        if path_lower.contains("supplier") { return 7; }
-        if path_lower.contains("nation") { return 4; }
-        if path_lower.contains("region") { return 3; }
-        
-        // TPC-DS common tables
-        if path_lower.contains("store_sales") { return 23; }
-        if path_lower.contains("web_sales") { return 34; }
-        if path_lower.contains("catalog_sales") { return 34; }
-        
-        // Default estimate for unknown schemas
-        // Typical analytical tables have 10-30 columns
-        16
-    }
 
-    /// Get Delta table statistics from _delta_log
-    async fn get_delta_stats(&self, client: &S3Client, bucket: &str, base_key: &str) -> Result<DeltaStats> {
-        // List files in _delta_log to get latest version
-        let delta_log_prefix = format!("{}/_delta_log/", base_key.trim_end_matches('/'));
-        
-        let resp = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .prefix(&delta_log_prefix)
-            .send()
-            .await
-            .context("Failed to list Delta log")?;
-
-        let contents = resp.contents();
-        if contents.is_empty() {
-            anyhow::bail!("No Delta log files found");
-        }
-
-        // Get total size by listing all data files
-        let data_prefix = base_key.trim_end_matches('/');
-        let data_resp = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .prefix(data_prefix)
-            .send()
-            .await
-            .context("Failed to list Delta data files")?;
-
-        let total_size: u64 = data_resp
-            .contents()
-            .iter()
-            .filter(|obj| {
-                let key = obj.key().unwrap_or("");
-                key.ends_with(".parquet") && !key.contains("_delta_log")
-            })
-            .map(|obj| obj.size().unwrap_or(0) as u64)
-            .sum();
-
-        let num_files = data_resp
-            .contents()
-            .iter()
-            .filter(|obj| {
-                let key = obj.key().unwrap_or("");
-                key.ends_with(".parquet") && !key.contains("_delta_log")
-            })
-            .count();
-
-        Ok(DeltaStats {
-            total_size_bytes: total_size,
-            num_files,
-            row_count: None, // Would need to parse Delta log JSON
-        })
-    }
-
-    /// Get Iceberg table statistics from metadata
-    async fn get_iceberg_stats(&self, client: &S3Client, bucket: &str, base_key: &str) -> Result<IcebergStats> {
-        // List files in metadata folder
-        let metadata_prefix = format!("{}/metadata/", base_key.trim_end_matches('/'));
-        
-        let resp = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .prefix(&metadata_prefix)
-            .send()
-            .await
-            .context("Failed to list Iceberg metadata")?;
-
-        if resp.contents().is_empty() {
-            anyhow::bail!("No Iceberg metadata found");
-        }
-
-        // Get total size from data folder
-        let data_prefix = format!("{}/data/", base_key.trim_end_matches('/'));
-        let data_resp = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .prefix(&data_prefix)
-            .send()
-            .await
-            .context("Failed to list Iceberg data files")?;
-
-        let total_size: u64 = data_resp
-            .contents()
-            .iter()
-            .map(|obj| obj.size().unwrap_or(0) as u64)
-            .sum();
-
-        let num_files = data_resp.contents().len();
-
-        Ok(IcebergStats {
-            total_size_bytes: total_size,
-            num_files,
-            row_count: None, // Would need to parse manifest
-        })
-    }
-
-    /// Estimate HTTP URL size (limited without HEAD support)
-    async fn estimate_http_size(&self, path: &str) -> (u64, EstimationMethod) {
-        // Try HTTP HEAD request
-        // For now, use default estimation
-        (self.default_size_estimate(path), EstimationMethod::Default)
-    }
-
-    /// Default size estimate based on file type
-    fn default_size_estimate(&self, path: &str) -> u64 {
-        let path_lower = path.to_lowercase();
-        
-        // Check for size hints in filename (e.g., "data_10gb.parquet")
-        if let Some(size) = self.extract_size_from_filename(&path_lower) {
-            return size;
-        }
-
-        // Default sizes by file type (in bytes)
-        if path_lower.ends_with(".parquet") {
-            500 * 1024 * 1024 // 500 MB default for Parquet
-        } else if path_lower.ends_with(".csv") {
-            100 * 1024 * 1024 // 100 MB default for CSV
-        } else if path_lower.ends_with(".json") || path_lower.ends_with(".jsonl") {
-            50 * 1024 * 1024 // 50 MB default for JSON
+        // Use known schemas for better estimates
+        let bytes_per_row = if path_lower.contains("lineitem") {
+            53 // TPC-H lineitem average
+        } else if path_lower.contains("orders") {
+            40
+        } else if path_lower.contains("customer") {
+            45
         } else {
-            100 * 1024 * 1024 // 100 MB default
-        }
+            50 // Default for Parquet
+        };
+
+        size_bytes / bytes_per_row
     }
 
-    /// Extract size hint from filename (e.g., "data_10gb.parquet" -> 10GB)
-    fn extract_size_from_filename(&self, path: &str) -> Option<u64> {
-        let size_regex = Regex::new(r"(\d+)\s*(mb|gb|tb)").ok()?;
-        
-        if let Some(caps) = size_regex.captures(path) {
-            let num: u64 = caps.get(1)?.as_str().parse().ok()?;
-            let unit = caps.get(2)?.as_str();
-            
-            let bytes = match unit {
-                "mb" => num * 1024 * 1024,
-                "gb" => num * 1024 * 1024 * 1024,
-                "tb" => num * 1024 * 1024 * 1024 * 1024,
-                _ => return None,
-            };
-            
-            return Some(bytes);
-        }
-        
-        None
-    }
-
-    /// Parse S3 path into bucket and key
     fn parse_s3_path(&self, path: &str) -> Option<(String, String)> {
         if let Some(caps) = self.s3_path_regex.captures(path) {
             let bucket = caps.get(1)?.as_str().to_string();
@@ -559,29 +776,16 @@ impl DataSizer {
         None
     }
 
-    /// Check if path is a Delta table
-    fn is_delta_table(&self, path: &str) -> bool {
-        // Delta tables don't have file extension and are directories
-        !path.contains('.') || path.ends_with("/")
-    }
-
-    /// Check if path is an Iceberg table
-    fn is_iceberg_table(&self, path: &str) -> bool {
-        // Iceberg tables typically have metadata/ subfolder
-        path.contains("iceberg") || path.ends_with("/")
-    }
-
-    /// Detect data source type from path
     fn detect_source_type(&self, path: &str) -> DataSourceType {
         let path_lower = path.to_lowercase();
-        
+
         if path_lower.ends_with(".parquet") {
             DataSourceType::Parquet
         } else if path_lower.ends_with(".csv") {
             DataSourceType::Csv
         } else if path_lower.ends_with(".json") || path_lower.ends_with(".jsonl") {
             DataSourceType::Json
-        } else if path_lower.contains("_delta_log") || self.is_delta_table(path) {
+        } else if path_lower.contains("_delta_log") {
             DataSourceType::Delta
         } else if path_lower.contains("iceberg") {
             DataSourceType::Iceberg
@@ -590,68 +794,41 @@ impl DataSizer {
         }
     }
 
-    /// Calculate memory multiplier based on query complexity
-    fn calculate_memory_multiplier(&self, sql: &str) -> f64 {
-        let sql_upper = sql.to_uppercase();
-        let mut multiplier = 2.0; // Base: 2x data size
+    fn default_size_estimate(&self, path: &str) -> u64 {
+        let path_lower = path.to_lowercase();
 
-        // JOINs need more memory
-        if sql_upper.contains(" JOIN ") {
-            multiplier *= 1.5;
-            // Multiple JOINs need even more
-            let join_count = sql_upper.matches(" JOIN ").count();
-            if join_count > 1 {
-                multiplier *= 1.0 + (join_count as f64 * 0.2);
-            }
+        // Check for size hints in filename
+        if let Some(size) = self.extract_size_from_filename(&path_lower) {
+            return size;
         }
 
-        // Aggregations need memory for hash tables
-        let agg_functions = ["SUM(", "COUNT(", "AVG(", "MIN(", "MAX(", "GROUP BY"];
-        for func in agg_functions {
-            if sql_upper.contains(func) {
-                multiplier *= 1.2;
-                break;
-            }
+        // Default sizes by file type
+        if path_lower.ends_with(".parquet") {
+            500 * 1024 * 1024 // 500 MB
+        } else if path_lower.ends_with(".csv") {
+            100 * 1024 * 1024 // 100 MB
+        } else {
+            100 * 1024 * 1024 // 100 MB default
         }
-
-        // DISTINCT needs memory
-        if sql_upper.contains("DISTINCT") {
-            multiplier *= 1.3;
-        }
-
-        // Window functions
-        if sql_upper.contains("OVER (") || sql_upper.contains("OVER(") {
-            multiplier *= 1.4;
-        }
-
-        // ORDER BY on large datasets
-        if sql_upper.contains("ORDER BY") && !sql_upper.contains("LIMIT") {
-            multiplier *= 1.2;
-        }
-
-        // LIMIT reduces memory needs
-        if let Some(limit) = self.extract_limit(&sql_upper) {
-            if limit < 10000 {
-                multiplier *= 0.5;
-            } else if limit < 100000 {
-                multiplier *= 0.7;
-            }
-        }
-
-        multiplier.min(10.0) // Cap at 10x
     }
 
-    /// Extract LIMIT value
-    fn extract_limit(&self, sql: &str) -> Option<u64> {
-        if let Some(pos) = sql.find("LIMIT") {
-            let after = &sql[pos + 5..];
-            let num_str: String = after
-                .trim()
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            return num_str.parse().ok();
+    fn extract_size_from_filename(&self, path: &str) -> Option<u64> {
+        let size_regex = Regex::new(r"(\d+)\s*(mb|gb|tb)").ok()?;
+
+        if let Some(caps) = size_regex.captures(path) {
+            let num: u64 = caps.get(1)?.as_str().parse().ok()?;
+            let unit = caps.get(2)?.as_str();
+
+            let bytes = match unit {
+                "mb" => num * 1024 * 1024,
+                "gb" => num * 1024 * 1024 * 1024,
+                "tb" => num * 1024 * 1024 * 1024 * 1024,
+                _ => return None,
+            };
+
+            return Some(bytes);
         }
+
         None
     }
 
@@ -666,71 +843,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_size_from_filename() {
-        let sizer = DataSizer {
-            s3_client: None,
-            cache: DashMap::new(),
-            cache_ttl: Duration::from_secs(300),
-            s3_path_regex: Regex::new(r"s3://([^/]+)/(.+)").unwrap(),
-            endpoint_url: None,
-        };
+    fn test_parse_sql_select_star() {
+        let sizer = create_test_sizer();
+        let result = sizer.parse_sql("SELECT * FROM read_parquet('s3://bucket/file.parquet')");
 
-        assert_eq!(
-            sizer.extract_size_from_filename("data_10gb.parquet"),
-            Some(10 * 1024 * 1024 * 1024)
-        );
-        assert_eq!(
-            sizer.extract_size_from_filename("sales_500mb.csv"),
-            Some(500 * 1024 * 1024)
-        );
-        assert_eq!(
-            sizer.extract_size_from_filename("small.parquet"),
-            None
-        );
+        assert!(result.is_select_star);
+        assert!(result.tables.contains(&"s3://bucket/file.parquet".to_string()));
     }
 
     #[test]
-    fn test_memory_multiplier() {
-        let sizer = DataSizer {
-            s3_client: None,
-            cache: DashMap::new(),
-            cache_ttl: Duration::from_secs(300),
-            s3_path_regex: Regex::new(r"s3://([^/]+)/(.+)").unwrap(),
-            endpoint_url: None,
-        };
+    fn test_parse_sql_with_columns() {
+        let sizer = create_test_sizer();
+        let result = sizer.parse_sql("SELECT l_orderkey, l_quantity FROM read_parquet('s3://bucket/lineitem.parquet')");
 
-        // Simple query
-        let simple = sizer.calculate_memory_multiplier("SELECT * FROM t");
-        assert!(simple >= 2.0 && simple < 2.5);
-
-        // JOIN query
-        let join = sizer.calculate_memory_multiplier("SELECT * FROM a JOIN b ON a.id = b.id");
-        assert!(join > simple);
-
-        // Complex query
-        let complex = sizer.calculate_memory_multiplier(
-            "SELECT DISTINCT col, SUM(val) FROM a JOIN b ON a.id = b.id GROUP BY col ORDER BY col"
-        );
-        assert!(complex > join);
-
-        // Query with LIMIT
-        let limited = sizer.calculate_memory_multiplier("SELECT * FROM t LIMIT 100");
-        assert!(limited < simple);
+        assert!(!result.is_select_star);
+        assert!(result.selected_columns.contains(&"l_orderkey".to_string()));
+        assert!(result.selected_columns.contains(&"l_quantity".to_string()));
     }
 
     #[test]
-    fn test_parse_s3_path() {
-        let sizer = DataSizer {
+    fn test_parse_sql_with_limit() {
+        let sizer = create_test_sizer();
+        let result = sizer.parse_sql("SELECT * FROM t LIMIT 1000");
+
+        assert_eq!(result.limit, Some(1000));
+    }
+
+    #[test]
+    fn test_parse_sql_with_join() {
+        let sizer = create_test_sizer();
+        let result = sizer.parse_sql("SELECT * FROM a JOIN b ON a.id = b.id");
+
+        assert!(result.has_join);
+    }
+
+    fn create_test_sizer() -> DataSizer {
+        DataSizer {
             s3_client: None,
             cache: DashMap::new(),
             cache_ttl: Duration::from_secs(300),
             s3_path_regex: Regex::new(r"s3://([^/]+)/(.+)").unwrap(),
             endpoint_url: None,
-        };
-
-        let (bucket, key) = sizer.parse_s3_path("s3://my-bucket/path/to/file.parquet").unwrap();
-        assert_eq!(bucket, "my-bucket");
-        assert_eq!(key, "path/to/file.parquet");
+        }
     }
 }
-

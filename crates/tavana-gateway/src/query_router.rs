@@ -96,7 +96,7 @@ impl QueryRouter {
         for source in &size_estimate.sources {
             metrics::record_estimation_method(match source.estimation_method {
                 EstimationMethod::S3Head => "s3_head",
-                EstimationMethod::ParquetMetadata => "parquet_metadata",
+                EstimationMethod::ParquetFooter | EstimationMethod::ParquetMetadata => "parquet_metadata",
                 EstimationMethod::DeltaLog => "delta_log",
                 EstimationMethod::IcebergManifest => "iceberg_manifest",
                 EstimationMethod::Cached => "cached",
