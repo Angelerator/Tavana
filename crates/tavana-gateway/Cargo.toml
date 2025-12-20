@@ -77,7 +77,7 @@ regex = "1.10"
 # S3 and data formats for real size estimation
 aws-sdk-s3 = "1.65"
 aws-config = "1.5"
-parquet = { version = "53.3", default-features = false, features = ["async"] }
+parquet = { workspace = true }
 tokio-util = { version = "0.7", features = ["compat"] }
 
 # Kubernetes (for creating DuckDBQuery CRs)
