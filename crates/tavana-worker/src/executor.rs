@@ -118,6 +118,33 @@ impl DuckDbExecutor {
             tracing::warn!("Could not load httpfs: {}", e);
         }
         
+        // Enable external file cache for S3/remote files (DuckDB 1.3+)
+        // This caches remote data locally to avoid repeated network transfers
+        if let Err(e) = connection.execute("SET enable_external_file_cache = true", params![]) {
+            tracing::warn!("Could not enable external file cache: {}", e);
+        }
+        
+        // Configure temp directory for out-of-core processing (spill to disk)
+        let temp_dir = std::env::var("DUCKDB_TEMP_DIR").unwrap_or_else(|_| "/tmp/duckdb".to_string());
+        let max_temp_size = std::env::var("DUCKDB_MAX_TEMP_SIZE").unwrap_or_else(|_| "100GB".to_string());
+        
+        // Create temp directory if it doesn't exist
+        let _ = std::fs::create_dir_all(&temp_dir);
+        
+        if let Err(e) = connection.execute(&format!("SET temp_directory = '{}'", temp_dir), params![]) {
+            tracing::warn!("Could not set temp_directory: {}", e);
+        }
+        if let Err(e) = connection.execute(&format!("SET max_temp_directory_size = '{}'", max_temp_size), params![]) {
+            tracing::warn!("Could not set max_temp_directory_size: {}", e);
+        }
+        
+        // Increase threads for remote file parallelism (helps with S3)
+        // DuckDB uses synchronous I/O for remote files, so more threads = better parallelism
+        let threads_for_remote = threads * 2;
+        if let Err(e) = connection.execute(&format!("SET threads = {}", threads_for_remote), params![]) {
+            tracing::warn!("Could not increase threads for remote: {}", e);
+        }
+        
         Ok(connection)
     }
     

@@ -74,7 +74,7 @@ pub async fn execute_query(
         QueryTarget::PreSizedWorker { worker_name, .. } => Some(worker_name.clone()),
         QueryTarget::WorkerPool => None,
     };
-
+    
     info!(
         "Query: {}MB data, {}MB memory, resized={}, target={:?}",
         estimate.data_size_mb,
@@ -111,11 +111,11 @@ pub async fn execute_query(
         Ok((columns, column_types, rows, total_rows)) => {
             let elapsed = start_time.elapsed();
             metrics::record_query_completed(route_label, "success", elapsed.as_secs_f64());
-
+            
             let estimated_bytes = total_rows as u64 * 100;
             metrics::record_data_scanned(estimated_bytes);
             metrics::record_actual_query_size((estimated_bytes as f64) / (1024.0 * 1024.0));
-
+            
             let response = QueryResponse {
                 columns,
                 column_types,
@@ -132,7 +132,7 @@ pub async fn execute_query(
         Err(e) => {
             let elapsed = start_time.elapsed();
             metrics::record_query_completed(route_label, "error", elapsed.as_secs_f64());
-
+            
             error!("Query failed: {}", e);
             let error_response = ErrorResponse {
                 error: e.to_string(),
@@ -176,7 +176,7 @@ async fn execute_on_presized_worker(
         }),
         options: Some(proto::QueryOptions {
             timeout_seconds: 300,
-            max_rows: 10000,
+            max_rows: 0,  // 0 = unlimited rows (streaming)
             max_bytes: 0,
             enable_profiling: false,
             session_params: Default::default(),
@@ -283,9 +283,9 @@ pub async fn export_query(
     Json(request): Json<ExportRequest>,
 ) -> impl IntoResponse {
     info!("Export request to {}: {}", request.output_path, request.sql);
-
+    
     let start = std::time::Instant::now();
-
+    
     let format_options = match request.format {
         ExportFormat::Parquet if !request.partition_by.is_empty() => {
             format!(
@@ -297,12 +297,12 @@ pub async fn export_query(
         ExportFormat::Csv => "FORMAT CSV, HEADER true".to_string(),
         ExportFormat::Json => "FORMAT JSON".to_string(),
     };
-
+    
     let export_sql = format!(
         "COPY ({}) TO '{}' ({})",
         request.sql, request.output_path, format_options
     );
-
+    
     match state
         .worker_client
         .execute_query(&export_sql, &request.user_id)
@@ -314,13 +314,13 @@ pub async fn export_query(
                 "Export completed in {}ms to {}",
                 duration_ms, request.output_path
             );
-
+            
             (
                 StatusCode::OK,
                 Json(ExportResponse {
-                    output_path: request.output_path,
-                    message: "Export completed successfully".to_string(),
-                    execution_time_ms: duration_ms,
+                output_path: request.output_path,
+                message: "Export completed successfully".to_string(),
+                execution_time_ms: duration_ms,
                 }),
             )
         }
@@ -329,9 +329,9 @@ pub async fn export_query(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ExportResponse {
-                    output_path: request.output_path,
-                    message: format!("Export failed: {}", e),
-                    execution_time_ms: start.elapsed().as_millis() as u64,
+                output_path: request.output_path,
+                message: format!("Export failed: {}", e),
+                execution_time_ms: start.elapsed().as_millis() as u64,
                 }),
             )
         }
