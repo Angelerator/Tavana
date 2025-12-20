@@ -1,12 +1,11 @@
 //! gRPC service implementation for the worker
+//! 
+//! Uses Arrow's built-in display utilities for data-type agnostic value formatting.
+//! This eliminates the need to manually handle each Arrow data type.
 
 use crate::executor::{DuckDbExecutor, ExecutorConfig};
-use duckdb::arrow::array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array, StringArray, LargeStringArray,
-    Date32Array, Date64Array, TimestampMicrosecondArray,
-};
-use duckdb::arrow::datatypes::DataType;
+use duckdb::arrow::array::Array;
+use duckdb::arrow::util::display::ArrayFormatter;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -193,93 +192,20 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
 }
 
 /// Format an Arrow array value at a given index as a string
+/// 
+/// Uses Arrow's built-in ArrayFormatter which handles ALL data types automatically,
+/// including Decimal128, Decimal256, timestamps, dates, lists, structs, etc.
+/// This is data-type agnostic - no need to add new types manually.
 fn format_array_value(array: &dyn Array, idx: usize) -> String {
     if array.is_null(idx) {
         return "NULL".to_string();
     }
 
-    match array.data_type() {
-        DataType::Boolean => {
-            array.as_any().downcast_ref::<BooleanArray>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Int8 => {
-            array.as_any().downcast_ref::<Int8Array>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Int16 => {
-            array.as_any().downcast_ref::<Int16Array>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Int32 => {
-            array.as_any().downcast_ref::<Int32Array>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Int64 => {
-            array.as_any().downcast_ref::<Int64Array>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        }
-        DataType::UInt8 => {
-            array.as_any().downcast_ref::<UInt8Array>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        }
-        DataType::UInt16 => {
-            array.as_any().downcast_ref::<UInt16Array>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        }
-        DataType::UInt32 => {
-            array.as_any().downcast_ref::<UInt32Array>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        }
-        DataType::UInt64 => {
-            array.as_any().downcast_ref::<UInt64Array>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Float32 => {
-            array.as_any().downcast_ref::<Float32Array>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Float64 => {
-            array.as_any().downcast_ref::<Float64Array>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Utf8 => {
-            array.as_any().downcast_ref::<StringArray>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        }
-        DataType::LargeUtf8 => {
-            array.as_any().downcast_ref::<LargeStringArray>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Date32 => {
-            array.as_any().downcast_ref::<Date32Array>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Date64 => {
-            array.as_any().downcast_ref::<Date64Array>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_default()
-        }
-        DataType::Timestamp(_, _) => {
-            array.as_any().downcast_ref::<TimestampMicrosecondArray>()
-                .map(|a| a.value(idx).to_string())
-                .unwrap_or_else(|| "<timestamp>".to_string())
-        }
-        _ => format!("<{:?}>", array.data_type()),
+    // Use Arrow's built-in formatter which handles all types correctly
+    // FormatOptions::default() provides sensible defaults for all types
+    match ArrayFormatter::try_new(array, &Default::default()) {
+        Ok(formatter) => formatter.value(idx).to_string(),
+        Err(_) => format!("<{:?}>", array.data_type()),
     }
 }
 

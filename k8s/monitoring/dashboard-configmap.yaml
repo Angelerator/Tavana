@@ -43,7 +43,7 @@ data:
           "gridPos": { "h": 4, "w": 3, "x": 0, "y": 1 },
           "id": 1,
           "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-          "targets": [{ "expr": "tavana_worker_pool_status{state=\"total\"}", "legendFormat": "Total", "refId": "A" }],
+          "targets": [{ "expr": "sum(tavana_worker_pool_status{state=\"total\"})", "legendFormat": "Total", "refId": "A" }],
           "title": "Total Workers",
           "type": "stat"
         },
@@ -54,7 +54,7 @@ data:
           "gridPos": { "h": 4, "w": 2, "x": 3, "y": 1 },
           "id": 2,
           "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-          "targets": [{ "expr": "tavana_worker_pool_status{state=\"busy\"}", "legendFormat": "Busy", "refId": "A" }],
+          "targets": [{ "expr": "sum(tavana_worker_pool_status{state=\"busy\"})", "legendFormat": "Busy", "refId": "A" }],
           "title": "Busy Workers",
           "type": "stat"
         },
@@ -65,7 +65,7 @@ data:
           "gridPos": { "h": 4, "w": 2, "x": 5, "y": 1 },
           "id": 3,
           "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-          "targets": [{ "expr": "tavana_worker_pool_status{state=\"idle\"}", "legendFormat": "Idle", "refId": "A" }],
+          "targets": [{ "expr": "sum(tavana_worker_pool_status{state=\"idle\"})", "legendFormat": "Idle", "refId": "A" }],
           "title": "Idle Workers",
           "type": "stat"
         },
@@ -76,7 +76,7 @@ data:
           "gridPos": { "h": 4, "w": 2, "x": 7, "y": 1 },
           "id": 4,
           "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-          "targets": [{ "expr": "tavana_worker_pool_status{state=\"resizing\"}", "legendFormat": "Resizing", "refId": "A" }],
+          "targets": [{ "expr": "sum(tavana_worker_pool_status{state=\"resizing\"})", "legendFormat": "Resizing", "refId": "A" }],
           "title": "Resizing",
           "type": "stat"
         },
@@ -87,7 +87,7 @@ data:
           "gridPos": { "h": 4, "w": 2, "x": 9, "y": 1 },
           "id": 5,
           "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-          "targets": [{ "expr": "rate(tavana_worker_presize_total{result=\"success\"}[5m]) * 60", "legendFormat": "Pre-sizes/min", "refId": "A" }],
+          "targets": [{ "expr": "sum(rate(tavana_worker_presize_total{result=\"success\"}[5m])) * 60", "legendFormat": "Pre-sizes/min", "refId": "A" }],
           "title": "Pre-sizes/min",
           "type": "stat"
         },
@@ -120,7 +120,7 @@ data:
           "gridPos": { "h": 4, "w": 3, "x": 17, "y": 1 },
           "id": 8,
           "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-          "targets": [{ "expr": "tavana_data_scanned_bytes_total", "legendFormat": "Scanned", "refId": "A" }],
+          "targets": [{ "expr": "sum(tavana_data_scanned_bytes_total)", "legendFormat": "Scanned", "refId": "A" }],
           "title": "Total Data",
           "type": "stat"
         },
@@ -260,10 +260,10 @@ data:
           "id": 20,
           "options": { "legend": { "calcs": ["mean", "max", "lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
           "targets": [
-            { "expr": "tavana_worker_pool_status{state=\"total\"}", "legendFormat": "Total Workers", "refId": "Total" },
-            { "expr": "tavana_worker_pool_status{state=\"busy\"}", "legendFormat": "Busy", "refId": "Busy" },
-            { "expr": "tavana_worker_pool_status{state=\"idle\"}", "legendFormat": "Idle", "refId": "Idle" },
-            { "expr": "tavana_worker_pool_status{state=\"resizing\"}", "legendFormat": "Resizing", "refId": "Resizing" }
+            { "expr": "sum(tavana_worker_pool_status{state=\"total\"})", "legendFormat": "Total Workers", "refId": "Total" },
+            { "expr": "sum(tavana_worker_pool_status{state=\"busy\"})", "legendFormat": "Busy", "refId": "Busy" },
+            { "expr": "sum(tavana_worker_pool_status{state=\"idle\"})", "legendFormat": "Idle", "refId": "Idle" },
+            { "expr": "sum(tavana_worker_pool_status{state=\"resizing\"})", "legendFormat": "Resizing", "refId": "Resizing" }
           ],
           "title": "Worker Pool Status",
           "type": "timeseries"

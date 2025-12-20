@@ -352,32 +352,35 @@ impl WorkerPoolManager {
     }
     
     /// Resize a worker pod using K8s API (in-place resize)
+    /// Uses replace_subresource("resize") which is the correct API for K8s 1.35+ in-place pod resizing
     async fn resize_worker(&self, pod_name: &str, memory_mb: u64) -> Result<(), anyhow::Error> {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), &self.config.namespace);
         
-        // Create patch for resource resize
-        // K8s v1.35 with resizePolicy: NotRequired allows this without restart
-        let patch = json!({
-            "spec": {
-                "containers": [{
-                    "name": "worker",
-                    "resources": {
-                        "requests": {
-                            "memory": format!("{}Mi", memory_mb)
-                        },
-                        "limits": {
-                            "memory": format!("{}Mi", memory_mb * 2)  // Limits = 2x requests
-                        }
-                    }
-                }]
+        // Get current pod spec first
+        let mut pod = pods.get(pod_name).await?;
+        
+        // Modify the resources - K8s 1.35+ with resizePolicy: NotRequired allows this without restart
+        if let Some(ref mut spec) = pod.spec {
+            if let Some(container) = spec.containers.iter_mut().find(|c| c.name == "worker") {
+                let memory_request = format!("{}Mi", memory_mb);
+                let memory_limit = format!("{}Gi", (memory_mb as f64 / 1024.0 * 2.0).ceil() as u64);
+                
+                // Update resources
+                let resources = container.resources.get_or_insert_with(Default::default);
+                let requests = resources.requests.get_or_insert_with(Default::default);
+                requests.insert("memory".to_string(), k8s_openapi::apimachinery::pkg::api::resource::Quantity(memory_request));
+                
+                let limits = resources.limits.get_or_insert_with(Default::default);
+                limits.insert("memory".to_string(), k8s_openapi::apimachinery::pkg::api::resource::Quantity(memory_limit));
             }
-        });
+        }
         
-        let patch_params = PatchParams::apply("tavana-gateway").force();
+        // Use replace_subresource with "resize" - this is the correct API for in-place pod resize
+        // Equivalent to: kubectl replace -f pod.yaml --subresource=resize
+        let replace_params = kube::api::PostParams::default();
+        pods.replace_subresource("resize", pod_name, &replace_params, serde_json::to_vec(&pod)?).await?;
         
-        pods.patch(pod_name, &patch_params, &Patch::Apply(&patch)).await?;
-        
-        info!("Resized worker {} to {}MB (in-place)", pod_name, memory_mb);
+        info!("Resized worker {} to {}MB (in-place via resize subresource)", pod_name, memory_mb);
         Ok(())
     }
     
