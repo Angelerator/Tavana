@@ -52,17 +52,14 @@ impl WorkerClient {
             }
         }
 
-        // Connect with increased message size limits
-        // Note: HPA worker pool handles small/medium queries only (up to threshold)
-        // Large queries (10TB+) go to ephemeral pods, not here
+        // Connect with large message size for big result sets
         info!("Connecting to worker at {}", self.worker_addr);
-        const MAX_MESSAGE_SIZE: usize = 512 * 1024 * 1024; // 512MB - sufficient for HPA pool queries
+        const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
         
-        // HPA pool timeout: 10 minutes max (small/medium queries only)
-        // Large queries should be routed to ephemeral pods instead
         let channel = Channel::from_shared(self.worker_addr.clone())?
-            .timeout(std::time::Duration::from_secs(600)) // 10 minutes
-            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(1800)) // 30 minutes
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
             .connect()
             .await?;
             
