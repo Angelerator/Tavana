@@ -1,65 +1,124 @@
-# Horizontal Pod Autoscaler for Tavana Worker Pool
-# Uses K8s v1.35 configurable tolerance for responsive scaling
-# Works alongside VPA for complete auto-scaling
+# Worker HPA - DISABLED (SmartScaler controls scaling)
+# 
+# ARCHITECTURE:
+# SmartScaler handles BOTH:
+#   - HPA (pod count): Adaptive formula-based scaling
+#   - VPA (pod size): Pre-sizing + Elastic resize
+#
+# K8s HPA is disabled by setting targets to 99% (never triggers)
+# This prevents conflicts between K8s HPA and SmartScaler
+
+---
+# PASSIVE HPA - only provides bounds, never triggers scaling
+# All scaling decisions are made by SmartScaler's adaptive formula
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: worker-hpa
   namespace: tavana
-  labels:
-    app: tavana
-    component: worker
+  annotations:
+    description: "PASSIVE - SmartScaler controls scaling, not this HPA"
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
     name: worker
-  # Min 2 workers (always +2 idle buffer)
-  # Max 100 workers (for high load)
   minReplicas: 2
   maxReplicas: 100
   metrics:
-    # Scale based on CPU utilization
-    # 70% target means ~30% headroom for new queries
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70
-    # Also scale based on memory to handle large queries
-    - type: Resource
-      resource:
-        name: memory
-        target:
-          type: Utilization
-          averageUtilization: 70
+  # Set to 99% - will never trigger (SmartScaler handles scaling)
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 99
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 99
   behavior:
-    # Scale UP aggressively - react quickly to load
+    # SCALE UP: Effectively disabled - very slow (SmartScaler handles this)
     scaleUp:
-      # K8s v1.35: React to 5% change (more sensitive)
-      tolerance: 0.05
-      # Short stabilization - react quickly
-      stabilizationWindowSeconds: 15
+      stabilizationWindowSeconds: 1800  # 30 min - effectively disabled
       policies:
-        # Add 3 pods at a time (maintain +2 buffer)
-        - type: Pods
-          value: 3
-          periodSeconds: 15
-        # Or add up to 50% more pods if needed
-        - type: Percent
-          value: 50
-          periodSeconds: 15
-      selectPolicy: Max
-    # Scale DOWN conservatively - maintain buffer
-    scaleDown:
-      # K8s v1.35: Less sensitive to small drops
-      tolerance: 0.15
-      # Long stabilization - don't scale down too fast
-      stabilizationWindowSeconds: 300
-      policies:
-        # Remove 1 pod at a time
-        - type: Pods
-          value: 1
-          periodSeconds: 60
+      - type: Pods
+        value: 1  # Minimum allowed
+        periodSeconds: 1800  # Maximum allowed
       selectPolicy: Min
+    # SCALE DOWN: Effectively disabled - very slow (SmartScaler handles this)
+    scaleDown:
+      stabilizationWindowSeconds: 1800  # 30 min - effectively disabled
+      policies:
+      - type: Pods
+        value: 1  # Minimum allowed
+        periodSeconds: 1800  # Maximum allowed
+      selectPolicy: Min
+---
+# Option 2: KEDA ScaledObject (recommended for production)
+# Uses custom metrics: active_queries, queue_depth
+# 
+# To use: Install KEDA first:
+#   helm repo add kedacore https://kedacore.github.io/charts
+#   helm install keda kedacore/keda --namespace keda --create-namespace
+#
+# Then apply this ScaledObject (uncomment below):
+
+# apiVersion: keda.sh/v1alpha1
+# kind: ScaledObject
+# metadata:
+#   name: worker-scaledobject
+#   namespace: tavana
+# spec:
+#   scaleTargetRef:
+#     name: worker
+#   # Allow scaling to zero during idle periods (cost savings!)
+#   minReplicaCount: 0
+#   maxReplicaCount: 100
+#   # 5 min cooldown before scaling down
+#   cooldownPeriod: 300
+#   # Advanced settings
+#   advanced:
+#     horizontalPodAutoscalerConfig:
+#       behavior:
+#         scaleUp:
+#           stabilizationWindowSeconds: 0
+#           policies:
+#           - type: Percent
+#             value: 100
+#             periodSeconds: 15
+#         scaleDown:
+#           stabilizationWindowSeconds: 300
+#           policies:
+#           - type: Pods
+#             value: 1
+#             periodSeconds: 120
+#   triggers:
+#   # PRIMARY: Scale on active queries (most accurate!)
+#   - type: prometheus
+#     metadata:
+#       serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+#       metricName: tavana_active_queries
+#       # Scale when avg queries per worker > 3
+#       threshold: "3"
+#       query: |
+#         sum(tavana_active_queries) / 
+#         clamp_min(count(kube_pod_info{namespace="tavana", pod=~"worker.*"}), 1)
+#   # SECONDARY: Scale on queue depth (handle bursts)
+#   - type: prometheus
+#     metadata:
+#       serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+#       metricName: tavana_query_queue_depth
+#       # Scale when queue > 5 queries
+#       threshold: "5"
+#       query: tavana_query_queue_depth
+#   # TERTIARY: Scale on query rate (predictive scaling)
+#   - type: prometheus
+#     metadata:
+#       serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+#       metricName: tavana_query_rate
+#       # Scale when rate > 10 queries/sec
+#       threshold: "10"
+#       query: tavana_query_rate

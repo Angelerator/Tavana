@@ -519,6 +519,28 @@ pub fn init_metrics() {
     let _ = &*RESIZE_MEMORY_DELTA_MB;
     let _ = &*ELASTIC_SCALEUP_TOTAL;
     let _ = &*VPA_RECOMMENDATION_MB;
+    // Queue metrics
+    let _ = &*QUERY_QUEUE_DEPTH;
+    let _ = &*QUERY_QUEUE_DEPTH_BY_PRIORITY;
+    let _ = &*QUERY_QUEUE_REJECTED_TOTAL;
+    let _ = &*QUERY_QUEUE_TIMEOUT_TOTAL;
+    let _ = &*QUERY_QUEUE_WAIT_SECONDS;
+    // Active query metrics (for HPA/KEDA)
+    let _ = &*ACTIVE_QUERIES;
+    let _ = &*ACTIVE_QUERIES_PER_WORKER;
+    let _ = &*QUERY_RATE;
+    let _ = &*ELASTIC_RESIZE_TOTAL;
+    let _ = &*ELASTIC_RESIZE_MEMORY_MB;
+    // Adaptive queue metrics
+    let _ = &*QUERY_OUTCOME_TOTAL;
+    let _ = &*ADAPTIVE_CONCURRENCY_LIMIT;
+    let _ = &*ADAPTIVE_COST_UNITS_IN_USE;
+    let _ = &*ADAPTIVE_AIMD_EVENTS;
+    let _ = &*ADAPTIVE_AIMD_DELTA;
+    let _ = &*ADAPTIVE_MIN_LATENCY_MS;
+    let _ = &*QUERY_COST_UNITS;
+    let _ = &*QUERY_SUCCESS_RATE;
+    let _ = &*FAILURE_BREAKDOWN;
 
     // Set initial values
     ADAPTIVE_THRESHOLD_MB.set(2048.0); // 2GB default
@@ -530,6 +552,12 @@ pub fn init_metrics() {
     WORKER_POOL_STATUS.with_label_values(&["busy"]).set(0.0);
     WORKER_POOL_STATUS.with_label_values(&["idle"]).set(0.0);
     WORKER_POOL_STATUS.with_label_values(&["resizing"]).set(0.0);
+    
+    // Initialize queue metrics
+    QUERY_QUEUE_DEPTH.set(0.0);
+    QUERY_QUEUE_DEPTH_BY_PRIORITY.with_label_values(&["high"]).set(0.0);
+    QUERY_QUEUE_DEPTH_BY_PRIORITY.with_label_values(&["normal"]).set(0.0);
+    QUERY_QUEUE_DEPTH_BY_PRIORITY.with_label_values(&["low"]).set(0.0);
 }
 
 /// Encode all metrics as Prometheus text format
@@ -713,5 +741,526 @@ pub fn update_vpa_recommendations(target_mb: f64, lower_bound_mb: f64, upper_bou
     VPA_RECOMMENDATION_MB.with_label_values(&["lower_bound"]).set(lower_bound_mb);
     VPA_RECOMMENDATION_MB.with_label_values(&["upper_bound"]).set(upper_bound_mb);
     VPA_RECOMMENDATION_MB.with_label_values(&["uncapped_target"]).set(uncapped_mb);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// QUERY QUEUE METRICS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Query queue depth
+pub static QUERY_QUEUE_DEPTH: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_query_queue_depth",
+        "Current number of queries waiting in the queue"
+    )
+    .unwrap()
+});
+
+/// Query queue depth by priority
+pub static QUERY_QUEUE_DEPTH_BY_PRIORITY: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "tavana_query_queue_depth_by_priority",
+        "Query queue depth by priority level",
+        &["priority"]  // "high", "normal", "low"
+    )
+    .unwrap()
+});
+
+/// Queries rejected due to queue full
+pub static QUERY_QUEUE_REJECTED_TOTAL: Lazy<prometheus::Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "tavana_query_queue_rejected_total",
+        "Total queries rejected because queue was full"
+    )
+    .unwrap()
+});
+
+/// Queries that timed out in queue
+pub static QUERY_QUEUE_TIMEOUT_TOTAL: Lazy<prometheus::Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "tavana_query_queue_timeout_total",
+        "Total queries that timed out while waiting in queue"
+    )
+    .unwrap()
+});
+
+/// Queue wait time
+pub static QUERY_QUEUE_WAIT_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "tavana_query_queue_wait_seconds",
+        "Time queries spent waiting in queue",
+        vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0]
+    )
+    .unwrap()
+});
+
+/// Record queue depth
+pub fn record_queue_depth(depth: usize) {
+    QUERY_QUEUE_DEPTH.set(depth as f64);
+}
+
+/// Record queue depth by priority
+pub fn record_queue_depth_by_priority(high: usize, normal: usize, low: usize) {
+    QUERY_QUEUE_DEPTH_BY_PRIORITY.with_label_values(&["high"]).set(high as f64);
+    QUERY_QUEUE_DEPTH_BY_PRIORITY.with_label_values(&["normal"]).set(normal as f64);
+    QUERY_QUEUE_DEPTH_BY_PRIORITY.with_label_values(&["low"]).set(low as f64);
+}
+
+/// Record query rejected due to queue full
+pub fn record_queue_rejected() {
+    QUERY_QUEUE_REJECTED_TOTAL.inc();
+}
+
+/// Record query timeout in queue
+pub fn record_queue_timeout() {
+    QUERY_QUEUE_TIMEOUT_TOTAL.inc();
+}
+
+/// Record queue wait time
+pub fn record_queue_wait_time(wait_seconds: f64) {
+    QUERY_QUEUE_WAIT_SECONDS.observe(wait_seconds);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ACTIVE QUERY METRICS (for HPA scaling)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Currently executing queries (for HPA/KEDA scaling)
+pub static ACTIVE_QUERIES: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_active_queries",
+        "Number of queries currently being executed (for HPA scaling)"
+    )
+    .unwrap()
+});
+
+/// Active queries per worker (for load balancing insights)
+pub static ACTIVE_QUERIES_PER_WORKER: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "tavana_active_queries_per_worker",
+        "Active queries per worker pod",
+        &["worker"]
+    )
+    .unwrap()
+});
+
+/// Query rate (queries started per second, for HPA scaling)
+pub static QUERY_RATE: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_query_rate",
+        "Queries started per second (moving average)"
+    )
+    .unwrap()
+});
+
+/// Elastic resize operations
+pub static ELASTIC_RESIZE_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "tavana_elastic_resize_total",
+        "Total elastic resize operations during query execution",
+        &["result"]  // "success", "failed", "at_limit"
+    )
+    .unwrap()
+});
+
+/// Elastic resize memory delta
+pub static ELASTIC_RESIZE_MEMORY_MB: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "tavana_elastic_resize_memory_mb",
+        "Memory added during elastic resize (MB)",
+        vec![64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0]
+    )
+    .unwrap()
+});
+
+/// Increment active query count (call when query starts)
+pub fn query_started() {
+    ACTIVE_QUERIES.inc();
+}
+
+/// Decrement active query count (call when query ends)
+pub fn query_ended() {
+    ACTIVE_QUERIES.dec();
+}
+
+/// Update active queries for a specific worker
+pub fn update_worker_active_queries(worker: &str, count: i64) {
+    ACTIVE_QUERIES_PER_WORKER.with_label_values(&[worker]).set(count as f64);
+}
+
+/// Update query rate
+pub fn update_query_rate(rate: f64) {
+    QUERY_RATE.set(rate);
+}
+
+/// Record elastic resize operation
+pub fn record_elastic_resize(result: &str, memory_delta_mb: f64) {
+    ELASTIC_RESIZE_TOTAL.with_label_values(&[result]).inc();
+    if memory_delta_mb > 0.0 {
+        ELASTIC_RESIZE_MEMORY_MB.observe(memory_delta_mb);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TENANT POOL METRICS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Total tenant pools
+pub static TENANT_POOLS_TOTAL: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_tenant_pools_total",
+        "Total number of tenant-dedicated worker pools"
+    )
+    .unwrap()
+});
+
+/// Active tenant pools (with workers > 0)
+pub static TENANT_POOLS_ACTIVE: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_tenant_pools_active",
+        "Number of active tenant pools (with running workers)"
+    )
+    .unwrap()
+});
+
+/// Workers per tenant
+pub static TENANT_POOL_WORKERS: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "tavana_tenant_pool_workers",
+        "Number of workers in each tenant pool",
+        &["tenant_id"]
+    )
+    .unwrap()
+});
+
+/// Queries per tenant
+pub static TENANT_POOL_QUERIES: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "tavana_tenant_pool_queries_total",
+        "Total queries processed per tenant pool",
+        &["tenant_id"]
+    )
+    .unwrap()
+});
+
+/// Tenant pool routing decisions
+pub static TENANT_ROUTING_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "tavana_tenant_routing_total",
+        "Routing decisions by type",
+        &["type"]  // "dedicated", "shared", "new_pool"
+    )
+    .unwrap()
+});
+
+/// Tenant pool creation events
+pub static TENANT_POOL_CREATED_TOTAL: Lazy<prometheus::Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "tavana_tenant_pool_created_total",
+        "Total tenant pools created"
+    )
+    .unwrap()
+});
+
+/// Tenant pool deletion events
+pub static TENANT_POOL_DELETED_TOTAL: Lazy<prometheus::Counter> = Lazy::new(|| {
+    prometheus::register_counter!(
+        "tavana_tenant_pool_deleted_total",
+        "Total tenant pools deleted (idle cleanup)"
+    )
+    .unwrap()
+});
+
+/// Record tenant pool created
+pub fn record_tenant_pool_created(tenant_id: &str) {
+    TENANT_POOL_CREATED_TOTAL.inc();
+    TENANT_POOLS_TOTAL.inc();
+    TENANT_POOLS_ACTIVE.inc();
+    TENANT_POOL_WORKERS.with_label_values(&[tenant_id]).set(1.0);
+}
+
+/// Record tenant pool deleted
+pub fn record_tenant_pool_deleted(tenant_id: &str) {
+    TENANT_POOL_DELETED_TOTAL.inc();
+    TENANT_POOLS_TOTAL.dec();
+    TENANT_POOLS_ACTIVE.dec();
+    TENANT_POOL_WORKERS.with_label_values(&[tenant_id]).set(0.0);
+}
+
+/// Record tenant query routed
+pub fn record_tenant_query(tenant_id: &str, routing_type: &str) {
+    TENANT_POOL_QUERIES.with_label_values(&[tenant_id]).inc();
+    TENANT_ROUTING_TOTAL.with_label_values(&[routing_type]).inc();
+}
+
+/// Update tenant pool workers count
+pub fn update_tenant_pool_workers(tenant_id: &str, count: i32) {
+    TENANT_POOL_WORKERS.with_label_values(&[tenant_id]).set(count as f64);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ADAPTIVE QUEUE METRICS - Comprehensive Success/Failure Tracking
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Query outcome counter by type - CRITICAL for success rate calculation
+pub static QUERY_OUTCOME_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "tavana_query_outcome_total",
+        "Total queries by outcome type",
+        &["outcome"]  
+        // Possible values:
+        // "success", "timeout", "oom", "connection_error", "worker_error",
+        // "client_disconnect", "parse_error", "auth_error", "unknown_error",
+        // "rejected_capacity", "rejected_queue_full", "rejected_too_large", "rejected_overload"
+    )
+    .unwrap()
+});
+
+/// Current adaptive concurrency limit (learned via AIMD)
+pub static ADAPTIVE_CONCURRENCY_LIMIT: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_adaptive_concurrency_limit",
+        "Current concurrency limit in cost units (learned via AIMD)"
+    )
+    .unwrap()
+});
+
+/// Current cost units in use
+pub static ADAPTIVE_COST_UNITS_IN_USE: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_adaptive_cost_units_in_use",
+        "Current cost units being used (in-flight queries)"
+    )
+    .unwrap()
+});
+
+/// AIMD adjustment events
+pub static ADAPTIVE_AIMD_EVENTS: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "tavana_adaptive_aimd_events_total",
+        "AIMD limit adjustment events",
+        &["direction"]  // "increase", "decrease"
+    )
+    .unwrap()
+});
+
+/// AIMD limit adjustment magnitude
+pub static ADAPTIVE_AIMD_DELTA: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "tavana_adaptive_aimd_delta",
+        "Magnitude of AIMD limit adjustments",
+        vec![-50.0, -20.0, -10.0, -5.0, -1.0, 0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+    )
+    .unwrap()
+});
+
+/// Minimum observed latency (baseline for gradient)
+pub static ADAPTIVE_MIN_LATENCY_MS: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_adaptive_min_latency_ms",
+        "Minimum observed latency in ms (baseline when unloaded)"
+    )
+    .unwrap()
+});
+
+/// Query cost units distribution
+pub static QUERY_COST_UNITS: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "tavana_query_cost_units",
+        "Cost units assigned to each query",
+        vec![0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0]
+    )
+    .unwrap()
+});
+
+/// Query success rate (calculated)
+pub static QUERY_SUCCESS_RATE: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_query_success_rate",
+        "Rolling success rate (0.0 - 1.0)"
+    )
+    .unwrap()
+});
+
+/// Failure breakdown by type (for debugging)
+pub static FAILURE_BREAKDOWN: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "tavana_failure_breakdown",
+        "Recent failure counts by type",
+        &["type"]
+    )
+    .unwrap()
+});
+
+/// Record query outcome (call for EVERY query)
+pub fn record_query_outcome(outcome: &str) {
+    QUERY_OUTCOME_TOTAL.with_label_values(&[outcome]).inc();
+}
+
+/// Update adaptive queue state
+pub fn update_adaptive_queue_state(limit: f64, in_use: f64, min_latency_ms: Option<u64>) {
+    ADAPTIVE_CONCURRENCY_LIMIT.set(limit);
+    ADAPTIVE_COST_UNITS_IN_USE.set(in_use);
+    if let Some(min_lat) = min_latency_ms {
+        if min_lat < u64::MAX {
+            ADAPTIVE_MIN_LATENCY_MS.set(min_lat as f64);
+        }
+    }
+}
+
+/// Record AIMD adjustment
+pub fn record_aimd_adjustment(direction: &str, delta: f64) {
+    ADAPTIVE_AIMD_EVENTS.with_label_values(&[direction]).inc();
+    ADAPTIVE_AIMD_DELTA.observe(delta);
+}
+
+/// Record query cost units
+pub fn record_query_cost(cost_units: f64) {
+    QUERY_COST_UNITS.observe(cost_units);
+}
+
+/// Update success rate gauge
+pub fn update_success_rate(rate: f64) {
+    QUERY_SUCCESS_RATE.set(rate);
+}
+
+/// Update failure breakdown
+pub fn update_failure_breakdown(timeout: u64, oom: u64, connection: u64, worker: u64, client: u64, other: u64) {
+    FAILURE_BREAKDOWN.with_label_values(&["timeout"]).set(timeout as f64);
+    FAILURE_BREAKDOWN.with_label_values(&["oom"]).set(oom as f64);
+    FAILURE_BREAKDOWN.with_label_values(&["connection"]).set(connection as f64);
+    FAILURE_BREAKDOWN.with_label_values(&["worker"]).set(worker as f64);
+    FAILURE_BREAKDOWN.with_label_values(&["client"]).set(client as f64);
+    FAILURE_BREAKDOWN.with_label_values(&["other"]).set(other as f64);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NEW QUERY QUEUE METRICS (K8s Capacity-Aware)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Cluster total memory capacity in MB (from K8s)
+pub static CLUSTER_CAPACITY_MB: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_cluster_capacity_mb",
+        "Total memory capacity across all worker pods (MB)"
+    )
+    .unwrap()
+});
+
+/// Current memory usage in MB (sum of active query estimates)
+pub static CURRENT_USAGE_MB: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_current_usage_mb",
+        "Current estimated memory usage by active queries (MB)"
+    )
+    .unwrap()
+});
+
+/// Available capacity in MB
+pub static AVAILABLE_CAPACITY_MB: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_available_capacity_mb",
+        "Available memory capacity for new queries (MB)"
+    )
+    .unwrap()
+});
+
+/// Worker count from K8s
+pub static K8S_WORKER_COUNT: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_k8s_worker_count",
+        "Number of running worker pods from K8s"
+    )
+    .unwrap()
+});
+
+/// HPA scale-up signal (true when queue is backing up)
+pub static HPA_SCALE_UP_SIGNAL: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_hpa_scale_up_signal",
+        "1 if HPA should scale up (queue backing up), 0 otherwise"
+    )
+    .unwrap()
+});
+
+/// Set queue depth
+pub fn set_queue_depth(depth: usize) {
+    QUERY_QUEUE_DEPTH.set(depth as f64);
+}
+
+/// Set cluster capacity
+pub fn set_cluster_capacity_mb(capacity_mb: u64) {
+    CLUSTER_CAPACITY_MB.set(capacity_mb as f64);
+}
+
+/// Set current usage
+pub fn set_current_usage_mb(usage_mb: u64) {
+    CURRENT_USAGE_MB.set(usage_mb as f64);
+}
+
+/// Set available capacity
+pub fn set_available_capacity_mb(available_mb: u64) {
+    AVAILABLE_CAPACITY_MB.set(available_mb as f64);
+}
+
+/// Set worker count
+pub fn set_worker_count(count: u32) {
+    K8S_WORKER_COUNT.set(count as f64);
+}
+
+/// Set HPA scale-up signal
+pub fn set_hpa_scale_up_signal(signal: bool) {
+    HPA_SCALE_UP_SIGNAL.set(if signal { 1.0 } else { 0.0 });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CEILING-AWARE QUEUE METRICS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Resource ceiling (from K8s nodes)
+pub static RESOURCE_CEILING_MB: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_resource_ceiling_mb",
+        "Resource ceiling in MB (from K8s nodes)"
+    )
+    .unwrap()
+});
+
+/// Operation mode (0=scaling, 1=saturation)
+pub static OPERATION_MODE: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_operation_mode",
+        "Operation mode: 0=scaling (can grow), 1=saturation (at ceiling)"
+    )
+    .unwrap()
+});
+
+/// Estimated wait time for new queries (ms)
+pub static ESTIMATED_WAIT_MS: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "tavana_estimated_wait_ms",
+        "Estimated wait time for new queries in milliseconds"
+    )
+    .unwrap()
+});
+
+/// Set resource ceiling
+pub fn set_resource_ceiling_mb(ceiling_mb: u64) {
+    RESOURCE_CEILING_MB.set(ceiling_mb as f64);
+}
+
+/// Set operation mode
+pub fn set_operation_mode(mode: &str) {
+    let value = match mode {
+        "scaling" => 0.0,
+        "saturation" => 1.0,
+        _ => 0.0,
+    };
+    OPERATION_MODE.set(value);
+}
+
+/// Set estimated wait time
+pub fn set_estimated_wait_ms(wait_ms: u64) {
+    ESTIMATED_WAIT_MS.set(wait_ms as f64);
 }
 
