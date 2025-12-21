@@ -371,11 +371,12 @@ async fn execute_query_on_worker(
     sql: &str,
     user_id: &str,
 ) -> anyhow::Result<usize> {
-    const MAX_MESSAGE_SIZE: usize = 512 * 1024 * 1024;
+    const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
     
     let channel = Channel::from_shared(worker_addr.to_string())?
-        .timeout(std::time::Duration::from_secs(600))
-        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(1800))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
         .connect()
         .await?;
     
@@ -395,7 +396,7 @@ async fn execute_query_on_worker(
             claims: Default::default(),
         }),
         options: Some(proto::QueryOptions {
-            timeout_seconds: 600,
+            timeout_seconds: 1800,
             max_rows: 0,
             max_bytes: 0,
             enable_profiling: false,
@@ -839,12 +840,13 @@ async fn execute_query_streaming_to_worker(
     
     info!("Streaming query to worker: {}", worker_addr);
 
-    // Connect to worker
-    const MAX_MESSAGE_SIZE: usize = 512 * 1024 * 1024; // 512MB per gRPC message
+    // Connect to worker with large buffer settings for big result sets
+    const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB per gRPC message
     
     let channel = Channel::from_shared(worker_addr.to_string())?
-        .timeout(std::time::Duration::from_secs(600))
-        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(1800)) // 30 min for very large queries
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
         .connect()
         .await?;
 
