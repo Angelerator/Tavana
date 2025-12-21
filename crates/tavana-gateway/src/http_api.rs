@@ -158,11 +158,12 @@ async fn execute_on_presized_worker(
 ) -> Result<(Vec<String>, Vec<String>, Vec<Vec<String>>, usize), anyhow::Error> {
     info!("Executing on pre-sized worker: {}", worker_addr);
 
-    const MAX_MESSAGE_SIZE: usize = 512 * 1024 * 1024;
+    const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
 
     let channel = Channel::from_shared(worker_addr.to_string())?
-        .timeout(std::time::Duration::from_secs(600))
-        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(1800))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
         .connect()
         .await?;
 

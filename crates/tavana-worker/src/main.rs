@@ -117,10 +117,16 @@ async fn main() -> anyhow::Result<()> {
     
     info!("Tavana Worker listening on {}", addr);
 
-    // Start gRPC server with increased message size limits for large results
+    // Start gRPC server with increased message size limits and http2 settings for large results
     const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
     
     Server::builder()
+        // HTTP2 settings for large data streaming
+        .initial_connection_window_size(1024 * 1024 * 1024) // 1GB connection window
+        .initial_stream_window_size(512 * 1024 * 1024) // 512MB per stream
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(10)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(60)))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
         .add_service(
             QueryServiceServer::new(query_service)
                 .max_decoding_message_size(MAX_MESSAGE_SIZE)
