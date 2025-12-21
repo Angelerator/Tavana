@@ -1,10 +1,16 @@
-//! Query Router - Routes queries to pre-sized workers
+//! Query Router - Routes queries to pre-sized workers or tenant pools
 //!
 //! Query-aware pre-sizing architecture:
 //! 1. Estimate query data size
 //! 2. Calculate required memory (data_size × 0.5)
 //! 3. Find idle worker and pre-size if needed (K8s v1.35 in-place resize)
 //! 4. Route query to pre-sized worker
+//!
+//! Tenant isolation architecture:
+//! - Each tenant gets a dedicated worker pool (HPA + VPA per tenant)
+//! - Large queries (>1GB) always go to tenant's dedicated pool
+//! - Cache is preserved per tenant for efficiency
+//! - Anonymous/public queries go to shared pool
 
 use regex::Regex;
 use sqlparser::ast::{SetExpr, Statement, TableFactor};
@@ -15,15 +21,18 @@ use tracing::{debug, info, warn};
 
 use crate::data_sizer::{DataSizer, EstimationMethod};
 use crate::metrics;
-use crate::worker_pool::{PreSizedWorker, WorkerPoolManager};
+use crate::tenant_pool::{TenantPoolManager, TenantRouting};
+use crate::worker_pool::WorkerPoolManager;
 
 /// Query execution target
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryTarget {
-    /// Route to HPA+VPA managed worker pool (default service)
+    /// Route to HPA+VPA managed shared worker pool (default service)
     WorkerPool,
     /// Route to a specific pre-sized worker (pod IP)
     PreSizedWorker { address: String, worker_name: String },
+    /// Route to tenant's dedicated worker pool
+    TenantPool { tenant_id: String, service_addr: String },
 }
 
 /// Estimated query resources
@@ -47,26 +56,31 @@ pub struct QueryEstimate {
     pub estimation_method: String,
     /// Whether worker was resized
     pub was_resized: bool,
+    /// Tenant ID if routed to tenant pool
+    pub tenant_id: Option<String>,
 }
 
-/// Query Router with pre-sizing support
+/// Query Router with pre-sizing and tenant isolation support
 pub struct QueryRouter {
     /// Data sizer for size estimation
     data_sizer: Arc<DataSizer>,
-    /// Worker pool manager for pre-sizing
+    /// Worker pool manager for pre-sizing (shared pool)
     pool_manager: Option<Arc<WorkerPoolManager>>,
+    /// Tenant pool manager for dedicated tenant pools
+    tenant_manager: Option<Arc<TenantPoolManager>>,
 }
 
 impl QueryRouter {
-    /// Create a new query router without pre-sizing
+    /// Create a new query router without pre-sizing or tenant isolation
     pub fn new(data_sizer: Arc<DataSizer>) -> Self {
         Self {
             data_sizer,
             pool_manager: None,
+            tenant_manager: None,
         }
     }
 
-    /// Create a new query router with pre-sizing support
+    /// Create a new query router with pre-sizing support (shared pool only)
     pub fn with_pool_manager(
         data_sizer: Arc<DataSizer>,
         pool_manager: Arc<WorkerPoolManager>,
@@ -74,11 +88,35 @@ impl QueryRouter {
         Self {
             data_sizer,
             pool_manager: Some(pool_manager),
+            tenant_manager: None,
+        }
+    }
+
+    /// Create a full-featured query router with pre-sizing and tenant isolation
+    pub fn with_tenant_support(
+        data_sizer: Arc<DataSizer>,
+        pool_manager: Arc<WorkerPoolManager>,
+        tenant_manager: Arc<TenantPoolManager>,
+    ) -> Self {
+        Self {
+            data_sizer,
+            pool_manager: Some(pool_manager),
+            tenant_manager: Some(tenant_manager),
         }
     }
 
     /// Analyze, pre-size, and route a query
+    /// 
+    /// Routing priority:
+    /// 1. If tenant_id provided and tenant has dedicated pool → TenantPool
+    /// 2. If tenant_id provided and query is large → Create tenant pool
+    /// 3. Otherwise → Shared pre-sized worker pool
     pub async fn route(&self, sql: &str) -> QueryEstimate {
+        self.route_with_tenant(sql, None).await
+    }
+
+    /// Route a query with tenant context
+    pub async fn route_with_tenant(&self, sql: &str, tenant_id: Option<&str>) -> QueryEstimate {
         // Parse SQL to extract table references
         let tables = self.extract_tables(sql);
         let (has_aggregation, has_join) = self.analyze_query_complexity(sql);
@@ -107,7 +145,43 @@ impl QueryRouter {
         // Calculate CPU cores estimate for metrics
         let cpu_cores = self.estimate_cpu_cores(size_estimate.total_mb, has_join, has_aggregation);
 
-        // Try pre-sizing if pool manager is available and enabled
+        // First, check tenant routing (if tenant manager is available)
+        if let Some(ref tm) = self.tenant_manager {
+            match tm.route_query(tenant_id, size_estimate.total_mb).await {
+                TenantRouting::DedicatedPool { tenant_id: tid, service_addr } => {
+                    info!(
+                        "Routing query to tenant pool: tenant={}, data={}MB",
+                        tid, size_estimate.total_mb
+                    );
+                    metrics::record_query_routed("tenant_pool", size_estimate.total_mb as f64);
+                    metrics::record_tenant_query(&tid, "dedicated");
+
+                    return QueryEstimate {
+                        data_size_mb: size_estimate.total_mb,
+                        required_memory_mb: size_estimate.estimated_memory_mb,
+                        cpu_cores,
+                        tables,
+                        has_aggregation,
+                        has_join,
+                        target: QueryTarget::TenantPool {
+                            tenant_id: tid.clone(),
+                            service_addr,
+                        },
+                        estimation_method,
+                        was_resized: false,
+                        tenant_id: Some(tid),
+                    };
+                }
+                TenantRouting::SharedPool { reason } => {
+                    debug!("Using shared pool: {}", reason);
+                    if let Some(tid) = tenant_id {
+                        metrics::record_tenant_query(tid, "shared");
+                    }
+                }
+            }
+        }
+
+        // Fall back to pre-sizing on shared pool
         let (target, required_memory_mb, was_resized) = if let Some(ref pm) = self.pool_manager {
             if pm.is_enabled() {
                 // Calculate required memory using pool manager's formula
@@ -156,6 +230,7 @@ impl QueryRouter {
             target,
             estimation_method,
             was_resized,
+            tenant_id: tenant_id.map(|s| s.to_string()),
         };
 
         info!(
@@ -166,6 +241,7 @@ impl QueryRouter {
             match &estimate.target {
                 QueryTarget::WorkerPool => "WorkerPool".to_string(),
                 QueryTarget::PreSizedWorker { worker_name, .. } => format!("PreSized({})", worker_name),
+                QueryTarget::TenantPool { tenant_id, .. } => format!("TenantPool({})", tenant_id),
             },
             estimate.was_resized
         );
@@ -180,7 +256,7 @@ impl QueryRouter {
         }
     }
 
-    /// Synchronous route for simpler cases (no pre-sizing)
+    /// Synchronous route for simpler cases (no pre-sizing or tenant isolation)
     pub fn route_sync(&self, sql: &str) -> QueryEstimate {
         let tables = self.extract_tables(sql);
         let (has_aggregation, has_join) = self.analyze_query_complexity(sql);
@@ -201,6 +277,7 @@ impl QueryRouter {
             target: QueryTarget::WorkerPool,
             estimation_method: "sync".to_string(),
             was_resized: false,
+            tenant_id: None,
         }
     }
 

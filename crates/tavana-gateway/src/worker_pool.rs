@@ -1,7 +1,11 @@
-//! Worker Pool Manager with Query-Aware Pre-Sizing
+//! Worker Pool Manager with Query-Aware Pre-Sizing + Elastic Resize
 //!
 //! Tracks worker pods, their status, and current resources.
-//! Uses K8s v1.35 in-place resize to pre-size workers before query execution.
+//! Uses K8s v1.35 in-place resize to:
+//! 1. Pre-size workers BEFORE query execution (based on data size estimation)
+//! 2. Elastically resize DURING query execution if resources hit 80% threshold
+//!
+//! This implements VPA-like behavior with query-aware intelligence.
 
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -18,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use crate::metrics;
 
-/// Configuration for pre-sizing
+/// Configuration for pre-sizing and elastic resize
 #[derive(Clone, Debug)]
 pub struct PreSizingConfig {
     /// Multiplier for calculating memory from data size (default: 0.5)
@@ -33,6 +37,12 @@ pub struct PreSizingConfig {
     pub namespace: String,
     /// Label selector for worker pods
     pub worker_label_selector: String,
+    /// Elastic resize threshold (0.80 = 80% - trigger resize when resource usage exceeds this)
+    pub elastic_threshold: f64,
+    /// Elastic resize growth factor (1.5 = grow by 50% when threshold exceeded)
+    pub elastic_growth_factor: f64,
+    /// Interval to check resource usage during query execution (in seconds)
+    pub elastic_check_interval_secs: u64,
 }
 
 impl Default for PreSizingConfig {
@@ -44,6 +54,9 @@ impl Default for PreSizingConfig {
             enabled: true,
             namespace: "tavana".to_string(),
             worker_label_selector: "app=tavana-worker".to_string(),
+            elastic_threshold: 0.80,      // 80% - resize when usage exceeds this
+            elastic_growth_factor: 1.5,   // Grow by 50% when threshold exceeded
+            elastic_check_interval_secs: 2, // Check every 2 seconds
         }
     }
 }
@@ -71,6 +84,25 @@ impl PreSizingConfig {
         if let Ok(v) = std::env::var("PRE_SIZING_MAX_MB") {
             if let Ok(m) = v.parse::<u64>() {
                 config.max_memory_mb = m;
+            }
+        }
+        
+        // Elastic resize settings
+        if let Ok(v) = std::env::var("ELASTIC_THRESHOLD") {
+            if let Ok(t) = v.parse::<f64>() {
+                config.elastic_threshold = t;
+            }
+        }
+        
+        if let Ok(v) = std::env::var("ELASTIC_GROWTH_FACTOR") {
+            if let Ok(g) = v.parse::<f64>() {
+                config.elastic_growth_factor = g;
+            }
+        }
+        
+        if let Ok(v) = std::env::var("ELASTIC_CHECK_INTERVAL_SECS") {
+            if let Ok(i) = v.parse::<u64>() {
+                config.elastic_check_interval_secs = i;
             }
         }
         
@@ -116,6 +148,19 @@ pub struct WorkerPoolManager {
     workers: Arc<RwLock<HashMap<String, WorkerStatus>>>,
     /// Worker gRPC port
     worker_port: u16,
+}
+
+/// Worker availability info for queue decisions
+#[derive(Debug, Clone)]
+pub struct WorkerAvailability {
+    /// Total number of workers
+    pub total: usize,
+    /// Number of busy workers
+    pub busy: usize,
+    /// Number of idle workers
+    pub idle: usize,
+    /// Whether the pool has capacity
+    pub has_capacity: bool,
 }
 
 impl WorkerPoolManager {
@@ -328,6 +373,24 @@ impl WorkerPoolManager {
         })
     }
     
+    /// Check worker availability for queue decisions
+    pub async fn check_availability(&self) -> WorkerAvailability {
+        // Try to refresh, but don't fail if it errors
+        self.refresh_workers().await.ok();
+        
+        let workers = self.workers.read().await;
+        let total = workers.len();
+        let busy = workers.values().filter(|w| w.busy).count();
+        let idle = total.saturating_sub(busy);
+        
+        WorkerAvailability {
+            total,
+            busy,
+            idle,
+            has_capacity: idle > 0,
+        }
+    }
+
     /// Release a worker (mark as idle)
     pub async fn release_worker(&self, worker_name: &str, actual_memory_used_mb: Option<u64>) {
         let mut workers = self.workers.write().await;
@@ -389,6 +452,163 @@ impl WorkerPoolManager {
         format!("http://worker.{}.svc.cluster.local:{}", self.config.namespace, self.worker_port)
     }
     
+    /// Get the elastic resize threshold (80% by default)
+    pub fn get_elastic_threshold(&self) -> f64 {
+        self.config.elastic_threshold
+    }
+    
+    /// Get the elastic check interval in seconds
+    pub fn get_elastic_check_interval(&self) -> u64 {
+        self.config.elastic_check_interval_secs
+    }
+    
+    /// Check and perform elastic resize if needed during query execution
+    /// 
+    /// This should be called periodically while a query is running.
+    /// If memory usage exceeds the threshold (80%), it will grow the pod.
+    /// 
+    /// Returns: (resized: bool, new_memory_mb: u64)
+    pub async fn check_elastic_resize(
+        &self,
+        worker_name: &str,
+    ) -> Result<(bool, u64), anyhow::Error> {
+        // Get current pod metrics from K8s Metrics API
+        let usage = self.get_pod_resource_usage(worker_name).await?;
+        
+        let workers = self.workers.read().await;
+        let worker = workers.get(worker_name)
+            .ok_or_else(|| anyhow::anyhow!("Worker {} not found", worker_name))?;
+        
+        let current_memory_mb = worker.current_memory_mb;
+        let memory_usage_ratio = usage.memory_bytes as f64 / (current_memory_mb as f64 * 1024.0 * 1024.0);
+        
+        drop(workers);
+        
+        // Check if we need to resize
+        if memory_usage_ratio > self.config.elastic_threshold {
+            let new_memory_mb = ((current_memory_mb as f64) * self.config.elastic_growth_factor) as u64;
+            let clamped_memory = new_memory_mb.min(self.config.max_memory_mb);
+            
+            if clamped_memory > current_memory_mb {
+                info!(
+                    "Elastic resize triggered for {}: {}% usage > {}% threshold. Growing {}MB -> {}MB",
+                    worker_name,
+                    (memory_usage_ratio * 100.0) as u32,
+                    (self.config.elastic_threshold * 100.0) as u32,
+                    current_memory_mb,
+                    clamped_memory
+                );
+                
+                // Perform resize
+                self.resize_worker(worker_name, clamped_memory).await?;
+                
+                // Update worker cache
+                let mut workers = self.workers.write().await;
+                if let Some(w) = workers.get_mut(worker_name) {
+                    w.current_memory_mb = clamped_memory;
+                }
+                
+                // Record metrics
+                let memory_delta = clamped_memory as f64 - current_memory_mb as f64;
+                metrics::record_inplace_resize("elastic_grow", memory_delta);
+                
+                return Ok((true, clamped_memory));
+            } else {
+                warn!(
+                    "Elastic resize for {} would exceed max ({}MB), at limit",
+                    worker_name, self.config.max_memory_mb
+                );
+            }
+        }
+        
+        Ok((false, current_memory_mb))
+    }
+    
+    /// Get current resource usage for a pod from K8s Metrics API
+    /// 
+    /// Uses the metrics.k8s.io API which requires metrics-server to be installed.
+    /// Falls back to low usage if metrics unavailable (disables elastic resize).
+    async fn get_pod_resource_usage(&self, pod_name: &str) -> Result<PodResourceUsage, anyhow::Error> {
+        // Use kube-rs DynamicObject API to query pod metrics
+        use kube::api::DynamicObject;
+        use kube::discovery::ApiResource;
+        
+        let ar = ApiResource {
+            group: "metrics.k8s.io".to_string(),
+            version: "v1beta1".to_string(),
+            kind: "PodMetrics".to_string(),
+            api_version: "metrics.k8s.io/v1beta1".to_string(),
+            plural: "pods".to_string(),
+        };
+        
+        let metrics_api: Api<DynamicObject> = Api::namespaced_with(
+            self.client.clone(),
+            &self.config.namespace,
+            &ar,
+        );
+        
+        // Try to get metrics, fall back if unavailable
+        match metrics_api.get(pod_name).await {
+            Ok(metrics) => {
+                // Parse the containers array from the dynamic object
+                if let Some(containers) = metrics.data.get("containers").and_then(|c| c.as_array()) {
+                    if let Some(container) = containers.first() {
+                        let memory_str = container.get("usage")
+                            .and_then(|u| u.get("memory"))
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("0");
+                        
+                        let cpu_str = container.get("usage")
+                            .and_then(|u| u.get("cpu"))
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("0");
+                        
+                        return Ok(PodResourceUsage {
+                            memory_bytes: parse_k8s_memory(memory_str),
+                            cpu_millicores: parse_k8s_cpu(cpu_str),
+                        });
+                    }
+                }
+                warn!("No container metrics found for {}", pod_name);
+                Ok(PodResourceUsage { memory_bytes: 0, cpu_millicores: 0 })
+            }
+            Err(e) => {
+                warn!("Could not get pod metrics for {}: {}. Elastic resize disabled.", pod_name, e);
+                // Return low usage to prevent unnecessary resizing
+                Ok(PodResourceUsage { memory_bytes: 0, cpu_millicores: 0 })
+            }
+        }
+    }
+    
+    /// Shrink a worker back to minimum size after query completes
+    pub async fn shrink_worker(&self, worker_name: &str) -> Result<(), anyhow::Error> {
+        let workers = self.workers.read().await;
+        let worker = workers.get(worker_name);
+        
+        let current_memory = worker.map(|w| w.current_memory_mb).unwrap_or(0);
+        drop(workers);
+        
+        if current_memory > self.config.min_memory_mb {
+            info!(
+                "Shrinking worker {} from {}MB to {}MB",
+                worker_name, current_memory, self.config.min_memory_mb
+            );
+            
+            self.resize_worker(worker_name, self.config.min_memory_mb).await?;
+            
+            // Update worker cache
+            let mut workers = self.workers.write().await;
+            if let Some(w) = workers.get_mut(worker_name) {
+                w.current_memory_mb = self.config.min_memory_mb;
+            }
+            
+            let memory_delta = self.config.min_memory_mb as f64 - current_memory as f64;
+            metrics::record_inplace_resize("shrink", memory_delta);
+        }
+        
+        Ok(())
+    }
+    
     /// Get statistics about the worker pool
     pub async fn get_stats(&self) -> WorkerPoolStats {
         let workers = self.workers.read().await;
@@ -416,24 +636,53 @@ pub struct WorkerPoolStats {
     pub total_memory_mb: u64,
 }
 
+/// Current resource usage for a pod
+#[derive(Debug)]
+pub struct PodResourceUsage {
+    pub memory_bytes: u64,
+    pub cpu_millicores: u64,
+}
+
 /// Parse K8s memory quantity to MB
 fn parse_memory_to_mb(quantity: &Quantity) -> u64 {
-    let value = quantity.0.as_str();
-    
-    // Parse common formats: "256Mi", "1Gi", "512M", "1G"
+    parse_k8s_memory(&quantity.0) / (1024 * 1024)
+}
+
+/// Parse K8s memory string to bytes
+fn parse_k8s_memory(value: &str) -> u64 {
+    // Parse common formats: "256Mi", "1Gi", "512M", "1G", "1234567890"
     if value.ends_with("Gi") {
-        value.trim_end_matches("Gi").parse::<u64>().unwrap_or(0) * 1024
+        value.trim_end_matches("Gi").parse::<u64>().unwrap_or(0) * 1024 * 1024 * 1024
     } else if value.ends_with("Mi") {
-        value.trim_end_matches("Mi").parse::<u64>().unwrap_or(0)
-    } else if value.ends_with("G") {
-        value.trim_end_matches("G").parse::<u64>().unwrap_or(0) * 1024
-    } else if value.ends_with("M") {
-        value.trim_end_matches("M").parse::<u64>().unwrap_or(0)
+        value.trim_end_matches("Mi").parse::<u64>().unwrap_or(0) * 1024 * 1024
     } else if value.ends_with("Ki") {
-        value.trim_end_matches("Ki").parse::<u64>().unwrap_or(0) / 1024
+        value.trim_end_matches("Ki").parse::<u64>().unwrap_or(0) * 1024
+    } else if value.ends_with("G") {
+        value.trim_end_matches("G").parse::<u64>().unwrap_or(0) * 1000 * 1000 * 1000
+    } else if value.ends_with("M") {
+        value.trim_end_matches("M").parse::<u64>().unwrap_or(0) * 1000 * 1000
+    } else if value.ends_with("K") {
+        value.trim_end_matches("K").parse::<u64>().unwrap_or(0) * 1000
     } else {
         // Assume bytes
-        value.parse::<u64>().unwrap_or(0) / (1024 * 1024)
+        value.parse::<u64>().unwrap_or(0)
+    }
+}
+
+/// Parse K8s CPU string to millicores
+fn parse_k8s_cpu(value: &str) -> u64 {
+    // Parse common formats: "100m", "1", "1500m", "2.5"
+    if value.ends_with("m") {
+        value.trim_end_matches("m").parse::<u64>().unwrap_or(0)
+    } else if value.ends_with("n") {
+        // Nanocores
+        value.trim_end_matches("n").parse::<u64>().unwrap_or(0) / 1_000_000
+    } else if value.contains('.') {
+        // Fractional cores
+        (value.parse::<f64>().unwrap_or(0.0) * 1000.0) as u64
+    } else {
+        // Whole cores
+        value.parse::<u64>().unwrap_or(0) * 1000
     }
 }
 
