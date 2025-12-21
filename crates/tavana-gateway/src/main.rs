@@ -12,6 +12,7 @@
 //! - K8s v1.35 in-place resize for instant scaling
 //! - HPA+VPA for automatic scaling
 
+mod adaptive_queue;
 mod auth;
 mod data_sizer;
 mod flight;
@@ -19,8 +20,12 @@ mod http_api;
 mod metrics;
 mod pg_wire;
 mod query;
+mod query_queue;
 mod query_router;
+mod redis_queue;
+mod smart_scaler;
 mod telemetry;
+mod tenant_pool;
 mod worker_client;
 mod worker_pool;
 
@@ -128,6 +133,18 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Initialize SmartScaler (Adaptive Formula-Based Scaling)
+    let smart_scaler = match smart_scaler::SmartScaler::new("tavana", "worker").await {
+        Ok(ss) => {
+            // Logging is done inside SmartScaler::new()
+            Some(Arc::new(ss))
+        }
+        Err(e) => {
+            warn!("Failed to initialize SmartScaler: {} - using legacy pre-sizing", e);
+            None
+        }
+    };
+
     // Initialize QueryRouter with or without pre-sizing
     let query_router = if let Some(ref pm) = pool_manager {
         Arc::new(QueryRouter::with_pool_manager(data_sizer.clone(), pm.clone()))
@@ -139,17 +156,62 @@ async fn main() -> anyhow::Result<()> {
     // Create worker client (fallback for when pre-sizing is unavailable)
     let worker_client = Arc::new(WorkerClient::new(args.worker_addr.clone()));
 
-    // Start PostgreSQL wire protocol server
+    // Create SHARED QueryQueue for true FIFO queuing with K8s capacity awareness
+    // This queue:
+    // 1. Never rejects queries (always enqueues)
+    // 2. Awaits until real K8s capacity is available
+    // 3. Signals HPA when queue is backing up
+    let query_queue = query_queue::QueryQueue::new();
+    info!("QueryQueue initialized (K8s capacity-aware FIFO queue)");
+
+    // Start QueryQueue dispatcher loop (processes waiting queries)
+    let dispatcher_queue = query_queue.clone();
+    tokio::spawn(async move {
+        dispatcher_queue.start_dispatcher().await;
+    });
+
+    // Start K8s capacity updater (queries real worker memory from K8s every 1s)
+    if let Ok(k8s_client) = kube::Client::try_default().await {
+        let capacity_queue = query_queue.clone();
+        tokio::spawn(async move {
+            capacity_queue.start_capacity_updater(k8s_client).await;
+        });
+        info!("QueryQueue K8s capacity updater started (interval=1s)");
+    } else {
+        warn!("Failed to create K8s client - using default capacity estimates");
+    }
+
+    // Start PostgreSQL wire protocol server with SmartScaler + shared QueryQueue
     let pg_auth = auth_service.clone();
     let pg_port = args.pg_port;
     let pg_worker = worker_client.clone();
     let pg_router = query_router.clone();
+    let pg_pool = pool_manager.clone();
+    let pg_scaler = smart_scaler.clone();
+    let pg_queue = query_queue.clone();
     let pg_handle = tokio::spawn(async move {
-        let server = PgWireServer::new(pg_port, pg_auth, pg_worker, pg_router);
+        let server = pg_wire::PgWireServer::with_smart_scaler_and_queue(
+            pg_port,
+            pg_auth,
+            pg_worker,
+            pg_router,
+            pg_pool,
+            pg_scaler,
+            pg_queue,
+        ).await;
         if let Err(e) = server.start().await {
             tracing::error!("PostgreSQL server error: {}", e);
         }
     });
+    
+    // Start SmartScaler monitoring with shared QueryQueue
+    // HPA decisions now based on: queue depth, wait time, capacity utilization
+    if let Some(ref scaler) = smart_scaler {
+        let scaler_clone = scaler.clone();
+        let queue_clone = query_queue.clone();
+        scaler_clone.start_monitoring_with_queue(queue_clone);
+        info!("SmartScaler monitoring started with QueryQueue integration (interval={}ms)", smart_scaler::MONITOR_INTERVAL_MS);
+    }
 
     // Start Arrow Flight SQL server
     let flight_auth = auth_service.clone();

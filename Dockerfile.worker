@@ -21,14 +21,16 @@ RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib
 
 # Create non-root user with home directory (for DuckDB temp files and extensions)
 RUN useradd -m -u 1000 -s /bin/bash tavana && \
-    mkdir -p /home/tavana/.duckdb/extensions/v1.2.2/linux_arm64 /tmp/duckdb && \
+    mkdir -p /home/tavana/.duckdb/extensions /tmp/duckdb && \
     chown -R tavana:tavana /home/tavana /tmp/duckdb
 
-# Pre-download DuckDB extensions (httpfs for S3 support, parquet for file reading)
-# This avoids needing network access at runtime
-RUN curl -L "http://extensions.duckdb.org/v1.2.2/linux_arm64/httpfs.duckdb_extension.gz" | gunzip > /home/tavana/.duckdb/extensions/v1.2.2/linux_arm64/httpfs.duckdb_extension && \
-    curl -L "http://extensions.duckdb.org/v1.2.2/linux_arm64/parquet.duckdb_extension.gz" | gunzip > /home/tavana/.duckdb/extensions/v1.2.2/linux_arm64/parquet.duckdb_extension && \
-    chmod 644 /home/tavana/.duckdb/extensions/v1.2.2/linux_arm64/*.duckdb_extension && \
+# Pre-install DuckDB extensions (httpfs for S3 support, parquet for file reading)
+# Extensions are pre-downloaded and copied from local files (no network needed at build time)
+# This ensures workers start instantly without needing to download extensions
+RUN mkdir -p /home/tavana/.duckdb/extensions/v1.4.3/linux_arm64
+COPY docker/duckdb-extensions/httpfs.duckdb_extension /home/tavana/.duckdb/extensions/v1.4.3/linux_arm64/
+COPY docker/duckdb-extensions/parquet.duckdb_extension /home/tavana/.duckdb/extensions/v1.4.3/linux_arm64/
+RUN chmod 644 /home/tavana/.duckdb/extensions/v1.4.3/linux_arm64/*.duckdb_extension && \
     chown -R tavana:tavana /home/tavana/.duckdb
 
 COPY --from=builder /app/target/release/tavana-worker /usr/local/bin/

@@ -73,6 +73,7 @@ pub async fn execute_query(
     let worker_name = match &estimate.target {
         QueryTarget::PreSizedWorker { worker_name, .. } => Some(worker_name.clone()),
         QueryTarget::WorkerPool => None,
+        QueryTarget::TenantPool { .. } => None, // Tenant pools handle their own lifecycle
     };
     
     info!(
@@ -83,6 +84,7 @@ pub async fn execute_query(
         match &estimate.target {
             QueryTarget::WorkerPool => "WorkerPool".to_string(),
             QueryTarget::PreSizedWorker { worker_name, .. } => format!("PreSized({})", worker_name),
+            QueryTarget::TenantPool { tenant_id, .. } => format!("TenantPool({})", tenant_id),
         }
     );
 
@@ -90,6 +92,10 @@ pub async fn execute_query(
     let result = match &estimate.target {
         QueryTarget::PreSizedWorker { address, .. } => {
             execute_on_presized_worker(address, &request.sql, &request.user_id).await
+        }
+        QueryTarget::TenantPool { service_addr, .. } => {
+            // Tenant pools use the same execution path as pre-sized workers
+            execute_on_presized_worker(service_addr, &request.sql, &request.user_id).await
         }
         QueryTarget::WorkerPool => {
             execute_on_worker_pool(&state.worker_client, &request.sql, &request.user_id).await
@@ -104,6 +110,7 @@ pub async fn execute_query(
 
     let route_label = match &estimate.target {
         QueryTarget::PreSizedWorker { .. } => "presized_worker",
+        QueryTarget::TenantPool { .. } => "tenant_pool",
         QueryTarget::WorkerPool => "worker_pool",
     };
 

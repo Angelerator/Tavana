@@ -140,7 +140,7 @@ impl DataSizer {
     /// Create a new DataSizer
     pub async fn new() -> Self {
         let endpoint_url = std::env::var("AWS_ENDPOINT_URL").ok();
-
+        
         let s3_client = match Self::create_s3_client(&endpoint_url).await {
             Ok(client) => {
                 info!("S3 client initialized for real size estimation");
@@ -165,17 +165,17 @@ impl DataSizer {
         use aws_config::BehaviorVersion;
 
         let mut config_loader = aws_config::defaults(BehaviorVersion::latest());
-
+        
         if let Some(endpoint) = endpoint_url {
             config_loader = config_loader.endpoint_url(endpoint);
         }
-
+        
         let config = config_loader.load().await;
-
+        
         let s3_config = aws_sdk_s3::config::Builder::from(&config)
             .force_path_style(true)
             .build();
-
+        
         Ok(S3Client::from_conf(s3_config))
     }
 
@@ -333,16 +333,16 @@ impl DataSizer {
         for table in &effective_tables {
             let source = self.estimate_source_size_with_metadata(table).await;
             total_bytes += source.size_bytes;
-
+            
             if let Some(rows) = source.row_count {
-                total_rows += rows;
-            }
+                    total_rows += rows;
+                }
 
             // Get cached column metadata
             if let Some(cached) = self.cache.get(table) {
                 all_columns.extend(cached.columns.clone());
             }
-
+            
             sources.push(source);
         }
 
@@ -358,7 +358,7 @@ impl DataSizer {
             total_rows,
             &query_structure,
         );
-
+        
         // Calculate memory estimate using data types
         let estimated_memory_mb = self.calculate_memory_estimate(
             &query_structure,
@@ -366,7 +366,7 @@ impl DataSizer {
             effective_row_count,
             estimated_read_bytes,
         );
-
+        
         let total_mb = total_bytes / (1024 * 1024);
         let estimation_method = sources
             .first()
@@ -609,7 +609,7 @@ impl DataSizer {
                             source_type: self.detect_source_type(path),
                             estimation_method: EstimationMethod::S3Head,
                             row_count: Some(estimated_rows),
-                            column_count: None,
+            column_count: None,
                         };
                     }
                 }
@@ -654,7 +654,7 @@ impl DataSizer {
 
         if tail_bytes.len() < 8 {
             anyhow::bail!("Footer too small");
-        }
+            }
 
         // Check magic bytes "PAR1" at the end
         if &tail_bytes[tail_bytes.len() - 4..] != b"PAR1" {
@@ -691,7 +691,7 @@ impl DataSizer {
             anyhow::bail!("Footer bytes too small");
         }
         let metadata_bytes = &footer_bytes[..footer_bytes.len() - 8];
-
+                
         // Parse using ParquetMetaDataReader
         let metadata = ParquetMetaDataReader::decode_metadata(metadata_bytes)
             .context("Failed to decode Parquet metadata")?;
@@ -752,7 +752,7 @@ impl DataSizer {
     /// Estimate row count from file size (fallback)
     fn estimate_rows_from_size(&self, size_bytes: u64, path: &str) -> u64 {
         let path_lower = path.to_lowercase();
-
+        
         // Use known schemas for better estimates
         let bytes_per_row = if path_lower.contains("lineitem") {
             53 // TPC-H lineitem average
@@ -796,7 +796,7 @@ impl DataSizer {
 
     fn default_size_estimate(&self, path: &str) -> u64 {
         let path_lower = path.to_lowercase();
-
+        
         // Check for size hints in filename
         if let Some(size) = self.extract_size_from_filename(&path_lower) {
             return size;
@@ -814,21 +814,21 @@ impl DataSizer {
 
     fn extract_size_from_filename(&self, path: &str) -> Option<u64> {
         let size_regex = Regex::new(r"(\d+)\s*(mb|gb|tb)").ok()?;
-
+        
         if let Some(caps) = size_regex.captures(path) {
             let num: u64 = caps.get(1)?.as_str().parse().ok()?;
             let unit = caps.get(2)?.as_str();
-
+            
             let bytes = match unit {
                 "mb" => num * 1024 * 1024,
                 "gb" => num * 1024 * 1024 * 1024,
                 "tb" => num * 1024 * 1024 * 1024 * 1024,
                 _ => return None,
             };
-
+            
             return Some(bytes);
         }
-
+        
         None
     }
 

@@ -11,27 +11,12 @@ data:
       evaluation_interval: 15s
 
     scrape_configs:
-      # Gateway metrics - Pre-sizing and query routing metrics
-      # Use pod discovery to scrape each gateway pod individually (not via service)
+      # Gateway metrics - Use static config for reliability
       - job_name: 'tavana-gateway'
-        kubernetes_sd_configs:
-          - role: pod
-            namespaces:
-              names:
-                - tavana
-        relabel_configs:
-          - source_labels: [__meta_kubernetes_pod_label_app]
-            regex: tavana-gateway
-            action: keep
-          - source_labels: [__meta_kubernetes_pod_container_port_number]
-            regex: "8080"
-            action: keep
-          - source_labels: [__meta_kubernetes_pod_name]
-            target_label: pod
-          - source_labels: [__meta_kubernetes_pod_node_name]
-            target_label: node
+        static_configs:
+          - targets: ['gateway:8080']
         metrics_path: /metrics
-        scrape_interval: 5s  # Fast scrape for real-time pre-sizing monitoring
+        scrape_interval: 5s
 
       # Worker metrics (if exposed)
       - job_name: 'tavana-worker'
@@ -125,6 +110,12 @@ data:
           - source_labels: [namespace]
             regex: tavana
             action: keep
+
+      # Redis exporter metrics for queue monitoring
+      - job_name: 'redis'
+        static_configs:
+          - targets: ['redis:9121']
+        scrape_interval: 10s
 
 ---
 apiVersion: apps/v1

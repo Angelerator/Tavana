@@ -34,7 +34,7 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: gateway
-          image: tavana-gateway:presizing-metrics
+          image: tavana-gateway:latest
           imagePullPolicy: Never
           ports:
             - containerPort: 15432
@@ -49,6 +49,11 @@ spec:
           env:
             - name: LOG_LEVEL
               value: "info"
+            - name: REDIS_URL
+              value: "redis://redis:6379"
+            # K8s Service address for load-balanced worker access
+            - name: WORKER_ADDR
+              value: "http://worker:50053"
           resources:
             requests:
               memory: "256Mi"

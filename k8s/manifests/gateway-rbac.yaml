@@ -29,6 +29,16 @@ rules:
     resources: ["pods/log"]
     verbs: ["get", "list"]
   
+  # Deployment access for SmartScaler HPA control
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  
+  # Deployment scale subresource for HPA operations
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "patch", "update"]
+  
   # DuckDBQuery CRD management (for future gang scheduling)
   - apiGroups: ["tavana.io"]
     resources: ["duckdbqueries"]
