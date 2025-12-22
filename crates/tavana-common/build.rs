@@ -6,7 +6,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let protos = [
         proto_root.join("tavana/v1/common.proto"),
         proto_root.join("tavana/v1/query.proto"),
-        proto_root.join("tavana/v1/catalog.proto"),
     ];
 
     // Re-run if proto files change
