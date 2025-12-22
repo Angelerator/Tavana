@@ -127,7 +127,6 @@ MANIFESTS_DIR="$PROJECT_DIR/k8s/manifests"
 kubectl apply -f "$MANIFESTS_DIR/namespace.yaml"
 kubectl apply -f "$MANIFESTS_DIR/configmap.yaml"
 kubectl apply -f "$MANIFESTS_DIR/gateway-rbac.yaml"
-kubectl apply -f "$MANIFESTS_DIR/redis.yaml"
 kubectl apply -f "$MANIFESTS_DIR/minio.yaml"
 kubectl apply -f "$MANIFESTS_DIR/worker.yaml"
 kubectl apply -f "$MANIFESTS_DIR/gateway.yaml"
@@ -140,7 +139,6 @@ echo ""
 # ═══════════════════════════════════════════════════════════════════════════════
 echo "Waiting for deployments to be ready..."
 
-kubectl wait --for=condition=available --timeout=180s deployment/redis -n tavana || true
 kubectl wait --for=condition=available --timeout=180s deployment/minio -n tavana || true
 kubectl wait --for=condition=available --timeout=180s deployment/worker -n tavana || true
 kubectl wait --for=condition=available --timeout=180s deployment/gateway -n tavana || true
@@ -170,11 +168,9 @@ echo ""
 echo "PostgreSQL Wire Protocol (psql, DBeaver, Tableau):"
 echo "  PGPASSWORD=tavana psql -h localhost -p 25432 -U tavana -d tavana"
 echo ""
-echo "HTTP API Health Check:"
+echo "HTTP Health & Metrics:"
 echo "  curl http://localhost:28080/health"
-echo ""
-echo "Arrow Flight SQL:"
-echo "  grpc://localhost:28815"
+echo "  curl http://localhost:28080/metrics"
 echo ""
 echo "MinIO S3 Console:"
 echo "  http://localhost:29001 (minioadmin/minioadmin)"

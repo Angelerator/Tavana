@@ -12,9 +12,9 @@ echo "════════════════════════�
 pkill -f "kubectl port-forward" 2>/dev/null || true
 sleep 1
 
-# Gateway - PostgreSQL, HTTP, Flight
-echo "→ Gateway (15432, 8080, 8815)..."
-kubectl port-forward -n tavana svc/gateway 15432:15432 8080:8080 8815:8815 &
+# Gateway - PostgreSQL and HTTP only
+echo "→ Gateway (15432, 8080)..."
+kubectl port-forward -n tavana svc/gateway 15432:15432 8080:8080 &
 
 # Prometheus
 echo "→ Prometheus (9090)..."
@@ -35,11 +35,9 @@ echo "════════════════════════�
 echo "  All services forwarded! Access via:"
 echo "═══════════════════════════════════════════════════════════════════"
 echo ""
-echo "  DBeaver / PostgreSQL:   localhost:15432"
-echo "  HTTP API:               http://localhost:8080"
-echo "  Adaptive State:         http://localhost:8080/api/adaptive"
-echo "  Metrics:                http://localhost:8080/metrics"
-echo "  Arrow Flight:           localhost:8815"
+echo "  PostgreSQL (DBeaver):   localhost:15432"
+echo "  HTTP Health:            http://localhost:8080/health"
+echo "  HTTP Metrics:           http://localhost:8080/metrics"
 echo ""
 echo "  Prometheus:             http://localhost:9090"
 echo "  Grafana:                http://localhost:3001  (admin / tavana)"
