@@ -2,43 +2,36 @@
 //!
 //! Main entry point for client connections. Supports:
 //! - PostgreSQL wire protocol (for Tableau, PowerBI, DBeaver)
-//! - Arrow Flight SQL (for Python, Polars, DuckDB)
-//! - REST API (for management)
 //! - Prometheus metrics (/metrics)
+//! - Health checks (/health, /ready)
 //!
-//! Query-aware pre-sizing architecture:
-//! - Estimate query size before execution
-//! - Pre-size worker to 50% of data size (configurable)
-//! - K8s v1.35 in-place resize for instant scaling
-//! - HPA+VPA for automatic scaling
+//! Smart scaling architecture:
+//! - QueryQueue: FIFO queue with K8s capacity awareness
+//! - SmartScaler: VPA-first, HPA-second scaling
+//! - Resource ceiling detection for saturation mode
+//! - Streaming results for unlimited data size
 
-mod adaptive_queue;
 mod auth;
 mod data_sizer;
-mod flight;
-mod http_api;
 mod metrics;
 mod pg_wire;
-mod query;
 mod query_queue;
 mod query_router;
-mod redis_queue;
+#[path = "redis_queue_stub.rs"]
+mod redis_queue;  // Stub for removed Redis functionality
 mod smart_scaler;
 mod telemetry;
-mod tenant_pool;
 mod worker_client;
 mod worker_pool;
 
 use crate::auth::AuthService;
 use crate::data_sizer::DataSizer;
-use crate::flight::FlightSqlServer;
-use crate::http_api::{execute_query, health, prometheus_metrics, ready, root, AppState};
 use crate::pg_wire::PgWireServer;
 use crate::query_router::QueryRouter;
 use crate::worker_client::WorkerClient;
 use crate::worker_pool::{PreSizingConfig, WorkerPoolManager};
 use axum::{
-    routing::{get, post},
+    routing::get,
     Router,
 };
 use clap::Parser;
@@ -55,17 +48,9 @@ struct Args {
     #[arg(long, env = "PG_PORT", default_value = "15432")]
     pg_port: u16,
 
-    /// Arrow Flight SQL port
-    #[arg(long, env = "FLIGHT_PORT", default_value = "8815")]
-    flight_port: u16,
-
-    /// REST API port
+    /// HTTP metrics and health check port
     #[arg(long, env = "HTTP_PORT", default_value = "8080")]
     http_port: u16,
-
-    /// Catalog service address
-    #[arg(long, env = "CATALOG_ADDR", default_value = "http://localhost:50052")]
-    catalog_addr: String,
 
     /// Worker service address (fallback when pre-sizing unavailable)
     #[arg(long, env = "WORKER_ADDR", default_value = "http://localhost:50053")]
@@ -97,7 +82,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting Tavana Gateway");
     info!("  PostgreSQL port: {}", args.pg_port);
-    info!("  Arrow Flight port: {}", args.flight_port);
     info!("  HTTP port: {}", args.http_port);
     info!("  TLS enabled: {}", args.tls_enabled);
     info!("  Worker address: {}", args.worker_addr);
@@ -213,42 +197,46 @@ async fn main() -> anyhow::Result<()> {
         info!("SmartScaler monitoring started with QueryQueue integration (interval={}ms)", smart_scaler::MONITOR_INTERVAL_MS);
     }
 
-    // Start Arrow Flight SQL server
-    let flight_auth = auth_service.clone();
-    let flight_port = args.flight_port;
-    let flight_handle = tokio::spawn(async move {
-        let server = FlightSqlServer::new(flight_port, flight_auth);
-        if let Err(e) = server.start().await {
-            tracing::error!("Flight SQL server error: {}", e);
-        }
-    });
+    // Simple HTTP server for health checks and metrics only
+    async fn health() -> &'static str {
+        "ok"
+    }
+    
+    async fn ready() -> &'static str {
+        "ready"
+    }
+    
+    async fn root() -> &'static str {
+        "Tavana Gateway - PostgreSQL Wire Protocol"
+    }
+    
+    async fn metrics() -> String {
+        use prometheus::Encoder;
+        let encoder = prometheus::TextEncoder::new();
+        let metric_families = prometheus::gather();
+        let mut buffer = Vec::new();
+        encoder.encode(&metric_families, &mut buffer).unwrap();
+        String::from_utf8(buffer).unwrap()
+    }
 
-    // HTTP API state
-    let app_state = AppState {
-        worker_client,
-        query_router,
-    };
-
-    // CORS layer for frontend access
+    // CORS layer
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
 
-    // Start HTTP server for management and query API
+    // Start HTTP server for health and metrics
     let http_addr: SocketAddr = format!("0.0.0.0:{}", args.http_port).parse()?;
     let app = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/", get(root))
-        .route("/api/query", post(execute_query))
-        .route("/api/export", post(http_api::export_query))
-        .route("/metrics", get(prometheus_metrics))
-        .layer(cors)
-        .with_state(app_state);
+        .route("/metrics", get(metrics))
+        .layer(cors);
 
     info!("HTTP server listening on {}", http_addr);
-    info!("  /api/query - Execute queries with query-aware pre-sizing");
+    info!("  /health - Health check");
+    info!("  /ready - Readiness check");
     info!("  /metrics - Prometheus metrics");
 
     let http_handle = tokio::spawn(async move {
@@ -257,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     info!("Tavana Gateway started successfully");
-    info!("Architecture: Query-aware pre-sizing with K8s v1.35 in-place resize");
+    info!("Architecture: QueryQueue + SmartScaler (VPA-first, HPA-second)");
 
     // Wait for shutdown signal
     tokio::select! {
@@ -265,7 +253,6 @@ async fn main() -> anyhow::Result<()> {
             info!("Shutting down Tavana Gateway");
         }
         _ = pg_handle => {}
-        _ = flight_handle => {}
         _ = http_handle => {}
     }
 

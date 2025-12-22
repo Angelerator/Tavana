@@ -3,10 +3,7 @@ resolver = "2"
 members = [
     "crates/tavana-common",
     "crates/tavana-gateway",
-    "crates/tavana-operator",
     "crates/tavana-worker",
-    "crates/tavana-catalog",
-    "crates/tavana-metering",
 ]
 
 [workspace.package]
