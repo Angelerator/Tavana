@@ -24,14 +24,20 @@ RUN useradd -m -u 1000 -s /bin/bash tavana && \
     mkdir -p /home/tavana/.duckdb/extensions /tmp/duckdb && \
     chown -R tavana:tavana /home/tavana /tmp/duckdb
 
-# Pre-install DuckDB extensions (httpfs for S3 support, parquet for file reading)
-# Extensions are pre-downloaded and copied from local files (no network needed at build time)
-# This ensures workers start instantly without needing to download extensions
-RUN mkdir -p /home/tavana/.duckdb/extensions/v1.4.3/linux_arm64
-COPY docker/duckdb-extensions/httpfs.duckdb_extension /home/tavana/.duckdb/extensions/v1.4.3/linux_arm64/
-COPY docker/duckdb-extensions/parquet.duckdb_extension /home/tavana/.duckdb/extensions/v1.4.3/linux_arm64/
-RUN chmod 644 /home/tavana/.duckdb/extensions/v1.4.3/linux_arm64/*.duckdb_extension && \
-    chown -R tavana:tavana /home/tavana/.duckdb
+# Pre-download DuckDB extensions for fast pod startup
+# Detect architecture and download httpfs + parquet extensions
+ARG TARGETARCH
+RUN DUCKDB_VERSION="v1.1.3" && \
+    if [ "$TARGETARCH" = "arm64" ]; then DUCKDB_ARCH="linux_arm64"; \
+    else DUCKDB_ARCH="linux_amd64"; fi && \
+    EXT_DIR="/home/tavana/.duckdb/extensions/${DUCKDB_VERSION}/${DUCKDB_ARCH}" && \
+    mkdir -p "$EXT_DIR" && \
+    echo "Downloading DuckDB extensions for ${DUCKDB_ARCH}..." && \
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/httpfs.duckdb_extension.gz" | gunzip > "$EXT_DIR/httpfs.duckdb_extension" && \
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/parquet.duckdb_extension.gz" | gunzip > "$EXT_DIR/parquet.duckdb_extension" && \
+    chmod 644 "$EXT_DIR"/*.duckdb_extension && \
+    chown -R tavana:tavana /home/tavana/.duckdb && \
+    echo "✓ Extensions pre-installed for instant pod startup"
 
 COPY --from=builder /app/target/release/tavana-worker /usr/local/bin/
 
