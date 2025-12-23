@@ -746,10 +746,13 @@ mod tests {
 
     #[test]
     fn test_parse_memory_to_mb() {
+        // Binary units (1 MiB = 1024 * 1024 bytes)
         assert_eq!(parse_memory_to_mb(&Quantity("256Mi".to_string())), 256);
         assert_eq!(parse_memory_to_mb(&Quantity("1Gi".to_string())), 1024);
         assert_eq!(parse_memory_to_mb(&Quantity("4Gi".to_string())), 4096);
-        assert_eq!(parse_memory_to_mb(&Quantity("512M".to_string())), 512);
+        // SI units (1 MB = 1000 * 1000 bytes = ~0.95 MiB)
+        // 512 * 1000 * 1000 / (1024 * 1024) = 488
+        assert_eq!(parse_memory_to_mb(&Quantity("512M".to_string())), 488);
     }
 
     #[test]
