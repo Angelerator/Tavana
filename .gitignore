@@ -1,6 +1,7 @@
 # Rust
 /target/
-Cargo.lock
+# Keep Cargo.lock for reproducible builds (required for Docker builds)
+# Cargo.lock
 **/*.rs.bk
 *.pdb
 
