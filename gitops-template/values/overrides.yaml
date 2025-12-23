@@ -1,0 +1,55 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#                     TAVANA - Custom Value Overrides
+# ═══════════════════════════════════════════════════════════════════════════════
+# This file contains customer-specific overrides for the Tavana Helm chart.
+# These values are merged with the base values from the chart.
+#
+# Usage: Reference this file in your ArgoCD Application:
+#   helm:
+#     valueFiles:
+#       - values-azure.yaml
+#       - ../values/overrides.yaml
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+#                              EXAMPLE OVERRIDES
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Uncomment and modify as needed:
+
+# gateway:
+#   replicaCount: 2
+#   resources:
+#     requests:
+#       cpu: "1"
+#       memory: "2Gi"
+#     limits:
+#       cpu: "4"
+#       memory: "8Gi"
+
+# worker:
+#   replicaCount: 4
+#   maxReplicas: 20
+#   resources:
+#     requests:
+#       cpu: "2"
+#       memory: "8Gi"
+#     limits:
+#       cpu: "8"
+#       memory: "32Gi"
+
+# hpa:
+#   enabled: true
+#   cpuTargetUtilization: 70
+#   queueDepthTarget: "5"
+#   queueWaitTimeSecondsTarget: "30s"
+
+# ingress:
+#   enabled: true
+#   hosts:
+#     - host: "tavana.yourcompany.com"
+#       paths:
+#         - path: /
+#           pathType: Prefix
+#           port: 5432
+

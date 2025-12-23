@@ -1,0 +1,177 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  REGISTRY: docker.io
+  GATEWAY_IMAGE: tavana/gateway
+  WORKER_IMAGE: tavana/worker
+
+jobs:
+  build-and-push:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write  # For signing
+    
+    strategy:
+      matrix:
+        include:
+          - dockerfile: Dockerfile.gateway
+            image: gateway
+            context: .
+          - dockerfile: Dockerfile.worker
+            image: worker
+            context: .
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY }}/tavana/${{ matrix.image }}
+            ghcr.io/${{ github.repository_owner }}/tavana-${{ matrix.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+      
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+      
+      - name: Sign images
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          cosign sign --yes ${{ env.REGISTRY }}/tavana/${{ matrix.image }}@${{ steps.build.outputs.digest }}
+          cosign sign --yes ghcr.io/${{ github.repository_owner }}/tavana-${{ matrix.image }}@${{ steps.build.outputs.digest }}
+
+  helm-release:
+    name: Package & Publish Helm Chart
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.14.0'
+      
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+      
+      - name: Update Chart version
+        run: |
+          sed -i "s/^version:.*/version: ${{ steps.version.outputs.VERSION }}/" helm/tavana/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${{ steps.version.outputs.VERSION }}\"/" helm/tavana/Chart.yaml
+      
+      - name: Login to GitHub Container Registry
+        run: |
+          echo ${{ secrets.GITHUB_TOKEN }} | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+      
+      - name: Package Helm chart
+        run: |
+          helm package helm/tavana --destination .
+      
+      - name: Push to OCI registry
+        run: |
+          helm push tavana-${{ steps.version.outputs.VERSION }}.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-and-push, helm-release]
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          generate_release_notes: true
+          body: |
+            ## Tavana ${{ steps.version.outputs.VERSION }}
+            
+            ### Container Images
+            
+            **Docker Hub:**
+            ```bash
+            docker pull tavana/gateway:${{ steps.version.outputs.VERSION }}
+            docker pull tavana/worker:${{ steps.version.outputs.VERSION }}
+            ```
+            
+            **GitHub Container Registry:**
+            ```bash
+            docker pull ghcr.io/${{ github.repository_owner }}/tavana-gateway:${{ steps.version.outputs.VERSION }}
+            docker pull ghcr.io/${{ github.repository_owner }}/tavana-worker:${{ steps.version.outputs.VERSION }}
+            ```
+            
+            ### Helm Chart
+            
+            ```bash
+            helm install tavana oci://ghcr.io/${{ github.repository_owner }}/charts/tavana --version ${{ steps.version.outputs.VERSION }}
+            ```
+            
+            ### Quick Start
+            
+            See [deployment documentation](./terraform/README.md) for full instructions.
+

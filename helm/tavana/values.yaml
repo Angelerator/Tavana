@@ -4,34 +4,40 @@
 # Global settings
 global:
   namespace: tavana
-  imageRegistry: "ghcr.io/angelerator"
+  # Image registry - set to your private registry (e.g., myacr.azurecr.io)
+  # Default: Docker Hub (tavana/) or GHCR (ghcr.io/tavana/)
+  imageRegistry: ""
   imagePullPolicy: IfNotPresent
   imageTag: "latest"
 
 # Image pull secrets (for private registries)
 imagePullSecrets: []
   # - name: acr-secret
+  # - name: dockerhub-secret
 
 # Gateway settings
 gateway:
   enabled: true
   replicaCount: 2
   image:
-    repository: tavana-gateway
+    # Full image name (registry/repo:tag) or just repo name
+    # If global.imageRegistry is set, image will be: {global.imageRegistry}/tavana-gateway:{tag}
+    # If global.imageRegistry is empty, image will be: tavana/gateway:{tag} (Docker Hub)
+    repository: "gateway"
     tag: ""  # Defaults to global.imageTag
   
   service:
     type: ClusterIP
-    pgPort: 15432      # PostgreSQL wire protocol
+    pgPort: 5432       # PostgreSQL wire protocol
     httpPort: 8080     # Health + Metrics
   
   resources:
     requests:
-      memory: "256Mi"
-      cpu: "100m"
-    limits:
       memory: "1Gi"
-      cpu: "1000m"
+      cpu: "500m"
+    limits:
+      memory: "4Gi"
+      cpu: "2000m"
   
   # Environment variables
   env: []
@@ -52,30 +58,44 @@ gateway:
 worker:
   enabled: true
   replicaCount: 2
-  minReplicas: 1
-  maxReplicas: 10
+  minReplicas: 2
+  maxReplicas: 20
   image:
-    repository: tavana-worker
+    repository: "worker"
     tag: ""  # Defaults to global.imageTag
   
   resources:
     requests:
-      memory: "512Mi"
-      cpu: "250m"
+      memory: "2Gi"
+      cpu: "500m"
     limits:
-      memory: "4Gi"
-      cpu: "2000m"
+      memory: "12Gi"
+      cpu: "3500m"
   
   # Environment variables
   env: []
+  
+  # Node selector for dedicated worker nodes
+  nodeSelector: {}
+    # nodepool: tavana
+  
+  # Tolerations for dedicated worker nodes
+  tolerations: []
+    # - key: "workload"
+    #   operator: "Equal"
+    #   value: "tavana"
+    #   effect: "NoSchedule"
 
 # Horizontal Pod Autoscaler
 hpa:
   enabled: true
-  minReplicas: 1
-  maxReplicas: 10
-  targetCPUUtilizationPercentage: 70
-  targetMemoryUtilizationPercentage: 80
+  minReplicas: 2
+  maxReplicas: 20
+  cpuTargetUtilization: 70
+  memoryTargetUtilization: 80
+  # Custom metrics (requires metrics-server and prometheus-adapter)
+  queueDepthTarget: "5"
+  queueWaitTimeSecondsTarget: "30s"
 
 # Object Storage (S3-compatible)
 objectStorage:

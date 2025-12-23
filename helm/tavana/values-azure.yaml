@@ -1,26 +1,28 @@
 # Tavana Helm Chart - Azure Values Template
 # Cloud-Agnostic Auto-Scaling DuckDB Query Platform
 #
-# This file provides Azure-specific defaults. Copy and customize for your environment:
-#   cp values-azure.yaml my-values.yaml
-#   # Edit my-values.yaml with your settings
-#   helm install tavana ./helm/tavana -f my-values.yaml
+# Usage:
+#   helm install tavana ./helm/tavana -f values-azure.yaml \
+#     --set global.imageRegistry=YOUR_ACR.azurecr.io \
+#     --set ingress.hosts[0].host=tavana.example.com
 
 # Global settings
 global:
   namespace: tavana
-  # Container registry - use your private ACR
-  # Example: myacr.azurecr.io
-  imageRegistry: ""  # REQUIRED: Set to your ACR login server
+  # Container registry (Docker Hub or private ACR)
+  # Docker Hub: docker.io/angelerator
+  # ACR: myacr.azurecr.io
+  imageRegistry: "docker.io/angelerator"
   imagePullPolicy: Always
   imageTag: "v1.0.0"
 
-# Private registry credentials
-# Create with: kubectl create secret docker-registry acr-secret --docker-server=... -n tavana
-imagePullSecrets:
-  - name: acr-secret
+# Private registry credentials (optional for Docker Hub public, required for ACR)
+imagePullSecrets: []
+  # - name: acr-secret
 
-# Gateway configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+# GATEWAY CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
 gateway:
   enabled: true
   replicaCount: 2
@@ -32,66 +34,71 @@ gateway:
     pgPort: 15432
     httpPort: 8080
   
-  resources:
-    requests:
-      memory: "512Mi"
-      cpu: "250m"
-    limits:
-      memory: "2Gi"
-      cpu: "1000m"
-
-# Worker configuration
-worker:
-  enabled: true
-  replicaCount: 2
-  minReplicas: 2
-  maxReplicas: 20
-  image:
-    repository: tavana-worker
-  
+  # Resource sizing for D4s_v3 nodes (4 vCPU, 16 GB)
   resources:
     requests:
       memory: "1Gi"
       cpu: "500m"
     limits:
-      memory: "8Gi"
-      cpu: "4000m"
+      memory: "4Gi"
+      cpu: "2000m"
 
-# HPA configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+# WORKER CONFIGURATION (Query Execution)
+# ═══════════════════════════════════════════════════════════════════════════════
+worker:
+  enabled: true
+  replicaCount: 2
+  minReplicas: 2
+  maxReplicas: 8
+  image:
+    repository: tavana-worker
+  
+  # Resource sizing for D4s_v3 nodes (4 vCPU, 16 GB)
+  # Each worker can handle large queries with up to 12GB RAM
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "500m"
+    limits:
+      memory: "12Gi"      # Large limit for heavy queries
+      cpu: "3500m"        # Almost full node CPU
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTOSCALING (HPA)
+# ═══════════════════════════════════════════════════════════════════════════════
 hpa:
   enabled: true
   minReplicas: 2
-  maxReplicas: 20
+  maxReplicas: 8           # Max 8 workers (fits 4 nodes)
   targetCPUUtilizationPercentage: 70
-  targetMemoryUtilizationPercentage: 80
+  targetMemoryUtilizationPercentage: 75
 
-# Azure Blob Storage / ADLS Gen2 (S3-compatible API)
-# Option 1: Storage account with hierarchical namespace (ADLS Gen2)
-# Option 2: Azure Blob with S3 compatibility layer
+# ═══════════════════════════════════════════════════════════════════════════════
+# OBJECT STORAGE (Azure Blob / ADLS Gen2)
+# ═══════════════════════════════════════════════════════════════════════════════
 objectStorage:
-  # Storage endpoint (leave empty to use Azure SDK with Workload Identity)
+  # Leave empty to use Workload Identity with Azure SDK
   endpoint: ""
   bucket: ""
   region: "westeurope"
   pathStyle: false
-  # Use Kubernetes secret for credentials
   existingSecret: ""
-  existingSecretAccessKeyIdKey: "storage-account-name"
-  existingSecretSecretAccessKeyKey: "storage-account-key"
 
-# Service Account with Azure Workload Identity
+# ═══════════════════════════════════════════════════════════════════════════════
+# IDENTITY & SECURITY
+# ═══════════════════════════════════════════════════════════════════════════════
 serviceAccount:
   create: true
   name: "tavana"
   annotations:
-    # Azure Workload Identity - set your managed identity client ID
+    # Azure Workload Identity
     azure.workload.identity/client-id: ""
 
-# Pod labels for Workload Identity
 podLabels:
   azure.workload.identity/use: "true"
 
-# Security (Azure Policy / PSS compliant)
+# Pod Security (Azure Policy compliant)
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
@@ -109,49 +116,49 @@ containerSecurityContext:
     drop:
       - ALL
 
-# Network Policies
+# ═══════════════════════════════════════════════════════════════════════════════
+# NETWORKING
+# ═══════════════════════════════════════════════════════════════════════════════
 networkPolicies:
   enabled: true
-  # Azure service CIDRs - customize for your region
-  # Find your region's CIDRs: https://azureipranges.azurewebsites.net/
   egressCIDRs:
-    - 10.0.0.0/8         # Private network (VNet)
-    - 100.64.0.0/10      # Azure Private Link
-    - 168.63.0.0/16      # Azure platform services
+    - 10.0.0.0/8
+    - 100.64.0.0/10
+    - 168.63.0.0/16
 
-# Ingress via Azure Application Gateway (AGIC)
+# Ingress via Azure Application Gateway
 ingress:
   enabled: true
   className: "azure/application-gateway"
   annotations:
     appgw.ingress.kubernetes.io/ssl-redirect: "true"
     appgw.ingress.kubernetes.io/connection-draining: "true"
-    appgw.ingress.kubernetes.io/connection-draining-timeout: "30"
     appgw.ingress.kubernetes.io/request-timeout: "300"
     appgw.ingress.kubernetes.io/backend-protocol: "http"
     appgw.ingress.kubernetes.io/health-probe-path: "/health"
   hosts:
-    - host: ""  # REQUIRED: Set your hostname (e.g., tavana.example.com)
+    - host: ""  # REQUIRED
       paths:
         - path: /
           pathType: Prefix
   tls:
     - secretName: tavana-tls
       hosts:
-        - ""  # REQUIRED: Same as hosts[0].host
+        - ""  # REQUIRED
 
-# Monitoring
+# ═══════════════════════════════════════════════════════════════════════════════
+# OBSERVABILITY
+# ═══════════════════════════════════════════════════════════════════════════════
 monitoring:
   prometheus:
     enabled: false
-    serviceMonitor:
-      enabled: false
 
-# RBAC
+config:
+  logLevel: "info"
+
 rbac:
   create: true
 
-# Pod Disruption Budgets
 podDisruptionBudget:
   gateway:
     enabled: true

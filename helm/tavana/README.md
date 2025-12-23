@@ -1,78 +1,231 @@
 # Tavana Helm Chart
 
-Cloud-Agnostic Auto-Scaling DuckDB Query Platform.
+Cloud-Agnostic Auto-Scaling DuckDB Query Platform
 
-## Quick Start
-
-### Prerequisites
-
-- Kubernetes 1.25+
-- Helm 3.x
-- Container registry with Tavana images
-
-### Installation
+## TL;DR
 
 ```bash
-# Add your custom values
-helm install tavana ./helm/tavana \
-  --namespace tavana \
-  --create-namespace \
-  --set global.imageRegistry=your-registry.azurecr.io \
-  --set ingress.hosts[0].host=tavana.example.com
+# From Docker Hub
+helm install tavana oci://ghcr.io/tavana/charts/tavana
+
+# Or from local
+helm install tavana ./helm/tavana
 ```
 
-### Azure Deployment
+## Introduction
+
+This chart bootstraps a Tavana deployment on a Kubernetes cluster using the Helm package manager.
+
+Tavana consists of:
+- **Gateway**: Accepts PostgreSQL wire protocol connections, manages query queuing and routing
+- **Workers**: Execute DuckDB queries against cloud storage (S3, ADLS, GCS)
+
+## Prerequisites
+
+- Kubernetes 1.28+
+- Helm 3.12+
+- PV provisioner support (for monitoring stack)
+- Metrics Server (for HPA)
+
+## Installing the Chart
+
+### From OCI Registry (Recommended)
 
 ```bash
-# Use Azure-specific values
-helm install tavana ./helm/tavana \
+helm install tavana oci://ghcr.io/tavana/charts/tavana \
   --namespace tavana \
   --create-namespace \
-  -f ./helm/tavana/values-azure.yaml \
-  --set global.imageRegistry=your-acr.azurecr.io \
-  --set ingress.hosts[0].host=tavana.example.com \
-  --set ingress.tls[0].hosts[0]=tavana.example.com
+  --set global.imageRegistry=myacr.azurecr.io
+```
+
+### From Source
+
+```bash
+git clone https://github.com/tavana/tavana.git
+helm install tavana ./helm/tavana -n tavana --create-namespace
+```
+
+## Uninstalling
+
+```bash
+helm uninstall tavana -n tavana
 ```
 
 ## Configuration
 
+### Global Settings
+
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `global.imageRegistry` | Container registry URL | `ghcr.io/angelerator` |
+| `global.namespace` | Kubernetes namespace | `tavana` |
+| `global.imageRegistry` | Container registry | `""` (Docker Hub) |
+| `global.imagePullPolicy` | Image pull policy | `IfNotPresent` |
 | `global.imageTag` | Image tag | `latest` |
-| `gateway.replicaCount` | Gateway replicas | `2` |
-| `worker.replicaCount` | Worker replicas | `2` |
-| `worker.maxReplicas` | Max workers (HPA) | `10` |
-| `ingress.enabled` | Enable ingress | `false` |
+
+### Gateway
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `gateway.enabled` | Deploy gateway | `true` |
+| `gateway.replicaCount` | Number of replicas | `2` |
+| `gateway.resources.requests.memory` | Memory request | `1Gi` |
+| `gateway.resources.limits.memory` | Memory limit | `4Gi` |
+| `gateway.service.pgPort` | PostgreSQL port | `5432` |
+
+### Worker
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `worker.enabled` | Deploy workers | `true` |
+| `worker.replicaCount` | Initial replicas | `2` |
+| `worker.minReplicas` | HPA min replicas | `2` |
+| `worker.maxReplicas` | HPA max replicas | `20` |
+| `worker.resources.requests.memory` | Memory request | `2Gi` |
+| `worker.resources.limits.memory` | Memory limit | `12Gi` |
+| `worker.nodeSelector` | Node selector | `{}` |
+| `worker.tolerations` | Tolerations | `[]` |
+
+### HPA (Horizontal Pod Autoscaler)
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `hpa.enabled` | Enable HPA | `true` |
+| `hpa.cpuTargetUtilization` | CPU target % | `70` |
+| `hpa.queueDepthTarget` | Queue depth target | `5` |
+| `hpa.queueWaitTimeSecondsTarget` | Wait time target | `30s` |
+
+### Object Storage
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `objectStorage.endpoint` | S3 endpoint | `""` |
+| `objectStorage.bucket` | Bucket name | `""` |
+| `objectStorage.region` | AWS region | `us-east-1` |
+| `objectStorage.existingSecret` | Secret with credentials | `""` |
+
+### Security
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `serviceAccount.create` | Create service account | `true` |
+| `serviceAccount.name` | Service account name | `tavana` |
+| `serviceAccount.annotations` | SA annotations | `{}` |
 | `networkPolicies.enabled` | Enable network policies | `true` |
+| `podSecurityContext.runAsNonRoot` | Run as non-root | `true` |
 
-## Cloud-Specific Values
+## Cloud-Specific Configuration
 
-- `values.yaml` - Default values (works with any registry)
-- `values-azure.yaml` - Azure AKS with Application Gateway
+### Azure (AKS)
 
-## Security
+```yaml
+# values-azure.yaml
+global:
+  imageRegistry: "myacr.azurecr.io"
 
-This chart follows security best practices:
+serviceAccount:
+  annotations:
+    azure.workload.identity/client-id: "YOUR_CLIENT_ID"
+    azure.workload.identity/tenant-id: "YOUR_TENANT_ID"
 
-- Non-root containers
-- Read-only root filesystem
-- Dropped capabilities
-- Network policies
-- Pod security standards (restricted)
-
-## Architecture
-
-```
-┌─────────────┐     ┌─────────────┐
-│   Gateway   │────►│   Workers   │
-│  (2+ pods)  │     │  (2-20 pods)│
-└─────────────┘     └─────────────┘
-      │                    │
-      │   PostgreSQL       │   gRPC
-      │   Wire Protocol    │
-      ▼                    ▼
-   Clients            Object Storage
-   (psql, DBeaver)    (S3/ADLS/GCS)
+worker:
+  nodeSelector:
+    nodepool: tavana
+  tolerations:
+    - key: "workload"
+      operator: "Equal"
+      value: "tavana"
+      effect: "NoSchedule"
 ```
 
+### AWS (EKS)
+
+```yaml
+# values-aws.yaml
+global:
+  imageRegistry: "123456789.dkr.ecr.us-east-1.amazonaws.com"
+
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::123456789:role/tavana-role"
+
+objectStorage:
+  bucket: "my-data-bucket"
+  region: "us-east-1"
+```
+
+### GCP (GKE)
+
+```yaml
+# values-gcp.yaml
+global:
+  imageRegistry: "gcr.io/my-project"
+
+serviceAccount:
+  annotations:
+    iam.gke.io/gcp-service-account: "tavana@my-project.iam.gserviceaccount.com"
+
+objectStorage:
+  endpoint: "https://storage.googleapis.com"
+  bucket: "my-data-bucket"
+```
+
+## Using with ArgoCD
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: tavana
+  namespace: argocd
+spec:
+  source:
+    repoURL: oci://ghcr.io/tavana/charts
+    chart: tavana
+    targetRevision: "1.0.0"
+    helm:
+      valueFiles:
+        - values-azure.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: tavana
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+## Upgrading
+
+### To 1.x
+
+No breaking changes.
+
+## Troubleshooting
+
+### Pods stuck in Pending
+
+Check node resources:
+```bash
+kubectl describe node
+kubectl top nodes
+```
+
+### Image pull errors
+
+Verify registry access:
+```bash
+kubectl create job test-pull --image=YOUR_REGISTRY/tavana/gateway:latest -- echo ok
+kubectl logs job/test-pull
+```
+
+### Connection refused
+
+Check services:
+```bash
+kubectl get svc -n tavana
+kubectl port-forward svc/gateway -n tavana 5432:5432
+```
+
+## License
+
+Apache 2.0
