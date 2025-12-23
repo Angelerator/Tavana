@@ -1,0 +1,117 @@
+{{- if .Values.worker.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: tavana-worker
+    {{- include "tavana.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.worker.replicaCount }}
+  selector:
+    matchLabels:
+      app: tavana-worker
+  template:
+    metadata:
+      labels:
+        app: tavana-worker
+        {{- if .Values.podLabels }}
+        {{- toYaml .Values.podLabels | nindent 8 }}
+        {{- end }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "50053"
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: worker
+          image: "{{ .Values.global.imageRegistry }}/{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag | default .Values.global.imageTag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: grpc
+              containerPort: 50053
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.config.logLevel | default "info" }}
+            - name: GRPC_PORT
+              value: "50053"
+            {{- if .Values.objectStorage.endpoint }}
+            - name: S3_ENDPOINT
+              value: {{ .Values.objectStorage.endpoint }}
+            {{- end }}
+            {{- if .Values.objectStorage.bucket }}
+            - name: S3_BUCKET
+              value: {{ .Values.objectStorage.bucket }}
+            {{- end }}
+            {{- if .Values.objectStorage.region }}
+            - name: AWS_REGION
+              value: {{ .Values.objectStorage.region }}
+            {{- end }}
+            {{- if .Values.objectStorage.existingSecret }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.objectStorage.existingSecret }}
+                  key: {{ .Values.objectStorage.existingSecretAccessKeyIdKey }}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.objectStorage.existingSecret }}
+                  key: {{ .Values.objectStorage.existingSecretSecretAccessKeyKey }}
+            {{- end }}
+            {{- with .Values.worker.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: duckdb-home
+              mountPath: /home/tavana
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: duckdb-home
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: tavana-worker
+    {{- include "tavana.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None  # Headless service for direct pod access
+  ports:
+    - name: grpc
+      port: 50053
+      targetPort: grpc
+      protocol: TCP
+  selector:
+    app: tavana-worker
+{{- end }}
+

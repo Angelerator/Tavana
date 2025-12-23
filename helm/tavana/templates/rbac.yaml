@@ -1,0 +1,61 @@
+{{- if .Values.rbac.create }}
+# Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.serviceAccount.name }}
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "tavana.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+# Role for gateway to manage workers (for smart scaling)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tavana-gateway-role
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "tavana.labels" . | nindent 4 }}
+rules:
+  # Read pods for worker discovery
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Patch pods for VPA (in-place resize)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["patch"]
+  # Read nodes for capacity checking
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+  # Manage deployments for HPA signaling
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "patch"]
+---
+# RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tavana-gateway-rolebinding
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "tavana.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Values.global.namespace }}
+roleRef:
+  kind: Role
+  name: tavana-gateway-role
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
+

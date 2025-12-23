@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tavana-config
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "tavana.labels" . | nindent 4 }}
+data:
+  # Gateway configuration
+  LOG_LEVEL: {{ .Values.config.logLevel | default "info" | quote }}
+  WORKER_SERVICE_NAME: {{ .Values.config.workerServiceName | default "worker" | quote }}
+  WORKER_SERVICE_PORT: {{ .Values.config.workerServicePort | default 50053 | quote }}
+  
+  # Object storage configuration
+  {{- if .Values.objectStorage.endpoint }}
+  S3_ENDPOINT: {{ .Values.objectStorage.endpoint | quote }}
+  {{- end }}
+  {{- if .Values.objectStorage.bucket }}
+  S3_BUCKET: {{ .Values.objectStorage.bucket | quote }}
+  {{- end }}
+  {{- if .Values.objectStorage.region }}
+  AWS_REGION: {{ .Values.objectStorage.region | quote }}
+  {{- end }}
+  S3_PATH_STYLE: {{ .Values.objectStorage.pathStyle | default false | quote }}
+

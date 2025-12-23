@@ -3,13 +3,12 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "tavana.fullname" . }}-default-deny
+  name: default-deny-ingress
+  namespace: {{ .Values.global.namespace }}
   labels:
     {{- include "tavana.labels" . | nindent 4 }}
 spec:
-  podSelector:
-    matchLabels:
-      {{- include "tavana.selectorLabels" . | nindent 6 }}
+  podSelector: {}
   policyTypes:
     - Ingress
 ---
@@ -17,42 +16,82 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "tavana.fullname" . }}-gateway-ingress
+  name: allow-gateway-ingress
+  namespace: {{ .Values.global.namespace }}
   labels:
     {{- include "tavana.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      {{- include "tavana.selectorLabels" . | nindent 6 }}
-      app.kubernetes.io/component: gateway
+      app: tavana-gateway
+  policyTypes:
+    - Ingress
   ingress:
-    - ports:
+    # Allow from ingress controller
+    - from: []
+      ports:
         - protocol: TCP
           port: {{ .Values.gateway.service.pgPort }}
         - protocol: TCP
-          port: {{ .Values.gateway.service.flightPort }}
-        - protocol: TCP
           port: {{ .Values.gateway.service.httpPort }}
-  policyTypes:
-    - Ingress
 ---
-# Allow internal communication
+# Allow gateway to worker communication
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "tavana.fullname" . }}-internal
+  name: allow-gateway-to-worker
+  namespace: {{ .Values.global.namespace }}
   labels:
     {{- include "tavana.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      {{- include "tavana.selectorLabels" . | nindent 6 }}
+      app: tavana-worker
+  policyTypes:
+    - Ingress
   ingress:
     - from:
         - podSelector:
             matchLabels:
-              {{- include "tavana.selectorLabels" . | nindent 14 }}
+              app: tavana-gateway
+      ports:
+        - protocol: TCP
+          port: 50053
+---
+# Allow egress to Azure services (or configured CIDRs)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-cloud-services
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "tavana.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
   policyTypes:
-    - Ingress
+    - Egress
+  egress:
+    # Allow DNS
+    - to: []
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow HTTPS to cloud services
+    - to: []
+      ports:
+        - protocol: TCP
+          port: 443
+    # Allow within namespace
+    - to:
+        - podSelector: {}
+    {{- if .Values.networkPolicies.egressCIDRs }}
+    # Allow to configured CIDRs (Azure services, etc.)
+    - to:
+        {{- range .Values.networkPolicies.egressCIDRs }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+    {{- end }}
 {{- end }}
-

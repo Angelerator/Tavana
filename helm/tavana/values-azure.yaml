@@ -1,0 +1,144 @@
+# Tavana Helm Chart - Azure Values (Community Edition)
+# For deployment to Azure Kubernetes Service (AKS)
+
+# Global settings - CUSTOMIZE FOR YOUR ENVIRONMENT
+global:
+  namespace: tavana
+  # Use customer's ACR (private registry, no internet needed)
+  imageRegistry: "YOUR_ACR_NAME.azurecr.io"
+  imagePullPolicy: Always
+  imageTag: "v1.0.0"
+
+# ACR pull secret
+imagePullSecrets:
+  - name: acr-secret
+
+# Gateway settings
+gateway:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: tavana-gateway
+    tag: "v1.0.0"
+  
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "2Gi"
+      cpu: "1000m"
+
+# Worker settings
+worker:
+  enabled: true
+  replicaCount: 2
+  minReplicas: 2
+  maxReplicas: 20
+  image:
+    repository: tavana-worker
+    tag: "v1.0.0"
+  
+  resources:
+    requests:
+      memory: "1Gi"
+      cpu: "500m"
+    limits:
+      memory: "8Gi"
+      cpu: "4000m"
+
+# Azure Blob Storage (S3-compatible API)
+# Option 1: Use Azure Blob with S3 API (requires storage account with hierarchical namespace)
+# Option 2: Use Azure Blob with native SDK (configure via env vars)
+objectStorage:
+  # Azure Blob S3-compatible endpoint
+  endpoint: "https://YOUR_STORAGE_ACCOUNT.blob.core.windows.net"
+  bucket: "your-data-container"
+  region: "westeurope"
+  pathStyle: false
+  # Use existingSecret for credentials
+  existingSecret: "azure-storage-secret"
+  existingSecretAccessKeyIdKey: "storage-account-name"
+  existingSecretSecretAccessKeyKey: "storage-account-key"
+
+# Service Account with Azure Workload Identity
+serviceAccount:
+  create: true
+  name: "tavana"
+  annotations:
+    # Azure Workload Identity (recommended for production)
+    azure.workload.identity/client-id: "YOUR_MANAGED_IDENTITY_CLIENT_ID"
+
+# Pod labels for Workload Identity
+podLabels:
+  azure.workload.identity/use: "true"
+
+# Security (matches customer's PSS requirements)
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# Network Policies (restrict egress to Azure services)
+networkPolicies:
+  enabled: true
+  # Azure service CIDRs (customize for your region)
+  egressCIDRs:
+    - 13.69.0.0/16      # West Europe
+    - 20.50.0.0/16      # West Europe
+    - 168.63.0.0/16     # Azure Wire Server
+    - 10.0.0.0/8        # Private network
+
+# Ingress via Azure Application Gateway
+ingress:
+  enabled: true
+  className: "azure/application-gateway"
+  annotations:
+    appgw.ingress.kubernetes.io/ssl-redirect: "true"
+    appgw.ingress.kubernetes.io/connection-draining: "true"
+    appgw.ingress.kubernetes.io/connection-draining-timeout: "30"
+    appgw.ingress.kubernetes.io/request-timeout: "300"
+    appgw.ingress.kubernetes.io/backend-protocol: "http"
+    appgw.ingress.kubernetes.io/health-probe-path: "/health"
+  hosts:
+    - host: tavana.YOUR_DOMAIN.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: tavana-tls
+      hosts:
+        - tavana.YOUR_DOMAIN.com
+
+# Monitoring (optional - enable if Prometheus operator is installed)
+monitoring:
+  prometheus:
+    enabled: false
+    serviceMonitor:
+      enabled: false
+
+# RBAC
+rbac:
+  create: true
+
+# Pod Disruption Budgets
+podDisruptionBudget:
+  gateway:
+    enabled: true
+    minAvailable: 1
+  worker:
+    enabled: true
+    maxUnavailable: 1
+

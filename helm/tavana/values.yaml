@@ -1,10 +1,16 @@
-# Tavana Helm Chart Values
+# Tavana Helm Chart Values - Community Edition
+# Cloud-Agnostic Auto-Scaling DuckDB Query Platform
 
 # Global settings
 global:
-  imageRegistry: ghcr.io/tavana
+  namespace: tavana
+  imageRegistry: "ghcr.io/angelerator"
   imagePullPolicy: IfNotPresent
   imageTag: "latest"
+
+# Image pull secrets (for private registries)
+imagePullSecrets: []
+  # - name: acr-secret
 
 # Gateway settings
 gateway:
@@ -16,9 +22,8 @@ gateway:
   
   service:
     type: ClusterIP
-    pgPort: 5432
-    flightPort: 8815
-    httpPort: 8080
+    pgPort: 15432      # PostgreSQL wire protocol
+    httpPort: 8080     # Health + Metrics
   
   resources:
     requests:
@@ -28,189 +33,137 @@ gateway:
       memory: "1Gi"
       cpu: "1000m"
   
-  # TLS configuration
-  tls:
+  # Environment variables
+  env: []
+  
+  # Liveness and readiness probes
+  livenessProbe:
     enabled: true
-    # Use cert-manager for automatic certificate management
-    certManager:
-      enabled: true
-      issuerName: letsencrypt-prod
-      issuerKind: ClusterIssuer
+    path: /health
+    initialDelaySeconds: 30
+    periodSeconds: 10
+  readinessProbe:
+    enabled: true
+    path: /health
+    initialDelaySeconds: 10
+    periodSeconds: 5
 
-# Operator settings
-operator:
-  enabled: true
-  replicaCount: 1
-  image:
-    repository: tavana-operator
-    tag: ""
-  
-  # Worker pod settings
-  worker:
-    image:
-      repository: tavana-worker
-      tag: ""
-    
-    # Default resource limits for worker pods
-    defaultResources:
-      minMemoryMb: 512
-      maxMemoryMb: 65536
-      minCpuMillicores: 500
-      maxCpuMillicores: 16000
-  
-  resources:
-    requests:
-      memory: "128Mi"
-      cpu: "50m"
-    limits:
-      memory: "256Mi"
-      cpu: "200m"
-
-# Catalog settings
-catalog:
+# Worker settings (managed by gateway's smart scaler)
+worker:
   enabled: true
   replicaCount: 2
+  minReplicas: 1
+  maxReplicas: 10
   image:
-    repository: tavana-catalog
-    tag: ""
-  
-  service:
-    grpcPort: 50052
-    httpPort: 8080
+    repository: tavana-worker
+    tag: ""  # Defaults to global.imageTag
   
   resources:
     requests:
-      memory: "256Mi"
-      cpu: "100m"
-    limits:
       memory: "512Mi"
-      cpu: "500m"
-
-# Metering settings
-metering:
-  enabled: true
-  replicaCount: 1
-  image:
-    repository: tavana-metering
-    tag: ""
-  
-  # Control plane for usage reporting
-  controlPlane:
-    enabled: false
-    url: ""
-    apiKey: ""
-  
-  # Usage data archival
-  archival:
-    enabled: true
-    # S3-compatible storage for Parquet archives
-    bucket: ""
-    prefix: "metering/"
-  
-  resources:
-    requests:
-      memory: "128Mi"
-      cpu: "50m"
+      cpu: "250m"
     limits:
-      memory: "256Mi"
-      cpu: "200m"
+      memory: "4Gi"
+      cpu: "2000m"
+  
+  # Environment variables
+  env: []
 
-# PostgreSQL for catalog and metering
-postgresql:
+# Horizontal Pod Autoscaler
+hpa:
   enabled: true
-  auth:
-    postgresPassword: tavana-admin
-    database: tavana
-    username: tavana
-    password: tavana
-  primary:
-    persistence:
-      enabled: true
-      size: 8Gi
-  architecture: standalone
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
 
-# External database (if postgresql.enabled=false)
-externalDatabase:
-  host: ""
-  port: 5432
-  database: tavana
-  username: tavana
-  password: ""
+# Object Storage (S3-compatible)
+objectStorage:
+  # Endpoint for S3-compatible storage
+  endpoint: ""
+  # Bucket name for data
+  bucket: ""
+  # Region (for AWS S3)
+  region: "us-east-1"
+  # Use path-style access (required for MinIO, ADLS with S3 API)
+  pathStyle: true
+  # Credentials (use existingSecret in production)
+  accessKeyId: ""
+  secretAccessKey: ""
   existingSecret: ""
-  existingSecretPasswordKey: password
+  existingSecretAccessKeyIdKey: "access-key-id"
+  existingSecretSecretAccessKeyKey: "secret-access-key"
+
+# Service Account
+serviceAccount:
+  create: true
+  name: "tavana"
+  annotations: {}
+  # AWS IRSA annotation:
+  # eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT:role/tavana-role
+  # Azure Workload Identity annotation:
+  # azure.workload.identity/client-id: CLIENT_ID
+
+# Pod Security
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# Network Policies
+networkPolicies:
+  enabled: true
 
 # Ingress configuration
 ingress:
   enabled: false
-  className: nginx
+  className: ""
   annotations: {}
   hosts:
     - host: tavana.example.com
       paths:
         - path: /
           pathType: Prefix
-          port: 8080
   tls: []
 
-# Service Account
-serviceAccount:
-  create: true
-  name: ""
-  annotations: {}
-  # AWS IRSA annotation
-  # eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT:role/tavana-role
-  # Azure Workload Identity annotation
-  # azure.workload.identity/client-id: CLIENT_ID
-
-# Pod Security
-podSecurityContext:
-  runAsNonRoot: true
-  fsGroup: 1000
-
-securityContext:
-  runAsUser: 1000
-  runAsNonRoot: true
-  readOnlyRootFilesystem: true
-  allowPrivilegeEscalation: false
-
-# Network Policies
-networkPolicies:
-  enabled: true
-
-# Observability
-observability:
-  # OpenTelemetry
-  opentelemetry:
-    enabled: true
-    collectorEndpoint: "http://otel-collector:4317"
-  
-  # Prometheus
+# Monitoring
+monitoring:
   prometheus:
     enabled: true
     serviceMonitor:
-      enabled: true
+      enabled: false
       namespace: ""
       labels: {}
 
-# Cloud-specific settings
-cloud:
-  # AWS-specific configuration
-  aws:
-    enabled: false
-    region: us-east-1
-    # Use IRSA for authentication
-    useIRSA: true
-  
-  # Azure-specific configuration
-  azure:
-    enabled: false
-    # Use Workload Identity
-    useWorkloadIdentity: true
-  
-  # GCP-specific configuration
-  gcp:
-    enabled: false
-    projectId: ""
-    # Use Workload Identity
-    useWorkloadIdentity: true
+# ConfigMap for gateway configuration
+config:
+  # Log level: debug, info, warn, error
+  logLevel: "info"
+  # Worker discovery endpoint
+  workerServiceName: "worker"
+  workerServicePort: 50053
 
+# RBAC for gateway to manage workers
+rbac:
+  create: true
+
+# Pod Disruption Budgets
+podDisruptionBudget:
+  gateway:
+    enabled: true
+    minAvailable: 1
+  worker:
+    enabled: true
+    maxUnavailable: 1
