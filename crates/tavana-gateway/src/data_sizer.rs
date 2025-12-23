@@ -140,14 +140,17 @@ impl DataSizer {
     /// Create a new DataSizer
     pub async fn new() -> Self {
         let endpoint_url = std::env::var("AWS_ENDPOINT_URL").ok();
-        
+
         let s3_client = match Self::create_s3_client(&endpoint_url).await {
             Ok(client) => {
                 info!("S3 client initialized for real size estimation");
                 Some(client)
             }
             Err(e) => {
-                warn!("Failed to create S3 client, using fallback estimation: {}", e);
+                warn!(
+                    "Failed to create S3 client, using fallback estimation: {}",
+                    e
+                );
                 None
             }
         };
@@ -165,17 +168,17 @@ impl DataSizer {
         use aws_config::BehaviorVersion;
 
         let mut config_loader = aws_config::defaults(BehaviorVersion::latest());
-        
+
         if let Some(endpoint) = endpoint_url {
             config_loader = config_loader.endpoint_url(endpoint);
         }
-        
+
         let config = config_loader.load().await;
-        
+
         let s3_config = aws_sdk_s3::config::Builder::from(&config)
             .force_path_style(true)
             .build();
-        
+
         Ok(S3Client::from_conf(s3_config))
     }
 
@@ -228,10 +231,16 @@ impl DataSizer {
 
                     // Extract tables
                     for from in &select.from {
-                        self.extract_tables_from_table_factor(&from.relation, &mut structure.tables);
+                        self.extract_tables_from_table_factor(
+                            &from.relation,
+                            &mut structure.tables,
+                        );
                         for join in &from.joins {
                             structure.has_join = true;
-                            self.extract_tables_from_table_factor(&join.relation, &mut structure.tables);
+                            self.extract_tables_from_table_factor(
+                                &join.relation,
+                                &mut structure.tables,
+                            );
                         }
                     }
 
@@ -295,12 +304,17 @@ impl DataSizer {
         }
 
         // Check for SELECT *
-        structure.is_select_star = sql_upper.contains("SELECT *") || sql_upper.contains("SELECT\n*");
+        structure.is_select_star =
+            sql_upper.contains("SELECT *") || sql_upper.contains("SELECT\n*");
 
         // Extract LIMIT
         if let Some(pos) = sql_upper.find("LIMIT") {
             let after = &sql[pos + 5..];
-            let num_str: String = after.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+            let num_str: String = after
+                .trim()
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
             structure.limit = num_str.parse().ok();
         }
 
@@ -333,32 +347,26 @@ impl DataSizer {
         for table in &effective_tables {
             let source = self.estimate_source_size_with_metadata(table).await;
             total_bytes += source.size_bytes;
-            
+
             if let Some(rows) = source.row_count {
-                    total_rows += rows;
-                }
+                total_rows += rows;
+            }
 
             // Get cached column metadata
             if let Some(cached) = self.cache.get(table) {
                 all_columns.extend(cached.columns.clone());
             }
-            
+
             sources.push(source);
         }
 
         // Calculate column pruning
-        let (selected_column_count, estimated_read_bytes) = self.calculate_column_pruning(
-            &query_structure,
-            &all_columns,
-            total_bytes,
-        );
+        let (selected_column_count, estimated_read_bytes) =
+            self.calculate_column_pruning(&query_structure, &all_columns, total_bytes);
 
         // Calculate effective row count (after LIMIT and predicates)
-        let effective_row_count = self.calculate_effective_rows(
-            total_rows,
-            &query_structure,
-        );
-        
+        let effective_row_count = self.calculate_effective_rows(total_rows, &query_structure);
+
         // Calculate memory estimate using data types
         let estimated_memory_mb = self.calculate_memory_estimate(
             &query_structure,
@@ -366,7 +374,7 @@ impl DataSizer {
             effective_row_count,
             estimated_read_bytes,
         );
-        
+
         let total_mb = total_bytes / (1024 * 1024);
         let estimation_method = sources
             .first()
@@ -376,13 +384,17 @@ impl DataSizer {
         QuerySizeEstimate {
             total_bytes,
             total_mb,
-            row_count: if total_rows > 0 { Some(total_rows) } else { None },
+            row_count: if total_rows > 0 {
+                Some(total_rows)
+            } else {
+                None
+            },
             effective_row_count,
             column_count: all_columns.len().try_into().ok(),
             selected_column_count,
-            row_group_count: sources.first().and_then(|s| {
-                self.cache.get(&s.path).map(|c| c.row_group_count)
-            }),
+            row_group_count: sources
+                .first()
+                .and_then(|s| self.cache.get(&s.path).map(|c| c.row_group_count)),
             sources,
             estimated_read_bytes,
             estimated_memory_mb,
@@ -411,9 +423,10 @@ impl DataSizer {
 
         for col in columns {
             let col_name_lower = col.name.to_lowercase();
-            let is_selected = query.selected_columns.iter().any(|s| {
-                s.to_lowercase() == col_name_lower
-            });
+            let is_selected = query
+                .selected_columns
+                .iter()
+                .any(|s| s.to_lowercase() == col_name_lower);
 
             if is_selected {
                 selected_size += col.compressed_size;
@@ -474,7 +487,10 @@ impl DataSizer {
                 // Skip if column is pruned
                 if !query.is_select_star && !query.selected_columns.is_empty() {
                     let col_lower = col.name.to_lowercase();
-                    let is_selected = query.selected_columns.iter().any(|s| s.to_lowercase() == col_lower);
+                    let is_selected = query
+                        .selected_columns
+                        .iter()
+                        .any(|s| s.to_lowercase() == col_lower);
                     if !is_selected {
                         continue;
                     }
@@ -550,7 +566,10 @@ impl DataSizer {
         // Check cache first
         if let Some(cached) = self.cache.get(path) {
             if !cached.is_expired(self.cache_ttl) {
-                debug!("Cache hit for {}: {} bytes, {} rows", path, cached.size_bytes, cached.row_count);
+                debug!(
+                    "Cache hit for {}: {} bytes, {} rows",
+                    path, cached.size_bytes, cached.row_count
+                );
                 return DataSource {
                     path: path.to_string(),
                     size_bytes: cached.size_bytes,
@@ -569,7 +588,9 @@ impl DataSizer {
                     if let Ok(metadata) = self.read_parquet_metadata(client, &bucket, &key).await {
                         info!(
                             "Parquet footer read: {} rows, {} columns, {} row groups",
-                            metadata.row_count, metadata.columns.len(), metadata.row_group_count
+                            metadata.row_count,
+                            metadata.columns.len(),
+                            metadata.row_group_count
                         );
 
                         // Cache the metadata
@@ -578,7 +599,8 @@ impl DataSizer {
                         // Record metrics
                         crate::metrics::DATA_ROW_COUNT.observe(metadata.row_count as f64);
                         crate::metrics::DATA_COLUMN_COUNT.observe(metadata.columns.len() as f64);
-                        crate::metrics::DATA_ROW_GROUP_COUNT.observe(metadata.row_group_count as f64);
+                        crate::metrics::DATA_ROW_GROUP_COUNT
+                            .observe(metadata.row_group_count as f64);
 
                         return DataSource {
                             path: path.to_string(),
@@ -609,7 +631,7 @@ impl DataSizer {
                             source_type: self.detect_source_type(path),
                             estimation_method: EstimationMethod::S3Head,
                             row_count: Some(estimated_rows),
-            column_count: None,
+                            column_count: None,
                         };
                     }
                 }
@@ -654,7 +676,7 @@ impl DataSizer {
 
         if tail_bytes.len() < 8 {
             anyhow::bail!("Footer too small");
-            }
+        }
 
         // Check magic bytes "PAR1" at the end
         if &tail_bytes[tail_bytes.len() - 4..] != b"PAR1" {
@@ -668,7 +690,10 @@ impl DataSizer {
                 .context("Failed to read footer length")?,
         ) as u64;
 
-        debug!("Parquet file {} has metadata size: {} bytes", key, metadata_len);
+        debug!(
+            "Parquet file {} has metadata size: {} bytes",
+            key, metadata_len
+        );
 
         // Step 2: Read the full footer (metadata + 8 byte tail)
         let footer_size = metadata_len + 8;
@@ -691,7 +716,7 @@ impl DataSizer {
             anyhow::bail!("Footer bytes too small");
         }
         let metadata_bytes = &footer_bytes[..footer_bytes.len() - 8];
-                
+
         // Parse using ParquetMetaDataReader
         let metadata = ParquetMetaDataReader::decode_metadata(metadata_bytes)
             .context("Failed to decode Parquet metadata")?;
@@ -752,7 +777,7 @@ impl DataSizer {
     /// Estimate row count from file size (fallback)
     fn estimate_rows_from_size(&self, size_bytes: u64, path: &str) -> u64 {
         let path_lower = path.to_lowercase();
-        
+
         // Use known schemas for better estimates
         let bytes_per_row = if path_lower.contains("lineitem") {
             53 // TPC-H lineitem average
@@ -796,7 +821,7 @@ impl DataSizer {
 
     fn default_size_estimate(&self, path: &str) -> u64 {
         let path_lower = path.to_lowercase();
-        
+
         // Check for size hints in filename
         if let Some(size) = self.extract_size_from_filename(&path_lower) {
             return size;
@@ -814,21 +839,21 @@ impl DataSizer {
 
     fn extract_size_from_filename(&self, path: &str) -> Option<u64> {
         let size_regex = Regex::new(r"(\d+)\s*(mb|gb|tb)").ok()?;
-        
+
         if let Some(caps) = size_regex.captures(path) {
             let num: u64 = caps.get(1)?.as_str().parse().ok()?;
             let unit = caps.get(2)?.as_str();
-            
+
             let bytes = match unit {
                 "mb" => num * 1024 * 1024,
                 "gb" => num * 1024 * 1024 * 1024,
                 "tb" => num * 1024 * 1024 * 1024 * 1024,
                 _ => return None,
             };
-            
+
             return Some(bytes);
         }
-        
+
         None
     }
 
@@ -848,13 +873,17 @@ mod tests {
         let result = sizer.parse_sql("SELECT * FROM read_parquet('s3://bucket/file.parquet')");
 
         assert!(result.is_select_star);
-        assert!(result.tables.contains(&"s3://bucket/file.parquet".to_string()));
+        assert!(result
+            .tables
+            .contains(&"s3://bucket/file.parquet".to_string()));
     }
 
     #[test]
     fn test_parse_sql_with_columns() {
         let sizer = create_test_sizer();
-        let result = sizer.parse_sql("SELECT l_orderkey, l_quantity FROM read_parquet('s3://bucket/lineitem.parquet')");
+        let result = sizer.parse_sql(
+            "SELECT l_orderkey, l_quantity FROM read_parquet('s3://bucket/lineitem.parquet')",
+        );
 
         assert!(!result.is_select_star);
         assert!(result.selected_columns.contains(&"l_orderkey".to_string()));

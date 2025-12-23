@@ -147,8 +147,11 @@ impl ApiKeyValidator {
             .as_nanos();
         let hash = blake3::hash(&timestamp.to_le_bytes());
         bytes.copy_from_slice(hash.as_bytes());
-        
-        format!("tvn_{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+
+        format!(
+            "tvn_{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        )
     }
 }
 
@@ -180,8 +183,7 @@ mod tests {
     fn test_api_key_validation() {
         let mut validator = ApiKeyValidator::new();
         let key = "test_api_key_12345";
-        let identity = UserIdentity::new("user1".into(), "tenant1".into())
-            .with_scope(scopes::READ);
+        let identity = UserIdentity::new("user1".into(), "tenant1".into()).with_scope(scopes::READ);
 
         validator.register_key(key, identity.clone());
 
@@ -212,4 +214,3 @@ mod tests {
         assert!(key.len() > 40);
     }
 }
-

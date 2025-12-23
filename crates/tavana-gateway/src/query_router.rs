@@ -29,9 +29,15 @@ pub enum QueryTarget {
     /// Route to HPA+VPA managed shared worker pool (default service)
     WorkerPool,
     /// Route to a specific pre-sized worker (pod IP)
-    PreSizedWorker { address: String, worker_name: String },
+    PreSizedWorker {
+        address: String,
+        worker_name: String,
+    },
     /// Route to tenant's dedicated worker pool
-    TenantPool { tenant_id: String, service_addr: String },
+    TenantPool {
+        tenant_id: String,
+        service_addr: String,
+    },
 }
 
 /// Estimated query resources
@@ -89,7 +95,7 @@ impl QueryRouter {
     }
 
     /// Analyze, pre-size, and route a query
-    /// 
+    ///
     /// Routing priority:
     /// 1. If tenant_id provided and tenant has dedicated pool → TenantPool
     /// 2. If tenant_id provided and query is large → Create tenant pool
@@ -117,7 +123,9 @@ impl QueryRouter {
         for source in &size_estimate.sources {
             metrics::record_estimation_method(match source.estimation_method {
                 EstimationMethod::S3Head => "s3_head",
-                EstimationMethod::ParquetFooter | EstimationMethod::ParquetMetadata => "parquet_metadata",
+                EstimationMethod::ParquetFooter | EstimationMethod::ParquetMetadata => {
+                    "parquet_metadata"
+                }
                 EstimationMethod::DeltaLog => "delta_log",
                 EstimationMethod::IcebergManifest => "iceberg_manifest",
                 EstimationMethod::Cached => "cached",
@@ -143,7 +151,10 @@ impl QueryRouter {
                             "Pre-sized worker {} to {}MB for query (data={}MB, resized={})",
                             worker.name, worker.memory_mb, size_estimate.total_mb, worker.resized
                         );
-                        metrics::record_query_routed("presized_worker", size_estimate.total_mb as f64);
+                        metrics::record_query_routed(
+                            "presized_worker",
+                            size_estimate.total_mb as f64,
+                        );
                         (
                             QueryTarget::PreSizedWorker {
                                 address: worker.address,
@@ -154,20 +165,35 @@ impl QueryRouter {
                         )
                     }
                     Err(e) => {
-                        warn!("Failed to get pre-sized worker: {}, falling back to pool", e);
+                        warn!(
+                            "Failed to get pre-sized worker: {}, falling back to pool",
+                            e
+                        );
                         metrics::record_query_routed("worker_pool", size_estimate.total_mb as f64);
-                        (QueryTarget::WorkerPool, size_estimate.estimated_memory_mb, false)
+                        (
+                            QueryTarget::WorkerPool,
+                            size_estimate.estimated_memory_mb,
+                            false,
+                        )
                     }
                 }
             } else {
                 // Pre-sizing disabled
                 metrics::record_query_routed("worker_pool", size_estimate.total_mb as f64);
-                (QueryTarget::WorkerPool, size_estimate.estimated_memory_mb, false)
+                (
+                    QueryTarget::WorkerPool,
+                    size_estimate.estimated_memory_mb,
+                    false,
+                )
             }
         } else {
             // No pool manager
             metrics::record_query_routed("worker_pool", size_estimate.total_mb as f64);
-            (QueryTarget::WorkerPool, size_estimate.estimated_memory_mb, false)
+            (
+                QueryTarget::WorkerPool,
+                size_estimate.estimated_memory_mb,
+                false,
+            )
         };
 
         let estimate = QueryEstimate {
@@ -190,7 +216,8 @@ impl QueryRouter {
             estimate.estimation_method,
             match &estimate.target {
                 QueryTarget::WorkerPool => "WorkerPool".to_string(),
-                QueryTarget::PreSizedWorker { worker_name, .. } => format!("PreSized({})", worker_name),
+                QueryTarget::PreSizedWorker { worker_name, .. } =>
+                    format!("PreSized({})", worker_name),
                 QueryTarget::TenantPool { tenant_id, .. } => format!("TenantPool({})", tenant_id),
             },
             estimate.was_resized
@@ -306,9 +333,15 @@ impl QueryRouter {
 
     fn estimate_cpu_cores(&self, data_size_mb: u64, has_join: bool, has_aggregation: bool) -> f32 {
         let mut cores: f32 = 1.0;
-        if data_size_mb > 1000 { cores += 1.0; }
-        if has_join { cores += 1.0; }
-        if has_aggregation { cores += 0.5; }
+        if data_size_mb > 1000 {
+            cores += 1.0;
+        }
+        if has_join {
+            cores += 1.0;
+        }
+        if has_aggregation {
+            cores += 0.5;
+        }
         cores.min(8.0)
     }
 
@@ -331,8 +364,12 @@ impl QueryRouter {
 
     fn estimate_memory(&self, data_size_mb: u64, has_join: bool, has_aggregation: bool) -> u64 {
         let mut multiplier = 2.0;
-        if has_join { multiplier *= 1.5; }
-        if has_aggregation { multiplier *= 1.2; }
+        if has_join {
+            multiplier *= 1.5;
+        }
+        if has_aggregation {
+            multiplier *= 1.2;
+        }
         let memory = (data_size_mb as f64 * multiplier) as u64;
         memory.max(256)
     }
@@ -341,7 +378,11 @@ impl QueryRouter {
         let sql_upper = sql.to_uppercase();
         if let Some(pos) = sql_upper.find("LIMIT") {
             let after = &sql[pos + 5..];
-            let num_str: String = after.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+            let num_str: String = after
+                .trim()
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
             return num_str.parse().ok();
         }
         None
