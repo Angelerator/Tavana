@@ -1,0 +1,169 @@
+# Tavana Helm Chart - Nokia TECH Non-Production Environment
+# Pre-configured for: tech-patenting-dev-rg / tech-nprd-patb-aks-we
+
+# Global settings
+global:
+  namespace: tavana
+  # Using existing ACR (same as Dagster)
+  imageRegistry: "acrzagrosdagsterdev.azurecr.io"
+  imagePullPolicy: Always
+  imageTag: "v1.0.0"
+
+# ACR pull secret (create with: kubectl create secret docker-registry acr-secret ...)
+imagePullSecrets:
+  - name: acr-secret
+
+# Gateway settings
+gateway:
+  enabled: true
+  replicaCount: 2
+  image:
+    repository: tavana-gateway
+    tag: "v1.0.0"
+  
+  service:
+    type: ClusterIP
+    pgPort: 15432
+    httpPort: 8080
+  
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "2Gi"
+      cpu: "1000m"
+
+# Worker settings
+worker:
+  enabled: true
+  replicaCount: 2
+  minReplicas: 2
+  maxReplicas: 10
+  image:
+    repository: tavana-worker
+    tag: "v1.0.0"
+  
+  resources:
+    requests:
+      memory: "2Gi"      # Matches LimitRange minimum
+      cpu: "500m"
+    limits:
+      memory: "8Gi"
+      cpu: "2000m"
+
+# HPA
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# Object Storage - Azure Data Lake Storage Gen2
+# Configure customer's ADLS endpoint
+objectStorage:
+  # Option 1: S3-compatible endpoint (if enabled on storage account)
+  # endpoint: "https://STORAGE_ACCOUNT.blob.core.windows.net"
+  # bucket: "data-lake"
+  
+  # Option 2: Use Azure native SDK (via env vars)
+  # Set these env vars on gateway/worker pods:
+  # - AZURE_STORAGE_ACCOUNT_NAME
+  # - AZURE_STORAGE_ACCOUNT_KEY (or use Workload Identity)
+  endpoint: ""
+  bucket: ""
+
+# Service Account with Azure Workload Identity
+serviceAccount:
+  create: true
+  name: "tavana"
+  annotations:
+    # Enable Workload Identity (configure managed identity separately)
+    azure.workload.identity/client-id: ""
+
+# Pod labels for Workload Identity
+podLabels:
+  azure.workload.identity/use: "true"
+
+# Security (matches tech-patenting-dev-rg PSS requirements)
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# Network Policies (matches Dagster environment)
+networkPolicies:
+  enabled: true
+  egressCIDRs:
+    - 13.69.0.0/16      # West Europe
+    - 13.73.0.0/16      # West Europe
+    - 20.50.0.0/16      # West Europe
+    - 20.170.0.0/16     # Germany North
+    - 40.68.0.0/16      # West Europe
+    - 51.116.0.0/16     # Germany North
+    - 168.63.0.0/16     # Azure Wire Server
+    - 100.64.0.0/10     # Azure Private Link
+    - 10.0.0.0/8        # Private network
+
+# Ingress via Application Gateway (tech-nprd-patb-agic-we)
+ingress:
+  enabled: true
+  className: "azure/application-gateway"
+  annotations:
+    appgw.ingress.kubernetes.io/ssl-redirect: "true"
+    appgw.ingress.kubernetes.io/connection-draining: "true"
+    appgw.ingress.kubernetes.io/connection-draining-timeout: "30"
+    appgw.ingress.kubernetes.io/request-timeout: "300"
+    appgw.ingress.kubernetes.io/backend-protocol: "http"
+    appgw.ingress.kubernetes.io/health-probe-path: "/health"
+    appgw.ingress.kubernetes.io/health-probe-interval: "30"
+    appgw.ingress.kubernetes.io/health-probe-timeout: "5"
+  hosts:
+    - host: tavana-dev.int.nokia.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: tavana-tls-secret
+      hosts:
+        - tavana-dev.int.nokia.com
+
+# Monitoring (enable when Prometheus is available)
+monitoring:
+  prometheus:
+    enabled: false
+
+# RBAC
+rbac:
+  create: true
+
+# Pod Disruption Budgets
+podDisruptionBudget:
+  gateway:
+    enabled: true
+    minAvailable: 1
+  worker:
+    enabled: true
+    maxUnavailable: 1
+
+# Common labels
+commonLabels:
+  app.kubernetes.io/name: tavana
+  app.kubernetes.io/instance: tavana-dev
+  app.kubernetes.io/managed-by: Helm
+  environment: dev
+  project: patenting
+
