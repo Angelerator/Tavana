@@ -1,14 +1,7 @@
 name: Security
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'Dockerfile.*'
-      - '.github/workflows/security.yaml'
+  # Only run on PRs and scheduled scans, not on direct pushes
   pull_request:
     branches: [main]
     paths:
