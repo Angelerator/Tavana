@@ -1,6 +1,6 @@
 apiVersion: v2
 name: tavana
-description: Cloud-Agnostic Auto-Scaling DuckDB Query Platform - Community Edition
+description: Cloud-Agnostic Auto-Scaling DuckDB Query Platform
 
 type: application
 version: 1.0.0
@@ -14,14 +14,16 @@ keywords:
   - kubernetes
   - cloud-agnostic
   - auto-scaling
+  - serverless
 
 home: https://github.com/Angelerator/Tavana
 sources:
   - https://github.com/Angelerator/Tavana
 
-maintainers:
-  - name: Alireza Ghaffari
-    email: alireza.ghaffari@nokia.com
+icon: https://raw.githubusercontent.com/Angelerator/Tavana/main/docs/logo.png
 
-# No external dependencies for Community Edition
-# All components are self-contained
+annotations:
+  # Artifact Hub annotations
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/category: database
+  artifacthub.io/operator: "false"

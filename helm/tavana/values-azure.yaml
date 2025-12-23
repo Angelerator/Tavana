@@ -1,25 +1,36 @@
-# Tavana Helm Chart - Azure Values (Community Edition)
-# For deployment to Azure Kubernetes Service (AKS)
+# Tavana Helm Chart - Azure Values Template
+# Cloud-Agnostic Auto-Scaling DuckDB Query Platform
+#
+# This file provides Azure-specific defaults. Copy and customize for your environment:
+#   cp values-azure.yaml my-values.yaml
+#   # Edit my-values.yaml with your settings
+#   helm install tavana ./helm/tavana -f my-values.yaml
 
-# Global settings - CUSTOMIZE FOR YOUR ENVIRONMENT
+# Global settings
 global:
   namespace: tavana
-  # Use customer's ACR (private registry, no internet needed)
-  imageRegistry: "YOUR_ACR_NAME.azurecr.io"
+  # Container registry - use your private ACR
+  # Example: myacr.azurecr.io
+  imageRegistry: ""  # REQUIRED: Set to your ACR login server
   imagePullPolicy: Always
   imageTag: "v1.0.0"
 
-# ACR pull secret
+# Private registry credentials
+# Create with: kubectl create secret docker-registry acr-secret --docker-server=... -n tavana
 imagePullSecrets:
   - name: acr-secret
 
-# Gateway settings
+# Gateway configuration
 gateway:
   enabled: true
   replicaCount: 2
   image:
     repository: tavana-gateway
-    tag: "v1.0.0"
+  
+  service:
+    type: ClusterIP
+    pgPort: 15432
+    httpPort: 8080
   
   resources:
     requests:
@@ -29,7 +40,7 @@ gateway:
       memory: "2Gi"
       cpu: "1000m"
 
-# Worker settings
+# Worker configuration
 worker:
   enabled: true
   replicaCount: 2
@@ -37,7 +48,6 @@ worker:
   maxReplicas: 20
   image:
     repository: tavana-worker
-    tag: "v1.0.0"
   
   resources:
     requests:
@@ -47,17 +57,25 @@ worker:
       memory: "8Gi"
       cpu: "4000m"
 
-# Azure Blob Storage (S3-compatible API)
-# Option 1: Use Azure Blob with S3 API (requires storage account with hierarchical namespace)
-# Option 2: Use Azure Blob with native SDK (configure via env vars)
+# HPA configuration
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+# Azure Blob Storage / ADLS Gen2 (S3-compatible API)
+# Option 1: Storage account with hierarchical namespace (ADLS Gen2)
+# Option 2: Azure Blob with S3 compatibility layer
 objectStorage:
-  # Azure Blob S3-compatible endpoint
-  endpoint: "https://YOUR_STORAGE_ACCOUNT.blob.core.windows.net"
-  bucket: "your-data-container"
+  # Storage endpoint (leave empty to use Azure SDK with Workload Identity)
+  endpoint: ""
+  bucket: ""
   region: "westeurope"
   pathStyle: false
-  # Use existingSecret for credentials
-  existingSecret: "azure-storage-secret"
+  # Use Kubernetes secret for credentials
+  existingSecret: ""
   existingSecretAccessKeyIdKey: "storage-account-name"
   existingSecretSecretAccessKeyKey: "storage-account-key"
 
@@ -66,14 +84,14 @@ serviceAccount:
   create: true
   name: "tavana"
   annotations:
-    # Azure Workload Identity (recommended for production)
-    azure.workload.identity/client-id: "YOUR_MANAGED_IDENTITY_CLIENT_ID"
+    # Azure Workload Identity - set your managed identity client ID
+    azure.workload.identity/client-id: ""
 
 # Pod labels for Workload Identity
 podLabels:
   azure.workload.identity/use: "true"
 
-# Security (matches customer's PSS requirements)
+# Security (Azure Policy / PSS compliant)
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
@@ -91,17 +109,17 @@ containerSecurityContext:
     drop:
       - ALL
 
-# Network Policies (restrict egress to Azure services)
+# Network Policies
 networkPolicies:
   enabled: true
-  # Azure service CIDRs (customize for your region)
+  # Azure service CIDRs - customize for your region
+  # Find your region's CIDRs: https://azureipranges.azurewebsites.net/
   egressCIDRs:
-    - 13.69.0.0/16      # West Europe
-    - 20.50.0.0/16      # West Europe
-    - 168.63.0.0/16     # Azure Wire Server
-    - 10.0.0.0/8        # Private network
+    - 10.0.0.0/8         # Private network (VNet)
+    - 100.64.0.0/10      # Azure Private Link
+    - 168.63.0.0/16      # Azure platform services
 
-# Ingress via Azure Application Gateway
+# Ingress via Azure Application Gateway (AGIC)
 ingress:
   enabled: true
   className: "azure/application-gateway"
@@ -113,16 +131,16 @@ ingress:
     appgw.ingress.kubernetes.io/backend-protocol: "http"
     appgw.ingress.kubernetes.io/health-probe-path: "/health"
   hosts:
-    - host: tavana.YOUR_DOMAIN.com
+    - host: ""  # REQUIRED: Set your hostname (e.g., tavana.example.com)
       paths:
         - path: /
           pathType: Prefix
   tls:
     - secretName: tavana-tls
       hosts:
-        - tavana.YOUR_DOMAIN.com
+        - ""  # REQUIRED: Same as hosts[0].host
 
-# Monitoring (optional - enable if Prometheus operator is installed)
+# Monitoring
 monitoring:
   prometheus:
     enabled: false
@@ -141,4 +159,3 @@ podDisruptionBudget:
   worker:
     enabled: true
     maxUnavailable: 1
-
