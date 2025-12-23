@@ -3,8 +3,24 @@ name: CI
 on:
   push:
     branches: [main, develop]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+      - 'LICENSE'
+      - 'CONTRIBUTING.md'
+      - '**.sh'
+      - 'gitops-template/**'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+      - 'LICENSE'
+      - 'CONTRIBUTING.md'
+      - '**.sh'
+      - 'gitops-template/**'
 
 env:
   CARGO_TERM_COLOR: always
