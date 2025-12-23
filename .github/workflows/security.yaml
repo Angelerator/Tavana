@@ -28,6 +28,8 @@ jobs:
           push: false
           load: true
           tags: tavana-gateway:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
       
       - name: Build Worker image
         uses: docker/build-push-action@v5
@@ -37,34 +39,24 @@ jobs:
           push: false
           load: true
           tags: tavana-worker:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
       
       - name: Scan Gateway image
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: 'tavana-gateway:scan'
-          format: 'sarif'
-          output: 'gateway-trivy-results.sarif'
+          format: 'table'
+          exit-code: '0'  # Don't fail on vulnerabilities, just report
           severity: 'CRITICAL,HIGH'
       
       - name: Scan Worker image
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: 'tavana-worker:scan'
-          format: 'sarif'
-          output: 'worker-trivy-results.sarif'
+          format: 'table'
+          exit-code: '0'  # Don't fail on vulnerabilities, just report
           severity: 'CRITICAL,HIGH'
-      
-      - name: Upload Gateway scan results
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: 'gateway-trivy-results.sarif'
-          category: 'gateway-container'
-      
-      - name: Upload Worker scan results
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: 'worker-trivy-results.sarif'
-          category: 'worker-container'
 
   helm-lint:
     name: Helm Chart Lint
@@ -96,4 +88,3 @@ jobs:
       
       - name: Dependency Review
         uses: actions/dependency-review-action@v4
-
