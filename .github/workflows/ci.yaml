@@ -1,18 +1,9 @@
 name: CI
 
 on:
-  push:
-    branches: [main, develop]
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.gitignore'
-      - 'LICENSE'
-      - 'CONTRIBUTING.md'
-      - '**.sh'
-      - 'gitops-template/**'
+  # Only run on PRs, not on direct pushes to main
   pull_request:
-    branches: [main]
+    branches: [main, develop]
     paths-ignore:
       - '**.md'
       - 'docs/**'
