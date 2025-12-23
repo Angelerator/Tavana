@@ -1,0 +1,99 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run daily at midnight
+    - cron: '0 0 * * *'
+
+jobs:
+  trivy-scan:
+    name: Trivy Container Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Build Gateway image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.gateway
+          push: false
+          load: true
+          tags: tavana-gateway:scan
+      
+      - name: Build Worker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.worker
+          push: false
+          load: true
+          tags: tavana-worker:scan
+      
+      - name: Scan Gateway image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'tavana-gateway:scan'
+          format: 'sarif'
+          output: 'gateway-trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+      
+      - name: Scan Worker image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'tavana-worker:scan'
+          format: 'sarif'
+          output: 'worker-trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+      
+      - name: Upload Gateway scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'gateway-trivy-results.sarif'
+          category: 'gateway-container'
+      
+      - name: Upload Worker scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'worker-trivy-results.sarif'
+          category: 'worker-container'
+
+  helm-lint:
+    name: Helm Chart Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.14.0'
+      
+      - name: Lint Helm chart
+        run: helm lint helm/tavana
+      
+      - name: Template validation
+        run: |
+          helm template tavana helm/tavana -f helm/tavana/values.yaml > /dev/null
+          helm template tavana helm/tavana -f helm/tavana/values-azure.yaml > /dev/null
+
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+

@@ -1,0 +1,30 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#                     TAVANA - Enterprise Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+# Copy this file to terraform.tfvars and fill in your values.
+# terraform.tfvars is gitignored for security.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Required: Your Azure Subscription ID
+subscription_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# Project settings
+project_name = "tavana"
+environment  = "prod"
+location     = "westeurope"
+
+# Tags
+owner_email      = "platform-team@company.com"
+cost_center      = "PLATFORM-001"
+compliance_level = "SOC2"
+
+# ACR geo-replication (for Premium SKU)
+acr_geo_replication_locations = ["northeurope", "eastus"]
+
+# ArgoCD hostname (requires DNS configuration)
+argocd_hostname = "argocd.tavana.company.com"
+
+# DNS Zone (optional, for automatic DNS record creation)
+dns_zone_name           = "tavana.company.com"
+dns_zone_resource_group = "dns-rg"
+

@@ -1,51 +1,77 @@
 # Rust
 /target/
-**/*.rs.bk
 Cargo.lock
-
-# Node/Frontend
-frontend/node_modules/
-frontend/dist/
-frontend/.vite/
+**/*.rs.bk
+*.pdb
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
+
+# OS
 .DS_Store
+Thumbs.db
 
 # Environment
 .env
 .env.local
 .env.*.local
 
+# Terraform
+terraform/.terraform/
+terraform/**/.terraform/
+terraform/*.tfstate
+terraform/**/*.tfstate
+terraform/*.tfstate.*
+terraform/**/*.tfstate.*
+terraform/*.tfplan
+terraform/**/*.tfplan
+terraform/*.tfvars
+terraform/**/*.tfvars
+!terraform/**/*.tfvars.example
+terraform/.terraform.lock.hcl
+terraform/**/.terraform.lock.hcl
+terraform/crash.log
+
+# Kubernetes
+*.kubeconfig
+kubeconfig
+kubeconfig.yaml
+
+# Helm
+helm/**/*.tgz
+
 # Logs
 *.log
 logs/
 
 # Build artifacts
-*.exe
-*.dll
-*.so
-*.dylib
+dist/
+build/
 
-# Kubernetes secrets (keep templates)
-k8s/secrets/
+# Test coverage
+coverage/
+*.cover
+*.coverage
+
+# Generated files
+*.generated.*
+
+# Secrets (never commit)
+secrets/
 *.pem
 *.key
 *.crt
-
-# Local data
-data/
-exports/
-*.duckdb
-*.parquet
+id_rsa*
+*.p12
 
 # Docker
-.docker/
+docker-compose.override.yml
 
-# Temporary
+# Temporary files
 tmp/
 temp/
-cookies.txt
+*.tmp
