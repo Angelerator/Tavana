@@ -1,10 +1,10 @@
 apiVersion: v2
 name: tavana
-description: Cloud-Agnostic Auto-Scaling DuckDB Query Platform
+description: Cloud-Agnostic Auto-Scaling DuckDB Query Platform - Community Edition
 
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 1.0.0
+appVersion: "1.0.0"
 
 keywords:
   - duckdb
@@ -13,18 +13,15 @@ keywords:
   - data-lake
   - kubernetes
   - cloud-agnostic
+  - auto-scaling
 
-home: https://github.com/tavana/tavana
+home: https://github.com/Angelerator/Tavana
 sources:
-  - https://github.com/tavana/tavana
+  - https://github.com/Angelerator/Tavana
 
 maintainers:
-  - name: Tavana Team
-    email: team@tavana.io
+  - name: Alireza Ghaffari
+    email: user@example.com
 
-dependencies:
-  - name: postgresql
-    version: "~15.0.0"
-    repository: "https://charts.bitnami.com/bitnami"
-    condition: postgresql.enabled
-
+# No external dependencies for Community Edition
+# All components are self-contained
