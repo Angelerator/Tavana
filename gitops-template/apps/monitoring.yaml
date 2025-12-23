@@ -1,0 +1,70 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#                     TAVANA - Monitoring Stack (Optional)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Deploys Prometheus + Grafana for Tavana observability.
+# Remove this file if using Azure Monitor instead.
+# ═══════════════════════════════════════════════════════════════════════════════
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring
+  namespace: argocd
+spec:
+  project: default
+  
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: "56.6.2"
+    
+    helm:
+      values: |
+        prometheus:
+          prometheusSpec:
+            serviceMonitorSelector:
+              matchLabels:
+                app.kubernetes.io/part-of: tavana
+            retention: 15d
+            resources:
+              requests:
+                memory: 1Gi
+              limits:
+                memory: 2Gi
+        
+        grafana:
+          adminPassword: "changeme"  # Change in production!
+          persistence:
+            enabled: true
+            size: 10Gi
+          dashboardProviders:
+            dashboardproviders.yaml:
+              apiVersion: 1
+              providers:
+                - name: 'tavana'
+                  orgId: 1
+                  folder: 'Tavana'
+                  type: file
+                  disableDeletion: false
+                  editable: true
+                  options:
+                    path: /var/lib/grafana/dashboards/tavana
+          dashboards:
+            tavana:
+              tavana-overview:
+                gnetId: 00000  # Replace with actual Grafana dashboard ID
+                datasource: Prometheus
+        
+        alertmanager:
+          enabled: true
+  
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+

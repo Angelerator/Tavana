@@ -2,224 +2,209 @@
 
 **Cloud-Agnostic Auto-Scaling DuckDB Query Platform**
 
-Tavana is a cloud-agnostic Kubernetes application that hosts DuckDB instances for executing analytical queries on remote object storage data (S3, ADLS, GCS). It automatically estimates required resources per query and creates appropriately-sized pods for execution.
+Tavana is a production-ready Kubernetes application that hosts DuckDB instances for executing analytical queries on remote object storage data (S3, ADLS, GCS). It automatically scales resources based on query demand and workload complexity.
 
-## Features
+## ✨ Features
 
-- **Cloud Agnostic**: Deploy on AWS, Azure, GCP, or any Kubernetes cluster
-- **Auto-Scaling**: Intelligent per-query pod sizing based on data and query complexity
-- **Multiple Protocols**: 
-  - PostgreSQL wire protocol (for Tableau, PowerBI)
-  - Arrow Flight SQL (for Python, Polars, DuckDB)
-  - REST API (for management)
-- **Unity Catalog Compatible**: Standard catalog API for integration with data ecosystem tools
-- **Secure by Default**: TLS everywhere, API Key & OIDC authentication
-- **Observable**: Full OpenTelemetry integration (traces, metrics, logs)
-- **Fine-grained Billing**: Comprehensive usage metering for BYOC deployments
+- **Cloud Agnostic**: Deploy on Azure, AWS, GCP, or any Kubernetes cluster
+- **Auto-Scaling**: Intelligent HPA + VPA scaling based on queue depth and resource usage
+- **PostgreSQL Compatible**: Connect with Tableau, PowerBI, DBeaver, psql
+- **Smart Queuing**: FIFO queue with capacity-aware scheduling
+- **GitOps Ready**: Terraform + ArgoCD deployment
+- **Secure by Default**: Pod security, network policies, workload identity
+- **Observable**: Prometheus metrics, Grafana dashboards
 
-## Architecture
+## 🏗️ Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                              Client Layer                                 │
-├────────────────┬─────────────────────┬──────────────────────────────────-┤
-│  Tableau/PBI   │   Python/Polars     │     Management UI                 │
-│  (PostgreSQL)  │   (Flight SQL)      │     (REST API)                    │
-└───────┬────────┴─────────┬───────────┴─────────────┬────────────────────-┘
-        │                  │                         │
-        └──────────────────┼─────────────────────────┘
-                           │
-                           ▼
-              ┌────────────────────────┐
-              │    tavana-gateway      │
-              │  (Query Entry Point)   │
-              └───────────┬────────────┘
-                          │ gRPC
-          ┌───────────────┼───────────────┐
-          │               │               │
-          ▼               ▼               ▼
-┌─────────────────┐  ┌─────────────┐  ┌──────────────────┐
-│ tavana-catalog  │  │  tavana-    │  │ tavana-metering  │
-│ (Metadata)      │  │  operator   │  │ (Usage Tracking) │
-└─────────────────┘  │ (K8s CRD)   │  └──────────────────┘
-                     └──────┬──────┘
-                            │ Creates Pods
-                            ▼
-              ┌─────────────────────────┐
-              │    Worker Pods          │
-              │  ┌─────┐ ┌─────┐       │
-              │  │DuckDB│ │DuckDB│ ...  │
-              │  └─────┘ └─────┘       │
-              └──────────┬──────────────┘
-                         │
-                         ▼
-              ┌─────────────────────────┐
-              │   Object Storage        │
-              │  S3 / ADLS / GCS        │
-              └─────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                              CLIENT LAYER                                       │
+│    Tableau / PowerBI / DBeaver / psql (PostgreSQL Wire Protocol)               │
+└─────────────────────────────────────┬──────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                           KUBERNETES CLUSTER                                    │
+│  ┌──────────────────────────────────────────────────────────────────────────┐  │
+│  │                           TAVANA NAMESPACE                                │  │
+│  │                                                                           │  │
+│  │   ┌─────────────────────────────────────────────────────────────────┐    │  │
+│  │   │                        GATEWAY (2+ pods)                         │    │  │
+│  │   │   • PostgreSQL Wire Protocol (port 5432)                        │    │  │
+│  │   │   • Smart Query Queue (FIFO, capacity-aware)                    │    │  │
+│  │   │   • Worker Pool Management                                       │    │  │
+│  │   │   • Prometheus Metrics                                           │    │  │
+│  │   └─────────────────────────────────┬───────────────────────────────┘    │  │
+│  │                                     │ gRPC                               │  │
+│  │                                     ▼                                    │  │
+│  │   ┌─────────────────────────────────────────────────────────────────┐    │  │
+│  │   │                      WORKERS (2-20 pods, HPA)                    │    │  │
+│  │   │   • DuckDB Query Execution                                       │    │  │
+│  │   │   • Streaming Results                                            │    │  │
+│  │   │   • VPA Resource Resizing                                        │    │  │
+│  │   │   • Pre-installed Parquet/HTTPFS Extensions                      │    │  │
+│  │   └─────────────────────────────────┬───────────────────────────────┘    │  │
+│  │                                     │                                    │  │
+│  └─────────────────────────────────────┼────────────────────────────────────┘  │
+│                                        │                                       │
+└────────────────────────────────────────┼───────────────────────────────────────┘
+                                         │
+                                         ▼
+                     ┌─────────────────────────────────────┐
+                     │         OBJECT STORAGE              │
+                     │     S3 / ADLS Gen2 / GCS            │
+                     └─────────────────────────────────────┘
 ```
 
-## Components
+## 🚀 Quick Start
+
+### One-Click Deployment (Azure)
+
+```bash
+./deploy.sh --subscription-id YOUR_SUBSCRIPTION_ID --env prod
+```
+
+### Manual Deployment
+
+```bash
+# 1. Deploy infrastructure with Terraform
+cd terraform/azure/examples/quickstart
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars with your values
+terraform init && terraform apply
+
+# 2. Install with Helm
+helm install tavana oci://ghcr.io/tavana/charts/tavana \
+  --namespace tavana \
+  --create-namespace
+
+# 3. Connect
+kubectl port-forward svc/gateway -n tavana 5432:5432
+PGPASSWORD=tavana psql -h localhost -p 5432 -U tavana -d tavana
+```
+
+### Query Example
+
+```sql
+-- Query Parquet files from S3
+SELECT * FROM read_parquet('s3://my-bucket/data/*.parquet') LIMIT 100;
+
+-- Aggregation across millions of rows
+SELECT 
+    date_trunc('month', order_date) as month,
+    SUM(total_amount) as revenue
+FROM read_parquet('s3://my-bucket/orders/*.parquet')
+GROUP BY 1
+ORDER BY 1;
+```
+
+## 📦 Components
 
 | Component | Description |
 |-----------|-------------|
-| `tavana-gateway` | Query entry point supporting PG wire, Flight SQL, REST |
-| `tavana-operator` | Kubernetes operator managing DuckDBQuery CRDs and worker pods |
-| `tavana-worker` | DuckDB execution pod for running queries |
-| `tavana-catalog` | Metadata service with Unity Catalog compatible REST API |
-| `tavana-metering` | Usage tracking and billing metrics collection |
-| `tavana-common` | Shared library with types, auth, TLS, protobuf definitions |
+| `tavana-gateway` | Query entry point (PostgreSQL protocol), queue management, metrics |
+| `tavana-worker` | DuckDB query execution with auto-scaling |
+| `tavana-common` | Shared library (proto, auth, config) |
 
-## Quick Start
-
-### Prerequisites
-
-- Rust 1.75+
-- Docker
-- Kubernetes cluster (Docker Desktop, minikube, or cloud)
-- PostgreSQL 15+ (for catalog and metering)
-
-### Development Setup
-
-```bash
-# Clone the repository
-git clone https://github.com/tavana/tavana.git
-cd tavana
-
-# Build all crates
-cargo build
-
-# Run tests
-cargo test
-
-# Generate proto code
-cargo build -p tavana-common
-```
-
-### Running Locally
-
-```bash
-# Start PostgreSQL
-docker run -d --name postgres \
-  -e POSTGRES_PASSWORD=tavana \
-  -e POSTGRES_DB=tavana \
-  -p 5432:5432 \
-  postgres:15
-
-# Start the gateway
-cargo run -p tavana-gateway
-
-# Start the catalog
-DATABASE_URL=postgres://postgres:tavana@localhost:5432/tavana \
-cargo run -p tavana-catalog
-```
-
-### Deploying to Kubernetes
-
-```bash
-# Apply CRDs
-kubectl apply -f k8s/crds/
-
-# Deploy using Helm
-helm install tavana ./helm/tavana \
-  --namespace tavana \
-  --create-namespace
-```
-
-## Configuration
-
-All services are configured via environment variables:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `TLS_ENABLED` | Enable TLS for all connections | `true` |
-| `LOG_LEVEL` | Logging level (trace, debug, info, warn, error) | `info` |
-| `DATABASE_URL` | PostgreSQL connection URL | - |
-| `OTLP_ENDPOINT` | OpenTelemetry collector endpoint | - |
-
-See individual service documentation for more configuration options.
-
-## Connecting Clients
-
-### Tableau / PowerBI
-
-```
-Host: gateway.tavana.example.com
-Port: 5432
-Database: tavana
-Username: <your-user>
-Password: <your-api-key>
-SSL: Require
-```
-
-### Python with Polars
-
-```python
-import polars as pl
-
-# Using Flight SQL
-uri = "grpc+tls://gateway.tavana.example.com:8815"
-df = pl.read_database(
-    "SELECT * FROM catalog.schema.table LIMIT 1000",
-    connection=uri,
-)
-```
-
-### DuckDB
-
-```sql
--- Install the flight extension
-INSTALL flight;
-LOAD flight;
-
--- Connect to Tavana
-ATTACH 'grpc://gateway.tavana.example.com:8815' AS tavana (TYPE FLIGHT);
-
--- Query data
-SELECT * FROM tavana.catalog.schema.table;
-```
-
-## Development
-
-### Project Structure
+## 📁 Project Structure
 
 ```
 tavana/
-├── Cargo.toml              # Workspace definition
-├── proto/                  # Protocol buffer definitions
-│   └── tavana/v1/
-│       ├── common.proto
-│       ├── query.proto
-│       └── catalog.proto
+├── .github/workflows/      # CI/CD pipelines
+│   ├── ci.yaml            # Build, test, lint
+│   ├── release.yaml       # Docker & Helm publishing
+│   └── security.yaml      # Container scanning
 ├── crates/
-│   ├── tavana-common/      # Shared library
-│   ├── tavana-gateway/     # Query gateway
-│   ├── tavana-operator/    # K8s operator
-│   ├── tavana-worker/      # Query worker
-│   ├── tavana-catalog/     # Metadata service
-│   └── tavana-metering/    # Usage tracking
-├── k8s/                    # Kubernetes manifests
-└── helm/                   # Helm charts
+│   ├── tavana-gateway/    # Gateway service
+│   ├── tavana-worker/     # Worker service
+│   └── tavana-common/     # Shared library
+├── terraform/
+│   └── azure/             # Azure infrastructure module
+│       ├── main.tf
+│       ├── variables.tf
+│       ├── outputs.tf
+│       └── examples/
+│           ├── quickstart/
+│           └── enterprise/
+├── helm/
+│   └── tavana/            # Helm chart
+├── gitops-template/       # Customer GitOps config template
+├── deploy.sh              # One-click deployment script
+├── DEPLOYMENT.md          # Detailed deployment guide
+├── Dockerfile.gateway
+└── Dockerfile.worker
 ```
 
-### Running Tests
+## 🔧 Configuration
 
-```bash
-# Unit tests
-cargo test
+### Environment Variables
 
-# Integration tests (requires running services)
-cargo test --features integration
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `RUST_LOG` | Log level (trace/debug/info/warn/error) | `info` |
+| `PG_PORT` | PostgreSQL wire protocol port | `5432` |
+| `WORKER_SERVICE_NAME` | Kubernetes worker service name | `worker` |
 
-# Specific crate
-cargo test -p tavana-gateway
+### Helm Values
+
+See [helm/tavana/values.yaml](./helm/tavana/values.yaml) for all options.
+
+Key settings:
+
+```yaml
+gateway:
+  replicaCount: 2
+  resources:
+    limits:
+      memory: "4Gi"
+
+worker:
+  minReplicas: 2
+  maxReplicas: 20
+  resources:
+    limits:
+      memory: "12Gi"
 ```
 
-## License
+## 📊 Monitoring
+
+Tavana exposes Prometheus metrics at `/metrics`:
+
+| Metric | Description |
+|--------|-------------|
+| `tavana_query_queue_depth` | Queries waiting in queue |
+| `tavana_query_queue_wait_seconds` | Time queries wait before execution |
+| `tavana_query_duration_seconds` | Query execution time |
+| `tavana_active_queries` | Currently executing queries |
+| `tavana_worker_memory_bytes` | Worker memory usage |
+
+Import dashboards from `k8s/monitoring/` into Grafana.
+
+## 🔐 Security
+
+- **Pod Security**: Non-root, read-only filesystem, dropped capabilities
+- **Network Policies**: Deny by default, explicit allow rules
+- **Workload Identity**: Azure/AWS/GCP native identity (no credentials)
+- **TLS**: All internal communication encrypted
+
+## 🗺️ Roadmap
+
+- [ ] AWS EKS Terraform module
+- [ ] GCP GKE Terraform module
+- [ ] Query caching with Redis
+- [ ] Multi-tenancy with namespaces
+- [ ] Catalog integration (Unity Catalog, Iceberg)
+
+## 📚 Documentation
+
+- [Deployment Guide](./DEPLOYMENT.md)
+- [Helm Chart](./helm/tavana/README.md)
+- [Terraform Modules](./terraform/README.md)
+
+## 🤝 Contributing
+
+Contributions are welcome! Please read our contributing guidelines.
+
+## 📄 License
 
 Apache License 2.0
-
-## Contributing
-
-Contributions are welcome! Please read our contributing guidelines first.
-

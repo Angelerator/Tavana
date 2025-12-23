@@ -1,0 +1,83 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#                     TAVANA - ArgoCD Application
+# ═══════════════════════════════════════════════════════════════════════════════
+# This file defines the ArgoCD Application that deploys Tavana from the
+# official Helm chart using your custom values.
+#
+# How it works:
+# 1. ArgoCD watches this repository
+# 2. When changes are detected, ArgoCD applies them to your cluster
+# 3. Tavana is deployed/updated automatically
+# ═══════════════════════════════════════════════════════════════════════════════
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: tavana
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  
+  source:
+    # Official Tavana Helm chart from GitHub Container Registry
+    repoURL: oci://ghcr.io/tavana/charts
+    chart: tavana
+    targetRevision: "1.0.0"  # Pin to specific version for production
+    
+    helm:
+      # Use Azure-specific defaults, then overlay with your custom values
+      valueFiles:
+        - values-azure.yaml
+      
+      # Additional inline values (can also be in separate file)
+      values: |
+        # Override with your specific configuration
+        global:
+          # Your ACR login server (from Terraform output)
+          imageRegistry: "YOUR_ACR_LOGIN_SERVER"
+          imageTag: "v1.0.0"
+        
+        serviceAccount:
+          annotations:
+            # Your Workload Identity credentials (from Terraform output)
+            azure.workload.identity/client-id: "YOUR_TAVANA_IDENTITY_CLIENT_ID"
+            azure.workload.identity/tenant-id: "YOUR_AZURE_TENANT_ID"
+        
+        gateway:
+          env:
+            - name: AZURE_STORAGE_ACCOUNT
+              value: "YOUR_STORAGE_ACCOUNT_NAME"
+            - name: AZURE_STORAGE_CONTAINER
+              value: "data"
+        
+        worker:
+          # Target the Tavana node pool
+          nodeSelector:
+            nodepool: tavana
+          tolerations:
+            - key: "workload"
+              operator: "Equal"
+              value: "tavana"
+              effect: "NoSchedule"
+  
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: tavana
+  
+  syncPolicy:
+    automated:
+      prune: true       # Remove resources not in Git
+      selfHeal: true    # Auto-fix drift
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+

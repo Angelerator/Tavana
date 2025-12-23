@@ -61,3 +61,39 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Return the proper gateway image name
+*/}}
+{{- define "tavana.gateway.image" -}}
+{{- $tag := .Values.gateway.image.tag | default .Values.global.imageTag | default .Chart.AppVersion -}}
+{{- if .Values.global.imageRegistry -}}
+{{- printf "%s/tavana-%s:%s" .Values.global.imageRegistry .Values.gateway.image.repository $tag -}}
+{{- else -}}
+{{- printf "tavana/%s:%s" .Values.gateway.image.repository $tag -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Return the proper worker image name
+*/}}
+{{- define "tavana.worker.image" -}}
+{{- $tag := .Values.worker.image.tag | default .Values.global.imageTag | default .Chart.AppVersion -}}
+{{- if .Values.global.imageRegistry -}}
+{{- printf "%s/tavana-%s:%s" .Values.global.imageRegistry .Values.worker.image.repository $tag -}}
+{{- else -}}
+{{- printf "tavana/%s:%s" .Values.worker.image.repository $tag -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Return the proper image pull secrets
+*/}}
+{{- define "tavana.imagePullSecrets" -}}
+{{- if .Values.imagePullSecrets }}
+imagePullSecrets:
+{{- range .Values.imagePullSecrets }}
+  - name: {{ . }}
+{{- end }}
+{{- end }}
+{{- end -}}
