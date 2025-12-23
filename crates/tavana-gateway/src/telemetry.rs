@@ -5,18 +5,19 @@
 //! - Prometheus metrics
 //! - Structured JSON logging
 
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use anyhow::Result;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 /// Initialize telemetry (tracing, metrics, logs)
 pub fn init(log_level: &str) -> Result<()> {
     // Set up tracing subscriber with env filter
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(log_level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
     // Check if OTLP endpoint is configured
     let otlp_endpoint = std::env::var("OTLP_ENDPOINT").ok();
-    let json_logs = std::env::var("JSON_LOGS").map(|v| v == "true").unwrap_or(false);
+    let json_logs = std::env::var("JSON_LOGS")
+        .map(|v| v == "true")
+        .unwrap_or(false);
 
     let subscriber = tracing_subscriber::registry().with(filter);
 
@@ -27,9 +28,7 @@ pub fn init(log_level: &str) -> Result<()> {
             .init();
     } else {
         // Pretty formatted logs for development
-        subscriber
-            .with(tracing_subscriber::fmt::layer())
-            .init();
+        subscriber.with(tracing_subscriber::fmt::layer()).init();
     }
 
     // TODO: When OTLP endpoint is configured, add OpenTelemetry layer
@@ -43,8 +42,8 @@ pub fn init(log_level: &str) -> Result<()> {
 
 /// Prometheus metrics registry
 pub mod metrics {
-    use prometheus::{register_counter_vec, register_histogram_vec, CounterVec, HistogramVec};
     use once_cell::sync::Lazy;
+    use prometheus::{register_counter_vec, register_histogram_vec, CounterVec, HistogramVec};
 
     /// Query execution counter
     pub static QUERY_COUNTER: Lazy<CounterVec> = Lazy::new(|| {
@@ -52,7 +51,8 @@ pub mod metrics {
             "tavana_queries_total",
             "Total number of queries executed",
             &["status", "query_type"]
-        ).unwrap()
+        )
+        .unwrap()
     });
 
     /// Query execution duration histogram
@@ -62,7 +62,8 @@ pub mod metrics {
             "Query execution duration in seconds",
             &["query_type"],
             vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]
-        ).unwrap()
+        )
+        .unwrap()
     });
 
     /// Active connections gauge
@@ -71,7 +72,8 @@ pub mod metrics {
             "tavana_active_connections",
             "Number of active client connections",
             &["protocol"]
-        ).unwrap()
+        )
+        .unwrap()
     });
 
     /// Data scanned counter
@@ -80,7 +82,7 @@ pub mod metrics {
             "tavana_data_scanned_bytes_total",
             "Total bytes of data scanned",
             &["table", "format"]
-        ).unwrap()
+        )
+        .unwrap()
     });
 }
-

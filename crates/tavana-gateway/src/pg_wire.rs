@@ -8,13 +8,13 @@
 //! - Enqueued queries wait until K8s capacity is available
 //! - Queue depth signals HPA to scale up
 
-use crate::query_queue::{QueryQueue, QueryToken, QueryOutcome, QueueError};
 use crate::auth::AuthService;
 use crate::metrics;
+use crate::query_queue::{QueryOutcome, QueryQueue, QueryToken, QueueError};
 use crate::query_router::{QueryRouter, QueryTarget};
 use crate::redis_queue::{RedisQueue, RedisQueueConfig};
 use crate::smart_scaler::SmartScaler;
-use crate::worker_client::{WorkerClient, StreamingBatch};
+use crate::worker_client::{StreamingBatch, WorkerClient};
 use crate::worker_pool::WorkerPoolManager;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ use tracing::{debug, error, info, warn};
 const STREAMING_BATCH_SIZE: usize = 1000;
 
 /// PostgreSQL wire protocol server with SmartScaler (Formula 3) and Query Queue
-/// 
+///
 /// Architecture:
 /// 1. Connection arrives → authenticate
 /// 2. Query arrives → QueryQueue.enqueue() (blocks until capacity available)
@@ -76,7 +76,7 @@ impl PgWireServer {
         pool_manager: Option<Arc<WorkerPoolManager>>,
     ) -> Self {
         let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
-        
+
         // Initialize Redis queue if available
         let redis_queue = match RedisQueue::new(RedisQueueConfig::from_env()).await {
             Ok(queue) => {
@@ -88,7 +88,7 @@ impl PgWireServer {
                 None
             }
         };
-        
+
         Self {
             addr,
             auth_service,
@@ -120,9 +120,10 @@ impl PgWireServer {
             pool_manager,
             smart_scaler,
             query_queue,
-        ).await
+        )
+        .await
     }
-    
+
     /// Create with SmartScaler and SHARED QueryQueue
     /// Use this to share the queue with SmartScaler for HPA integration
     pub async fn with_smart_scaler_and_queue(
@@ -135,15 +136,19 @@ impl PgWireServer {
         query_queue: Arc<QueryQueue>,
     ) -> Self {
         let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
-        
+
         // Redis queue disabled - QueryQueue handles queuing
         let redis_queue: Option<Arc<RedisQueue>> = None;
-        
+
         info!(
             "PgWireServer initialized with shared QueryQueue + SmartScaler: {}",
-            if smart_scaler.is_some() { "enabled" } else { "disabled" }
+            if smart_scaler.is_some() {
+                "enabled"
+            } else {
+                "disabled"
+            }
         );
-        
+
         Self {
             addr,
             auth_service,
@@ -158,8 +163,11 @@ impl PgWireServer {
 
     /// Start the PostgreSQL wire protocol server
     pub async fn start(&self) -> anyhow::Result<()> {
-        info!("Starting PostgreSQL wire protocol server on {} (SmartScaler + QueryQueue mode)", self.addr);
-        
+        info!(
+            "Starting PostgreSQL wire protocol server on {} (SmartScaler + QueryQueue mode)",
+            self.addr
+        );
+
         // Start queue worker if Redis queue is available
         if let Some(ref queue) = self.redis_queue {
             let queue_clone = queue.clone();
@@ -167,19 +175,26 @@ impl PgWireServer {
             let query_router = self.query_router.clone();
             let pool_manager = self.pool_manager.clone();
             let smart_scaler = self.smart_scaler.clone();
-            
+
             tokio::spawn(async move {
-                run_queue_worker(queue_clone, worker_client, query_router, pool_manager, smart_scaler).await;
+                run_queue_worker(
+                    queue_clone,
+                    worker_client,
+                    query_router,
+                    pool_manager,
+                    smart_scaler,
+                )
+                .await;
             });
             info!("Queue worker started - processing queued queries with SmartScaler");
         }
-        
+
         // Start queue stats logging loop (every 5 seconds)
         let queue_for_stats = self.query_queue.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                
+
                 // Update metrics from queue stats
                 let stats = queue_for_stats.stats().await;
                 metrics::set_queue_depth(stats.queue_depth);
@@ -187,7 +202,7 @@ impl PgWireServer {
                 metrics::set_cluster_capacity_mb(stats.total_capacity_mb);
                 metrics::set_available_capacity_mb(stats.available_mb);
                 metrics::set_hpa_scale_up_signal(stats.hpa_scale_up_signal);
-                
+
                 // Log queue status periodically
                 if stats.queue_depth > 0 || stats.active_queries > 0 {
                     tracing::debug!(
@@ -227,7 +242,9 @@ impl PgWireServer {
                     redis_queue,
                     smart_scaler,
                     query_queue,
-                ).await {
+                )
+                .await
+                {
                     error!("Error handling PostgreSQL connection: {}", e);
                 }
             });
@@ -245,10 +262,10 @@ async fn run_queue_worker(
     smart_scaler: Option<Arc<SmartScaler>>,
 ) {
     info!("Queue worker starting with SmartScaler support...");
-    
+
     // Track active query processing tasks
     let _active_tasks = Arc::new(tokio::sync::Semaphore::new(0));
-    
+
     loop {
         // Check availability using SmartScaler if available, otherwise pool_manager
         let idle_count: i32 = if let Some(ref scaler) = smart_scaler {
@@ -260,13 +277,13 @@ async fn run_queue_worker(
         } else {
             3 // Default to 3 concurrent processors
         };
-        
+
         if idle_count == 0 {
             // No workers available, wait a bit
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             continue;
         }
-        
+
         // Try to dequeue
         match queue.dequeue().await {
             Ok(Some(queued_query)) => {
@@ -277,25 +294,26 @@ async fn run_queue_worker(
                 let worker_client = worker_client.clone();
                 let query_router = query_router.clone();
                 let queue = queue.clone();
-                
+
                 // Spawn a task to process this query concurrently
                 tokio::spawn(async move {
                     let start = Instant::now();
-                    
+
                     debug!(
                         query_id = %query_id,
                         user = %user_id,
                         "Processing queued query"
                     );
-                    
+
                     // Execute the query
-                    match execute_queued_query(&worker_client, &query_router, &sql, &user_id).await {
+                    match execute_queued_query(&worker_client, &query_router, &sql, &user_id).await
+                    {
                         Ok((row_count, worker_name)) => {
                             // Release the worker
                             if let Some(ref name) = worker_name {
                                 query_router.release_worker(name, None).await;
                             }
-                            
+
                             info!(
                                 query_id = %query_id,
                                 rows = row_count,
@@ -319,7 +337,7 @@ async fn run_queue_worker(
                         }
                     }
                 });
-                
+
                 // Small delay to allow task to start and claim a worker
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
@@ -344,14 +362,20 @@ async fn execute_queued_query(
     user_id: &str,
 ) -> anyhow::Result<(usize, Option<String>)> {
     let estimate = query_router.route(sql).await;
-    
+
     match estimate.target {
-        QueryTarget::PreSizedWorker { address, worker_name } => {
+        QueryTarget::PreSizedWorker {
+            address,
+            worker_name,
+        } => {
             // Execute on pre-sized worker
             let result = execute_query_on_worker(&address, sql, user_id).await?;
             Ok((result, Some(worker_name)))
         }
-        QueryTarget::TenantPool { service_addr, tenant_id } => {
+        QueryTarget::TenantPool {
+            service_addr,
+            tenant_id,
+        } => {
             // Execute on tenant's dedicated pool (same path as pre-sized)
             info!("Routing to tenant pool: {}", tenant_id);
             let result = execute_query_on_worker(&service_addr, sql, user_id).await?;
@@ -372,20 +396,20 @@ async fn execute_query_on_worker(
     user_id: &str,
 ) -> anyhow::Result<usize> {
     const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
-    
+
     let channel = Channel::from_shared(worker_addr.to_string())?
         .timeout(std::time::Duration::from_secs(1800))
         .connect_timeout(std::time::Duration::from_secs(30))
         .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
         .connect()
         .await?;
-    
+
     let mut client = proto::query_service_client::QueryServiceClient::new(channel)
         .max_decoding_message_size(MAX_MESSAGE_SIZE)
         .max_encoding_message_size(MAX_MESSAGE_SIZE);
-    
+
     let query_id = uuid::Uuid::new_v4().to_string();
-    
+
     let request = proto::ExecuteQueryRequest {
         query_id: query_id.clone(),
         sql: sql.to_string(),
@@ -404,17 +428,17 @@ async fn execute_query_on_worker(
         }),
         allocated_resources: None,
     };
-    
+
     let response = client.execute_query(request).await?;
     let mut stream = response.into_inner();
-    
+
     let mut total_rows = 0;
     while let Some(batch) = stream.message().await? {
         if let Some(proto::query_result_batch::Result::RecordBatch(data)) = batch.result {
             total_rows += data.row_count as usize;
         }
     }
-    
+
     Ok(total_rows)
 }
 
@@ -467,13 +491,14 @@ async fn handle_connection(
                     continue;
                 }
                 _ => {}
-                }
             }
-            break;
         }
+        break;
+    }
 
     // Extract user from startup message
-    let user_id = extract_startup_param(&startup_msg, "user").unwrap_or_else(|| "anonymous".to_string());
+    let user_id =
+        extract_startup_param(&startup_msg, "user").unwrap_or_else(|| "anonymous".to_string());
     info!("PostgreSQL client connected as user: {}", user_id);
 
     // Send AuthenticationOk (R)
@@ -532,24 +557,23 @@ async fn handle_connection(
                 debug!("Received query: {}", &query[..query.len().min(100)]);
 
                 let query_id = uuid::Uuid::new_v4().to_string();
-                
+
                 // Route query to estimate size (in MB)
                 let estimate = query_router.route(&query).await;
                 let estimated_data_mb = estimate.data_size_mb;
-                
+
                 // ═══════════════════════════════════════════════════════════════
                 // QUEUE & WAIT FOR CAPACITY (FIFO, never rejects)
                 // ═══════════════════════════════════════════════════════════════
-                let enqueue_result = query_queue.enqueue(
-                    query_id.clone(),
-                    estimated_data_mb,
-                ).await;
-                
+                let enqueue_result = query_queue
+                    .enqueue(query_id.clone(), estimated_data_mb)
+                    .await;
+
                 match enqueue_result {
                     Ok(query_token) => {
                         // Query dispatched - capacity available, execute now
                         let start = std::time::Instant::now();
-                        
+
                         let result = execute_query_streaming_with_scaler(
                             &mut socket,
                             &worker_client,
@@ -557,10 +581,11 @@ async fn handle_connection(
                             &query,
                             &user_id,
                             smart_scaler.as_ref().map(|s| s.as_ref()),
-                        ).await;
-                        
+                        )
+                        .await;
+
                         let duration_ms = start.elapsed().as_millis() as u64;
-                        
+
                         // Record completion with appropriate outcome
                         let outcome = match &result {
                             Ok(row_count) => {
@@ -586,7 +611,7 @@ async fn handle_connection(
                                 }
                             }
                         };
-                        
+
                         // CRITICAL: Release capacity for next query
                         query_queue.complete(query_token, outcome).await;
                     }
@@ -626,12 +651,13 @@ async fn handle_connection(
                         &user_id,
                         smart_scaler.as_ref().map(|s| s.as_ref()),
                         &query_queue,
-                    ).await?;
+                    )
+                    .await?;
                 } else {
                     // No prepared statement, just acknowledge
                     handle_execute_empty(&mut socket, &mut buf).await?;
                 }
-                prepared_query = None;  // Clear after execution
+                prepared_query = None; // Clear after execution
             }
             b'S' => {
                 socket.write_all(&ready).await?;
@@ -658,7 +684,8 @@ async fn execute_query_streaming(
     sql: &str,
     user_id: &str,
 ) -> anyhow::Result<usize> {
-    execute_query_streaming_with_scaler(socket, worker_client, query_router, sql, user_id, None).await
+    execute_query_streaming_with_scaler(socket, worker_client, query_router, sql, user_id, None)
+        .await
 }
 
 /// Execute query with SmartScaler (Formula 3) lifecycle management
@@ -678,10 +705,10 @@ async fn execute_query_streaming_with_scaler(
 
     // Track active queries for HPA scaling
     metrics::query_started();
-    
+
     // Route query to get estimate
     let estimate = query_router.route(sql).await;
-    
+
     info!(
         data_mb = estimate.data_size_mb,
         target = ?estimate.target,
@@ -698,21 +725,29 @@ async fn execute_query_streaming_with_scaler(
             sql,
             user_id,
             &estimate,
-        ).await;
+        )
+        .await;
     }
 
     // Fallback to legacy routing
     let (result, worker_name) = match estimate.target {
-        QueryTarget::PreSizedWorker { address, worker_name } => {
+        QueryTarget::PreSizedWorker {
+            address,
+            worker_name,
+        } => {
             info!("Using pre-sized worker {} at {}", worker_name, address);
             metrics::update_worker_active_queries(&worker_name, 1);
             let result = execute_query_streaming_to_worker(socket, &address, sql, user_id).await;
             metrics::update_worker_active_queries(&worker_name, 0);
             (result, Some(worker_name))
         }
-        QueryTarget::TenantPool { service_addr, tenant_id } => {
+        QueryTarget::TenantPool {
+            service_addr,
+            tenant_id,
+        } => {
             info!("Using tenant pool {} at {}", tenant_id, service_addr);
-            let result = execute_query_streaming_to_worker(socket, &service_addr, sql, user_id).await;
+            let result =
+                execute_query_streaming_to_worker(socket, &service_addr, sql, user_id).await;
             (result, None)
         }
         QueryTarget::WorkerPool => {
@@ -720,15 +755,15 @@ async fn execute_query_streaming_with_scaler(
             (result, None)
         }
     };
-    
+
     // Release the worker after query completion (success or failure)
     if let Some(ref name) = worker_name {
         query_router.release_worker(name, None).await;
         debug!("Released worker {} after streaming query", name);
     }
-    
+
     metrics::query_ended();
-    
+
     result
 }
 
@@ -743,7 +778,7 @@ async fn execute_with_smart_scaler(
     estimate: &crate::query_router::QueryEstimate,
 ) -> anyhow::Result<usize> {
     let query_id = uuid::Uuid::new_v4().to_string();
-    
+
     // Step 1: Select worker and determine if pre-sizing needed
     let selection = match scaler.select_worker(&query_id, estimate.data_size_mb).await {
         Some(s) => s,
@@ -754,10 +789,10 @@ async fn execute_with_smart_scaler(
             if let Err(e) = scaler.apply_hpa_scaling(&decision).await {
                 warn!("Failed to apply HPA scaling: {}", e);
             }
-            
+
             // Queue the query and retry
             scaler.enqueue_query(&query_id, estimate.data_size_mb).await;
-            
+
             // Wait for a worker to become available (with timeout)
             for _ in 0..30 {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -766,14 +801,14 @@ async fn execute_with_smart_scaler(
                     break;
                 }
             }
-            
+
             // If still no worker, fall back to worker pool
             warn!("No SmartScaler worker available after waiting, falling back to pool");
             metrics::query_ended();
             return execute_query_streaming_default(socket, worker_client, sql, user_id).await;
         }
     };
-    
+
     info!(
         "SmartScaler selected worker {} (needs_resize={}, limit={}MB->{}MB)",
         selection.worker_name,
@@ -781,51 +816,56 @@ async fn execute_with_smart_scaler(
         selection.current_limit_mb,
         selection.new_limit_mb
     );
-    
+
     // Step 2: Pre-size worker if needed (VPA pre-assignment)
     if selection.needs_resize {
-        if let Err(e) = scaler.presize_worker(&selection.worker_name, selection.new_limit_mb).await {
+        if let Err(e) = scaler
+            .presize_worker(&selection.worker_name, selection.new_limit_mb)
+            .await
+        {
             warn!("Failed to pre-size worker: {}", e);
             // Continue anyway - worker might still have enough capacity
         }
     }
-    
+
     // Step 3: Register query start
-    scaler.query_started(
-        &selection.worker_name,
-        &query_id,
-        estimate.data_size_mb,
-        selection.new_limit_mb,
-    ).await;
-    
+    scaler
+        .query_started(
+            &selection.worker_name,
+            &query_id,
+            estimate.data_size_mb,
+            selection.new_limit_mb,
+        )
+        .await;
+
     metrics::update_worker_active_queries(&selection.worker_name, 1);
-    
+
     // Step 4: Start elastic monitoring in background
     let elastic_handle = scaler.start_elastic_monitoring(selection.worker_name.clone());
-    
+
     // Step 5: Execute query
-    let result = execute_query_streaming_to_worker(
-        socket,
-        &selection.worker_address,
-        sql,
-        user_id,
-    ).await;
-    
+    let result =
+        execute_query_streaming_to_worker(socket, &selection.worker_address, sql, user_id).await;
+
     // Step 6: Clean up - abort elastic monitoring
     elastic_handle.abort();
-    
+
     // Step 7: Register query completion
-    scaler.query_completed(&selection.worker_name, &query_id).await;
-    query_router.release_worker(&selection.worker_name, None).await;
-    
+    scaler
+        .query_completed(&selection.worker_name, &query_id)
+        .await;
+    query_router
+        .release_worker(&selection.worker_name, None)
+        .await;
+
     metrics::update_worker_active_queries(&selection.worker_name, 0);
     metrics::query_ended();
-    
+
     info!(
         "SmartScaler query {} completed on worker {}",
         query_id, selection.worker_name
     );
-    
+
     result
 }
 
@@ -837,12 +877,12 @@ async fn execute_query_streaming_to_worker(
     user_id: &str,
 ) -> anyhow::Result<usize> {
     use tokio::io::AsyncWriteExt;
-    
+
     info!("Streaming query to worker: {}", worker_addr);
 
     // Connect to worker with large buffer settings for big result sets
     const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB per gRPC message
-    
+
     let channel = Channel::from_shared(worker_addr.to_string())?
         .timeout(std::time::Duration::from_secs(1800)) // 30 min for very large queries
         .connect_timeout(std::time::Duration::from_secs(30))
@@ -898,13 +938,13 @@ async fn execute_query_streaming_to_worker(
                             send_data_row(socket, &row).await?;
                             total_rows += 1;
                             batch_rows += 1;
-                            
+
                             // Flush every STREAMING_BATCH_SIZE rows for backpressure
                             if batch_rows >= STREAMING_BATCH_SIZE {
                                 socket.flush().await?;
                                 batch_rows = 0;
                             }
-                            
+
                             // Log progress for very large queries
                             if total_rows % 1_000_000 == 0 {
                                 info!("Streaming progress: {} rows sent", total_rows);
@@ -940,7 +980,7 @@ async fn execute_query_streaming_default(
     user_id: &str,
 ) -> anyhow::Result<usize> {
     use tokio::io::AsyncWriteExt;
-    
+
     // For the default path, we still need to use the existing client
     // but we'll stream the results to the client as they come
     match worker_client.execute_query_streaming(sql, user_id).await {
@@ -951,7 +991,10 @@ async fn execute_query_streaming_default(
 
             while let Some(batch) = stream.next().await {
                 match batch? {
-                    StreamingBatch::Metadata { columns, column_types } => {
+                    StreamingBatch::Metadata {
+                        columns,
+                        column_types,
+                    } => {
                         if !columns_sent {
                             send_row_description(socket, &columns, &column_types).await?;
                             columns_sent = true;
@@ -962,7 +1005,7 @@ async fn execute_query_streaming_default(
                             send_data_row(socket, &row).await?;
                             total_rows += 1;
                             batch_rows += 1;
-                            
+
                             if batch_rows >= STREAMING_BATCH_SIZE {
                                 socket.flush().await?;
                                 batch_rows = 0;
@@ -1048,23 +1091,51 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
     }
 
     if sql_trimmed.starts_with("RESET ") {
-        return Some(QueryExecutionResult { columns: vec![], rows: vec![], row_count: 0, command_tag: Some("RESET".to_string()) });
+        return Some(QueryExecutionResult {
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
+            command_tag: Some("RESET".to_string()),
+        });
     }
 
     if sql_trimmed == "BEGIN" || sql_trimmed.starts_with("BEGIN ") {
-        return Some(QueryExecutionResult { columns: vec![], rows: vec![], row_count: 0, command_tag: Some("BEGIN".to_string()) });
+        return Some(QueryExecutionResult {
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
+            command_tag: Some("BEGIN".to_string()),
+        });
     }
 
     if sql_trimmed == "COMMIT" {
-        return Some(QueryExecutionResult { columns: vec![], rows: vec![], row_count: 0, command_tag: Some("COMMIT".to_string()) });
+        return Some(QueryExecutionResult {
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
+            command_tag: Some("COMMIT".to_string()),
+        });
     }
 
     if sql_trimmed == "ROLLBACK" {
-        return Some(QueryExecutionResult { columns: vec![], rows: vec![], row_count: 0, command_tag: Some("ROLLBACK".to_string()) });
+        return Some(QueryExecutionResult {
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
+            command_tag: Some("ROLLBACK".to_string()),
+        });
     }
 
-    if sql_trimmed.starts_with("DISCARD ") || sql_trimmed.starts_with("DEALLOCATE ") || sql_trimmed.starts_with("CLOSE ") {
-        return Some(QueryExecutionResult { columns: vec![], rows: vec![], row_count: 0, command_tag: Some("OK".to_string()) });
+    if sql_trimmed.starts_with("DISCARD ")
+        || sql_trimmed.starts_with("DEALLOCATE ")
+        || sql_trimmed.starts_with("CLOSE ")
+    {
+        return Some(QueryExecutionResult {
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
+            command_tag: Some("OK".to_string()),
+        });
     }
 
     if sql_upper.contains("PG_CATALOG") || sql_upper.contains("INFORMATION_SCHEMA") {
@@ -1105,7 +1176,7 @@ async fn execute_local_fallback(sql: &str) -> anyhow::Result<QueryExecutionResul
     }
 
     Ok(QueryExecutionResult {
-            columns: vec![("result".to_string(), "text".to_string())],
+        columns: vec![("result".to_string(), "text".to_string())],
         rows: vec![],
         row_count: 0,
         command_tag: None,
@@ -1138,7 +1209,7 @@ async fn send_row_description(
 
     for (i, name) in columns.iter().enumerate() {
         let type_name = column_types.get(i).map(|s| s.as_str()).unwrap_or("text");
-        
+
         fields_data.extend_from_slice(name.as_bytes());
         fields_data.push(0);
         fields_data.extend_from_slice(&0u32.to_be_bytes()); // table OID
@@ -1158,34 +1229,31 @@ async fn send_row_description(
 }
 
 /// Send a single DataRow message
-async fn send_data_row(
-    socket: &mut tokio::net::TcpStream,
-    row: &[String],
-) -> anyhow::Result<()> {
+async fn send_data_row(socket: &mut tokio::net::TcpStream, row: &[String]) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
-    
+
     let mut data_row = Vec::with_capacity(5 + row.len() * 20);
-        data_row.push(b'D');
+    data_row.push(b'D');
 
     let mut row_data = Vec::with_capacity(2 + row.len() * 20);
-        row_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
+    row_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
 
-        for value in row {
+    for value in row {
         if value.is_empty() || value == "null" || value == "NULL" {
-                row_data.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
-            } else {
-                row_data.extend_from_slice(&(value.len() as i32).to_be_bytes());
-                row_data.extend_from_slice(value.as_bytes());
-            }
+            row_data.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
+        } else {
+            row_data.extend_from_slice(&(value.len() as i32).to_be_bytes());
+            row_data.extend_from_slice(value.as_bytes());
         }
+    }
 
-        let len = (4 + row_data.len()) as u32;
-        data_row.extend_from_slice(&len.to_be_bytes());
-        data_row.extend_from_slice(&row_data);
-        socket.write_all(&data_row).await?;
+    let len = (4 + row_data.len()) as u32;
+    data_row.extend_from_slice(&len.to_be_bytes());
+    data_row.extend_from_slice(&row_data);
+    socket.write_all(&data_row).await?;
 
     Ok(())
-    }
+}
 
 /// Send query result immediately (for small results)
 async fn send_query_result_immediate(
@@ -1195,7 +1263,9 @@ async fn send_query_result_immediate(
     use tokio::io::AsyncWriteExt;
 
     if result.columns.is_empty() {
-        let tag = result.command_tag.unwrap_or_else(|| format!("OK {}", result.row_count));
+        let tag = result
+            .command_tag
+            .unwrap_or_else(|| format!("OK {}", result.row_count));
         send_command_complete(socket, &tag).await?;
         return Ok(0);
     }
@@ -1210,7 +1280,7 @@ async fn send_query_result_immediate(
     for row in &result.rows {
         send_data_row(socket, row).await?;
         count += 1;
-        
+
         // Flush periodically
         if count % STREAMING_BATCH_SIZE == 0 {
             socket.flush().await?;
@@ -1223,7 +1293,10 @@ async fn send_query_result_immediate(
     Ok(result.rows.len())
 }
 
-async fn send_command_complete(socket: &mut tokio::net::TcpStream, tag: &str) -> anyhow::Result<()> {
+async fn send_command_complete(
+    socket: &mut tokio::net::TcpStream,
+    tag: &str,
+) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut msg = Vec::new();
     msg.push(b'C');
@@ -1276,7 +1349,11 @@ async fn send_notice(socket: &mut tokio::net::TcpStream, message: &str) -> anyho
     Ok(())
 }
 
-async fn send_parameter_status(socket: &mut tokio::net::TcpStream, key: &str, value: &str) -> anyhow::Result<()> {
+async fn send_parameter_status(
+    socket: &mut tokio::net::TcpStream,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut msg = Vec::new();
     msg.push(b'S');
@@ -1291,11 +1368,15 @@ async fn send_parameter_status(socket: &mut tokio::net::TcpStream, key: &str, va
 }
 
 fn extract_startup_param(msg: &[u8], key: &str) -> Option<String> {
-    if msg.len() < 8 { return None; }
+    if msg.len() < 8 {
+        return None;
+    }
     let params = &msg[4..];
     let mut iter = params.split(|&b| b == 0);
     while let Some(k) = iter.next() {
-        if k.is_empty() { break; }
+        if k.is_empty() {
+            break;
+        }
         let v = iter.next()?;
         if k == key.as_bytes() {
             return String::from_utf8(v.to_vec()).ok();
@@ -1333,31 +1414,41 @@ fn pg_type_len(type_name: &str) -> i16 {
 // ===== Extended Query Protocol Handlers =====
 
 /// Handle Parse message - extract and store the SQL query
-async fn handle_parse_extended(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4]) -> anyhow::Result<Option<String>> {
+async fn handle_parse_extended(
+    socket: &mut tokio::net::TcpStream,
+    buf: &mut [u8; 4],
+) -> anyhow::Result<Option<String>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     socket.read_exact(buf).await?;
     let len = u32::from_be_bytes(*buf) as usize - 4;
     let mut data = vec![0u8; len];
     socket.read_exact(&mut data).await?;
-    
+
     // Parse message format:
     // - Statement name (null-terminated string)
     // - Query string (null-terminated string)
     // - Number of parameter types (Int16)
     // - Parameter types (Int32 each)
-    
+
     // Find the first null byte (end of statement name)
     let stmt_end = data.iter().position(|&b| b == 0).unwrap_or(0);
     // Find the second null byte (end of query)
     let query_start = stmt_end + 1;
-    let query_end = data[query_start..].iter().position(|&b| b == 0).unwrap_or(data.len() - query_start) + query_start;
-    
+    let query_end = data[query_start..]
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(data.len() - query_start)
+        + query_start;
+
     let query = String::from_utf8_lossy(&data[query_start..query_end]).to_string();
-    debug!("Extended query protocol - Parse: {}", &query[..query.len().min(100)]);
-    
+    debug!(
+        "Extended query protocol - Parse: {}",
+        &query[..query.len().min(100)]
+    );
+
     socket.write_all(&[b'1', 0, 0, 0, 4]).await?; // ParseComplete
     socket.flush().await?;
-    
+
     if query.is_empty() {
         Ok(None)
     } else {
@@ -1376,7 +1467,10 @@ async fn handle_bind(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4]) -> a
     Ok(())
 }
 
-async fn handle_describe(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4]) -> anyhow::Result<()> {
+async fn handle_describe(
+    socket: &mut tokio::net::TcpStream,
+    buf: &mut [u8; 4],
+) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     socket.read_exact(buf).await?;
     let len = u32::from_be_bytes(*buf) as usize - 4;
@@ -1403,25 +1497,27 @@ async fn handle_execute_extended(
     let len = u32::from_be_bytes(*buf) as usize - 4;
     let mut data = vec![0u8; len];
     socket.read_exact(&mut data).await?;
-    
-    debug!("Extended query protocol - Execute: {}", &sql[..sql.len().min(100)]);
-    
+
+    debug!(
+        "Extended query protocol - Execute: {}",
+        &sql[..sql.len().min(100)]
+    );
+
     let query_id = uuid::Uuid::new_v4().to_string();
-    
+
     // Route query to estimate size
     let estimate = query_router.route(sql).await;
     let estimated_data_mb = estimate.data_size_mb;
-    
+
     // Enqueue and wait for capacity
-    let enqueue_result = query_queue.enqueue(
-        query_id.clone(),
-        estimated_data_mb,
-    ).await;
-    
+    let enqueue_result = query_queue
+        .enqueue(query_id.clone(), estimated_data_mb)
+        .await;
+
     match enqueue_result {
         Ok(query_token) => {
             let start = std::time::Instant::now();
-            
+
             let result = execute_query_streaming_with_scaler(
                 socket,
                 worker_client,
@@ -1429,10 +1525,11 @@ async fn handle_execute_extended(
                 sql,
                 user_id,
                 smart_scaler,
-            ).await;
-            
+            )
+            .await;
+
             let duration_ms = start.elapsed().as_millis() as u64;
-            
+
             let outcome = match &result {
                 Ok(row_count) => {
                     info!(
@@ -1456,7 +1553,7 @@ async fn handle_execute_extended(
                     }
                 }
             };
-            
+
             query_queue.complete(query_token, outcome).await;
         }
         Err(queue_error) => {
@@ -1465,7 +1562,7 @@ async fn handle_execute_extended(
             send_error(socket, &error_msg).await?;
         }
     }
-    
+
     Ok(())
 }
 

@@ -18,7 +18,7 @@ mod pg_wire;
 mod query_queue;
 mod query_router;
 #[path = "redis_queue_stub.rs"]
-mod redis_queue;  // Stub for removed Redis functionality
+mod redis_queue; // Stub for removed Redis functionality
 mod smart_scaler;
 mod telemetry;
 mod worker_client;
@@ -30,10 +30,7 @@ use crate::pg_wire::PgWireServer;
 use crate::query_router::QueryRouter;
 use crate::worker_client::WorkerClient;
 use crate::worker_pool::{PreSizingConfig, WorkerPoolManager};
-use axum::{
-    routing::get,
-    Router,
-};
+use axum::{routing::get, Router};
 use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -74,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Load environment variables from .env if present
     dotenvy::dotenv().ok();
-    
+
     let args = Args::parse();
 
     // Initialize telemetry
@@ -112,7 +109,10 @@ async fn main() -> anyhow::Result<()> {
             Some(Arc::new(pm))
         }
         Err(e) => {
-            warn!("Failed to initialize WorkerPoolManager: {} - pre-sizing disabled", e);
+            warn!(
+                "Failed to initialize WorkerPoolManager: {} - pre-sizing disabled",
+                e
+            );
             None
         }
     };
@@ -124,14 +124,20 @@ async fn main() -> anyhow::Result<()> {
             Some(Arc::new(ss))
         }
         Err(e) => {
-            warn!("Failed to initialize SmartScaler: {} - using legacy pre-sizing", e);
+            warn!(
+                "Failed to initialize SmartScaler: {} - using legacy pre-sizing",
+                e
+            );
             None
         }
     };
 
     // Initialize QueryRouter with or without pre-sizing
     let query_router = if let Some(ref pm) = pool_manager {
-        Arc::new(QueryRouter::with_pool_manager(data_sizer.clone(), pm.clone()))
+        Arc::new(QueryRouter::with_pool_manager(
+            data_sizer.clone(),
+            pm.clone(),
+        ))
     } else {
         Arc::new(QueryRouter::new(data_sizer.clone()))
     };
@@ -175,41 +181,39 @@ async fn main() -> anyhow::Result<()> {
     let pg_queue = query_queue.clone();
     let pg_handle = tokio::spawn(async move {
         let server = pg_wire::PgWireServer::with_smart_scaler_and_queue(
-            pg_port,
-            pg_auth,
-            pg_worker,
-            pg_router,
-            pg_pool,
-            pg_scaler,
-            pg_queue,
-        ).await;
+            pg_port, pg_auth, pg_worker, pg_router, pg_pool, pg_scaler, pg_queue,
+        )
+        .await;
         if let Err(e) = server.start().await {
             tracing::error!("PostgreSQL server error: {}", e);
         }
     });
-    
+
     // Start SmartScaler monitoring with shared QueryQueue
     // HPA decisions now based on: queue depth, wait time, capacity utilization
     if let Some(ref scaler) = smart_scaler {
         let scaler_clone = scaler.clone();
         let queue_clone = query_queue.clone();
         scaler_clone.start_monitoring_with_queue(queue_clone);
-        info!("SmartScaler monitoring started with QueryQueue integration (interval={}ms)", smart_scaler::MONITOR_INTERVAL_MS);
+        info!(
+            "SmartScaler monitoring started with QueryQueue integration (interval={}ms)",
+            smart_scaler::MONITOR_INTERVAL_MS
+        );
     }
 
     // Simple HTTP server for health checks and metrics only
     async fn health() -> &'static str {
         "ok"
     }
-    
+
     async fn ready() -> &'static str {
         "ready"
     }
-    
+
     async fn root() -> &'static str {
         "Tavana Gateway - PostgreSQL Wire Protocol"
     }
-    
+
     async fn metrics() -> String {
         use prometheus::Encoder;
         let encoder = prometheus::TextEncoder::new();

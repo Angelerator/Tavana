@@ -53,9 +53,12 @@ impl TlsConfig {
         let ca_cert = if let Some(ca_path) = ca_path {
             let ca_pem = fs::read(ca_path.as_ref())
                 .map_err(|e| TavanaError::TlsError(format!("Failed to read CA: {}", e)))?;
-            Some(Self::parse_pem_certs(&ca_pem)?.into_iter().next().ok_or_else(|| {
-                TavanaError::TlsError("No CA certificate found".into())
-            })?)
+            Some(
+                Self::parse_pem_certs(&ca_pem)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| TavanaError::TlsError("No CA certificate found".into()))?,
+            )
         } else {
             None
         };
@@ -82,15 +85,21 @@ impl TlsConfig {
         san_ips: &[std::net::IpAddr],
     ) -> Result<(String, String)> {
         let mut params = CertificateParams::default();
-        params.distinguished_name.push(DnType::CommonName, common_name);
-        params.distinguished_name.push(DnType::OrganizationName, "Tavana");
-        
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "Tavana");
+
         // Add Subject Alternative Names
         let mut subject_alt_names = Vec::new();
         for dns in san_dns {
-            subject_alt_names.push(rcgen::SanType::DnsName(dns.clone().try_into().map_err(|e| {
-                TavanaError::TlsError(format!("Invalid DNS name: {}", e))
-            })?));
+            subject_alt_names.push(rcgen::SanType::DnsName(
+                dns.clone()
+                    .try_into()
+                    .map_err(|e| TavanaError::TlsError(format!("Invalid DNS name: {}", e)))?,
+            ));
         }
         for ip in san_ips {
             subject_alt_names.push(rcgen::SanType::IpAddress(*ip));
@@ -98,13 +107,12 @@ impl TlsConfig {
         params.subject_alt_names = subject_alt_names;
 
         // Generate key pair
-        let key_pair = KeyPair::generate().map_err(|e| {
-            TavanaError::TlsError(format!("Failed to generate key pair: {}", e))
-        })?;
-        
-        let cert = params.self_signed(&key_pair).map_err(|e| {
-            TavanaError::TlsError(format!("Failed to generate certificate: {}", e))
-        })?;
+        let key_pair = KeyPair::generate()
+            .map_err(|e| TavanaError::TlsError(format!("Failed to generate key pair: {}", e)))?;
+
+        let cert = params
+            .self_signed(&key_pair)
+            .map_err(|e| TavanaError::TlsError(format!("Failed to generate certificate: {}", e)))?;
 
         let cert_pem = cert.pem();
         let key_pem = key_pair.serialize_pem();
@@ -124,12 +132,12 @@ impl TlsConfig {
     /// Parse PEM-encoded private key
     fn parse_pem_key(pem_data: &[u8]) -> Result<PrivateKeyDer<'static>> {
         let mut reader = std::io::BufReader::new(pem_data);
-        
+
         // Try to read any type of private key
         let key = rustls_pemfile::private_key(&mut reader)
             .map_err(|e| TavanaError::TlsError(format!("Failed to parse private key: {}", e)))?
             .ok_or_else(|| TavanaError::TlsError("No private key found".into()))?;
-        
+
         Ok(key)
     }
 }
@@ -140,21 +148,21 @@ pub fn create_client_tls_config(
     verify_server: bool,
 ) -> Result<rustls::ClientConfig> {
     let builder = rustls::ClientConfig::builder();
-    
+
     let config = if verify_server {
         // Use webpki roots for production
         let mut root_store = rustls::RootCertStore::empty();
-        
+
         // Add system roots
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        
+
         // Add custom CA if provided
         if let Some(ca) = &config.ca_cert {
             root_store.add(ca.clone()).map_err(|e| {
                 TavanaError::TlsError(format!("Failed to add CA certificate: {}", e))
             })?;
         }
-        
+
         builder
             .with_root_certificates(root_store)
             .with_no_client_auth()
@@ -165,19 +173,18 @@ pub fn create_client_tls_config(
             .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
             .with_no_client_auth()
     };
-    
+
     Ok(config)
 }
 
 /// Create a rustls server config for accepting TLS connections
 pub fn create_server_tls_config(config: &TlsConfig) -> Result<rustls::ServerConfig> {
-    let builder = rustls::ServerConfig::builder()
-        .with_no_client_auth();
-    
+    let builder = rustls::ServerConfig::builder().with_no_client_auth();
+
     let server_config = builder
         .with_single_cert(config.cert_chain.clone(), config.private_key())
         .map_err(|e| TavanaError::TlsError(format!("Failed to create server config: {}", e)))?;
-    
+
     Ok(server_config)
 }
 
@@ -248,4 +255,3 @@ mod tests {
         assert!(key_pem.contains("BEGIN PRIVATE KEY"));
     }
 }
-

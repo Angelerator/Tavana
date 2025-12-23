@@ -242,12 +242,7 @@ pub static S3_HEAD_LATENCY_SECONDS: Lazy<Histogram> = Lazy::new(|| {
 
 /// Cache hit rate
 pub static CACHE_HITS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
-    register_counter_vec!(
-        "tavana_cache_total",
-        "Cache hits and misses",
-        &["result"]
-    )
-    .unwrap()
+    register_counter_vec!("tavana_cache_total", "Cache hits and misses", &["result"]).unwrap()
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -317,7 +312,15 @@ pub static DATA_ROW_COUNT: Lazy<Histogram> = Lazy::new(|| {
     register_histogram!(
         "tavana_data_row_count",
         "Row count from data sources",
-        vec![1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0, 100000000.0, 1000000000.0]
+        vec![
+            1000.0,
+            10000.0,
+            100000.0,
+            1000000.0,
+            10000000.0,
+            100000000.0,
+            1000000000.0
+        ]
     )
     .unwrap()
 });
@@ -362,7 +365,7 @@ pub static WORKER_PRESIZE_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         "tavana_worker_presize_total",
         "Total worker pre-sizing operations by result",
-        &["result"]  // "success", "failed", "skipped"
+        &["result"] // "success", "failed", "skipped"
     )
     .unwrap()
 });
@@ -372,7 +375,10 @@ pub static WORKER_PRESIZE_MEMORY_MB: Lazy<Histogram> = Lazy::new(|| {
     register_histogram!(
         "tavana_worker_presize_memory_mb",
         "Memory requested during worker pre-sizing in MB",
-        vec![256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0, 131072.0, 262144.0, 409600.0]
+        vec![
+            256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0, 131072.0,
+            262144.0, 409600.0
+        ]
     )
     .unwrap()
 });
@@ -402,7 +408,7 @@ pub static WORKER_POOL_STATUS: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge_vec!(
         "tavana_worker_pool_status",
         "Worker pool status by state",
-        &["state"]  // "total", "busy", "idle", "resizing"
+        &["state"] // "total", "busy", "idle", "resizing"
     )
     .unwrap()
 });
@@ -432,7 +438,7 @@ pub static INPLACE_RESIZE_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         "tavana_inplace_resize_total",
         "In-place resize events by direction",
-        &["direction"]  // "scale_up", "scale_down", "initial"
+        &["direction"] // "scale_up", "scale_down", "initial"
     )
     .unwrap()
 });
@@ -442,7 +448,9 @@ pub static RESIZE_MEMORY_DELTA_MB: Lazy<Histogram> = Lazy::new(|| {
     register_histogram!(
         "tavana_resize_memory_delta_mb",
         "Memory change during resize (MB, can be negative for scale-down)",
-        vec![-4096.0, -2048.0, -1024.0, -512.0, 0.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0]
+        vec![
+            -4096.0, -2048.0, -1024.0, -512.0, 0.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0
+        ]
     )
     .unwrap()
 });
@@ -452,7 +460,7 @@ pub static ELASTIC_SCALEUP_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         "tavana_elastic_scaleup_total",
         "Elastic scale-up events during query execution",
-        &["trigger"]  // "memory_pressure", "oom_risk", "cpu_throttle"
+        &["trigger"] // "memory_pressure", "oom_risk", "cpu_throttle"
     )
     .unwrap()
 });
@@ -462,7 +470,7 @@ pub static VPA_RECOMMENDATION_MB: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge_vec!(
         "tavana_vpa_recommendation_mb",
         "VPA memory recommendations in MB",
-        &["type"]  // "target", "lower_bound", "upper_bound", "uncapped_target"
+        &["type"] // "target", "lower_bound", "upper_bound", "uncapped_target"
     )
     .unwrap()
 });
@@ -546,18 +554,24 @@ pub fn init_metrics() {
     ADAPTIVE_THRESHOLD_MB.set(2048.0); // 2GB default
     ADAPTIVE_HPA_MIN.set(2.0);
     ADAPTIVE_HPA_MAX.set(100.0);
-    
+
     // Initialize worker pool status
     WORKER_POOL_STATUS.with_label_values(&["total"]).set(0.0);
     WORKER_POOL_STATUS.with_label_values(&["busy"]).set(0.0);
     WORKER_POOL_STATUS.with_label_values(&["idle"]).set(0.0);
     WORKER_POOL_STATUS.with_label_values(&["resizing"]).set(0.0);
-    
+
     // Initialize queue metrics
     QUERY_QUEUE_DEPTH.set(0.0);
-    QUERY_QUEUE_DEPTH_BY_PRIORITY.with_label_values(&["high"]).set(0.0);
-    QUERY_QUEUE_DEPTH_BY_PRIORITY.with_label_values(&["normal"]).set(0.0);
-    QUERY_QUEUE_DEPTH_BY_PRIORITY.with_label_values(&["low"]).set(0.0);
+    QUERY_QUEUE_DEPTH_BY_PRIORITY
+        .with_label_values(&["high"])
+        .set(0.0);
+    QUERY_QUEUE_DEPTH_BY_PRIORITY
+        .with_label_values(&["normal"])
+        .set(0.0);
+    QUERY_QUEUE_DEPTH_BY_PRIORITY
+        .with_label_values(&["low"])
+        .set(0.0);
 }
 
 /// Encode all metrics as Prometheus text format
@@ -616,9 +630,15 @@ pub fn update_worker_pool_metrics(
 ) {
     WORKER_POOL_CPU_UTILIZATION.set(cpu_util);
     WORKER_POOL_MEMORY_UTILIZATION.set(mem_util);
-    WORKER_REPLICAS.with_label_values(&["desired"]).set(desired as f64);
-    WORKER_REPLICAS.with_label_values(&["ready"]).set(ready as f64);
-    WORKER_REPLICAS.with_label_values(&["available"]).set(available as f64);
+    WORKER_REPLICAS
+        .with_label_values(&["desired"])
+        .set(desired as f64);
+    WORKER_REPLICAS
+        .with_label_values(&["ready"])
+        .set(ready as f64);
+    WORKER_REPLICAS
+        .with_label_values(&["available"])
+        .set(available as f64);
 }
 
 /// Record ephemeral pod creation
@@ -659,9 +679,9 @@ pub fn record_estimation_accuracy(estimated_mb: f64, actual_mb: f64) {
 
 /// Record resource estimation details for ML training
 pub fn record_resource_estimation(
-    data_mb: f64, 
-    memory_mb: f64, 
-    cpu_millicores: f64, 
+    data_mb: f64,
+    memory_mb: f64,
+    cpu_millicores: f64,
     multiplier: f64,
     has_join: bool,
     has_agg: bool,
@@ -671,7 +691,7 @@ pub fn record_resource_estimation(
     RESOURCE_ESTIMATE_MEMORY_MB.set(memory_mb);
     RESOURCE_ESTIMATE_CPU_MILLICORES.set(cpu_millicores);
     RESOURCE_ESTIMATE_MULTIPLIER.set(multiplier);
-    
+
     RESOURCE_ALLOC_MEMORY_MB
         .with_label_values(&[
             if has_join { "true" } else { "false" },
@@ -679,7 +699,7 @@ pub fn record_resource_estimation(
             if has_window { "true" } else { "false" },
         ])
         .observe(memory_mb);
-    
+
     RESOURCE_ALLOC_CPU_MILLICORES
         .with_label_values(&[
             if has_join { "true" } else { "false" },
@@ -705,10 +725,18 @@ pub fn record_worker_presize(result: &str, memory_mb: f64, cpu_cores: f64, laten
 
 /// Update worker pool status
 pub fn update_worker_pool_status(total: i32, busy: i32, idle: i32, resizing: i32) {
-    WORKER_POOL_STATUS.with_label_values(&["total"]).set(total as f64);
-    WORKER_POOL_STATUS.with_label_values(&["busy"]).set(busy as f64);
-    WORKER_POOL_STATUS.with_label_values(&["idle"]).set(idle as f64);
-    WORKER_POOL_STATUS.with_label_values(&["resizing"]).set(resizing as f64);
+    WORKER_POOL_STATUS
+        .with_label_values(&["total"])
+        .set(total as f64);
+    WORKER_POOL_STATUS
+        .with_label_values(&["busy"])
+        .set(busy as f64);
+    WORKER_POOL_STATUS
+        .with_label_values(&["idle"])
+        .set(idle as f64);
+    WORKER_POOL_STATUS
+        .with_label_values(&["resizing"])
+        .set(resizing as f64);
 }
 
 /// Record pre-sizing memory utilization after query completes
@@ -736,11 +764,24 @@ pub fn record_elastic_scaleup(trigger: &str) {
 }
 
 /// Update VPA recommendations
-pub fn update_vpa_recommendations(target_mb: f64, lower_bound_mb: f64, upper_bound_mb: f64, uncapped_mb: f64) {
-    VPA_RECOMMENDATION_MB.with_label_values(&["target"]).set(target_mb);
-    VPA_RECOMMENDATION_MB.with_label_values(&["lower_bound"]).set(lower_bound_mb);
-    VPA_RECOMMENDATION_MB.with_label_values(&["upper_bound"]).set(upper_bound_mb);
-    VPA_RECOMMENDATION_MB.with_label_values(&["uncapped_target"]).set(uncapped_mb);
+pub fn update_vpa_recommendations(
+    target_mb: f64,
+    lower_bound_mb: f64,
+    upper_bound_mb: f64,
+    uncapped_mb: f64,
+) {
+    VPA_RECOMMENDATION_MB
+        .with_label_values(&["target"])
+        .set(target_mb);
+    VPA_RECOMMENDATION_MB
+        .with_label_values(&["lower_bound"])
+        .set(lower_bound_mb);
+    VPA_RECOMMENDATION_MB
+        .with_label_values(&["upper_bound"])
+        .set(upper_bound_mb);
+    VPA_RECOMMENDATION_MB
+        .with_label_values(&["uncapped_target"])
+        .set(uncapped_mb);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -761,7 +802,7 @@ pub static QUERY_QUEUE_DEPTH_BY_PRIORITY: Lazy<GaugeVec> = Lazy::new(|| {
     register_gauge_vec!(
         "tavana_query_queue_depth_by_priority",
         "Query queue depth by priority level",
-        &["priority"]  // "high", "normal", "low"
+        &["priority"] // "high", "normal", "low"
     )
     .unwrap()
 });
@@ -801,9 +842,15 @@ pub fn record_queue_depth(depth: usize) {
 
 /// Record queue depth by priority
 pub fn record_queue_depth_by_priority(high: usize, normal: usize, low: usize) {
-    QUERY_QUEUE_DEPTH_BY_PRIORITY.with_label_values(&["high"]).set(high as f64);
-    QUERY_QUEUE_DEPTH_BY_PRIORITY.with_label_values(&["normal"]).set(normal as f64);
-    QUERY_QUEUE_DEPTH_BY_PRIORITY.with_label_values(&["low"]).set(low as f64);
+    QUERY_QUEUE_DEPTH_BY_PRIORITY
+        .with_label_values(&["high"])
+        .set(high as f64);
+    QUERY_QUEUE_DEPTH_BY_PRIORITY
+        .with_label_values(&["normal"])
+        .set(normal as f64);
+    QUERY_QUEUE_DEPTH_BY_PRIORITY
+        .with_label_values(&["low"])
+        .set(low as f64);
 }
 
 /// Record query rejected due to queue full
@@ -858,7 +905,7 @@ pub static ELASTIC_RESIZE_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         "tavana_elastic_resize_total",
         "Total elastic resize operations during query execution",
-        &["result"]  // "success", "failed", "at_limit"
+        &["result"] // "success", "failed", "at_limit"
     )
     .unwrap()
 });
@@ -885,7 +932,9 @@ pub fn query_ended() {
 
 /// Update active queries for a specific worker
 pub fn update_worker_active_queries(worker: &str, count: i64) {
-    ACTIVE_QUERIES_PER_WORKER.with_label_values(&[worker]).set(count as f64);
+    ACTIVE_QUERIES_PER_WORKER
+        .with_label_values(&[worker])
+        .set(count as f64);
 }
 
 /// Update query rate
@@ -948,7 +997,7 @@ pub static TENANT_ROUTING_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         "tavana_tenant_routing_total",
         "Routing decisions by type",
-        &["type"]  // "dedicated", "shared", "new_pool"
+        &["type"] // "dedicated", "shared", "new_pool"
     )
     .unwrap()
 });
@@ -990,12 +1039,16 @@ pub fn record_tenant_pool_deleted(tenant_id: &str) {
 /// Record tenant query routed
 pub fn record_tenant_query(tenant_id: &str, routing_type: &str) {
     TENANT_POOL_QUERIES.with_label_values(&[tenant_id]).inc();
-    TENANT_ROUTING_TOTAL.with_label_values(&[routing_type]).inc();
+    TENANT_ROUTING_TOTAL
+        .with_label_values(&[routing_type])
+        .inc();
 }
 
 /// Update tenant pool workers count
 pub fn update_tenant_pool_workers(tenant_id: &str, count: i32) {
-    TENANT_POOL_WORKERS.with_label_values(&[tenant_id]).set(count as f64);
+    TENANT_POOL_WORKERS
+        .with_label_values(&[tenant_id])
+        .set(count as f64);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1007,11 +1060,10 @@ pub static QUERY_OUTCOME_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         "tavana_query_outcome_total",
         "Total queries by outcome type",
-        &["outcome"]  
-        // Possible values:
-        // "success", "timeout", "oom", "connection_error", "worker_error",
-        // "client_disconnect", "parse_error", "auth_error", "unknown_error",
-        // "rejected_capacity", "rejected_queue_full", "rejected_too_large", "rejected_overload"
+        &["outcome"] // Possible values:
+                     // "success", "timeout", "oom", "connection_error", "worker_error",
+                     // "client_disconnect", "parse_error", "auth_error", "unknown_error",
+                     // "rejected_capacity", "rejected_queue_full", "rejected_too_large", "rejected_overload"
     )
     .unwrap()
 });
@@ -1039,7 +1091,7 @@ pub static ADAPTIVE_AIMD_EVENTS: Lazy<CounterVec> = Lazy::new(|| {
     register_counter_vec!(
         "tavana_adaptive_aimd_events_total",
         "AIMD limit adjustment events",
-        &["direction"]  // "increase", "decrease"
+        &["direction"] // "increase", "decrease"
     )
     .unwrap()
 });
@@ -1125,13 +1177,32 @@ pub fn update_success_rate(rate: f64) {
 }
 
 /// Update failure breakdown
-pub fn update_failure_breakdown(timeout: u64, oom: u64, connection: u64, worker: u64, client: u64, other: u64) {
-    FAILURE_BREAKDOWN.with_label_values(&["timeout"]).set(timeout as f64);
-    FAILURE_BREAKDOWN.with_label_values(&["oom"]).set(oom as f64);
-    FAILURE_BREAKDOWN.with_label_values(&["connection"]).set(connection as f64);
-    FAILURE_BREAKDOWN.with_label_values(&["worker"]).set(worker as f64);
-    FAILURE_BREAKDOWN.with_label_values(&["client"]).set(client as f64);
-    FAILURE_BREAKDOWN.with_label_values(&["other"]).set(other as f64);
+pub fn update_failure_breakdown(
+    timeout: u64,
+    oom: u64,
+    connection: u64,
+    worker: u64,
+    client: u64,
+    other: u64,
+) {
+    FAILURE_BREAKDOWN
+        .with_label_values(&["timeout"])
+        .set(timeout as f64);
+    FAILURE_BREAKDOWN
+        .with_label_values(&["oom"])
+        .set(oom as f64);
+    FAILURE_BREAKDOWN
+        .with_label_values(&["connection"])
+        .set(connection as f64);
+    FAILURE_BREAKDOWN
+        .with_label_values(&["worker"])
+        .set(worker as f64);
+    FAILURE_BREAKDOWN
+        .with_label_values(&["client"])
+        .set(client as f64);
+    FAILURE_BREAKDOWN
+        .with_label_values(&["other"])
+        .set(other as f64);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1263,4 +1334,3 @@ pub fn set_operation_mode(mode: &str) {
 pub fn set_estimated_wait_ms(wait_ms: u64) {
     ESTIMATED_WAIT_MS.set(wait_ms as f64);
 }
-

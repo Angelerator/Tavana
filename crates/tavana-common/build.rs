@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_root = PathBuf::from("../../proto");
-    
+
     let protos = [
         proto_root.join("tavana/v1/common.proto"),
         proto_root.join("tavana/v1/query.proto"),
@@ -25,4 +25,3 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-

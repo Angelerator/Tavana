@@ -21,15 +21,15 @@ impl RedisQueue {
     pub async fn new(_config: RedisQueueConfig) -> anyhow::Result<Self> {
         anyhow::bail!("Redis queue not implemented")
     }
-    
+
     pub async fn dequeue(&self) -> anyhow::Result<Option<QueuedQuery>> {
         Ok(None)
     }
-    
+
     pub async fn complete(&self, _query_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
-    
+
     pub async fn fail(&self, _query_id: &str, _error: &str) -> anyhow::Result<()> {
         Ok(())
     }
@@ -48,4 +48,3 @@ pub async fn start_queue_worker(
 ) {
     // No-op
 }
-

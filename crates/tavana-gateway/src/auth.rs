@@ -1,8 +1,8 @@
 //! Authentication middleware for the gateway
 
-use tavana_common::{AuthToken, UserIdentity, ApiKeyValidator, TavanaError, Result};
-use std::sync::Arc;
 use parking_lot::RwLock;
+use std::sync::Arc;
+use tavana_common::{ApiKeyValidator, AuthToken, Result, TavanaError, UserIdentity};
 
 /// Authentication service that validates both API keys and JWTs
 pub struct AuthService {
@@ -32,7 +32,9 @@ impl AuthService {
 
     /// Register an API key
     pub fn register_api_key(&self, api_key: &str, identity: UserIdentity) {
-        self.api_key_validator.write().register_key(api_key, identity);
+        self.api_key_validator
+            .write()
+            .register_key(api_key, identity);
     }
 }
 
@@ -41,4 +43,3 @@ impl Default for AuthService {
         Self::new()
     }
 }
-
