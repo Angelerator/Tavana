@@ -3,8 +3,20 @@ name: Security
 on:
   push:
     branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Dockerfile.*'
+      - '.github/workflows/security.yaml'
   pull_request:
     branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Dockerfile.*'
+      - '.github/workflows/security.yaml'
   schedule:
     # Run weekly on Sunday
     - cron: '0 0 * * 0'
