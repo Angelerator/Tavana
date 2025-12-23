@@ -10,7 +10,10 @@ use uuid::Uuid;
 
 /// Streaming batch types for true row-by-row streaming
 pub enum StreamingBatch {
-    Metadata { columns: Vec<String>, column_types: Vec<String> },
+    Metadata {
+        columns: Vec<String>,
+        column_types: Vec<String>,
+    },
     Rows(Vec<Vec<String>>),
     Error(String),
 }
@@ -55,14 +58,14 @@ impl WorkerClient {
         // Connect with large message size for big result sets
         info!("Connecting to worker at {}", self.worker_addr);
         const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
-        
+
         let channel = Channel::from_shared(self.worker_addr.clone())?
             .timeout(std::time::Duration::from_secs(1800)) // 30 minutes
             .connect_timeout(std::time::Duration::from_secs(30))
             .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
             .connect()
             .await?;
-            
+
         let client = proto::query_service_client::QueryServiceClient::new(channel)
             .max_decoding_message_size(MAX_MESSAGE_SIZE)
             .max_encoding_message_size(MAX_MESSAGE_SIZE);
@@ -98,7 +101,7 @@ impl WorkerClient {
             }),
             options: Some(proto::QueryOptions {
                 timeout_seconds: 300,
-                max_rows: 0,  // 0 = unlimited rows (streaming)
+                max_rows: 0, // 0 = unlimited rows (streaming)
                 max_bytes: 0,
                 enable_profiling: false,
                 session_params: Default::default(),
@@ -132,7 +135,9 @@ impl WorkerClient {
                     debug!("Received batch with {} rows", batch.row_count);
                     // Decode JSON data
                     if !batch.data.is_empty() {
-                        if let Ok(batch_rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                        if let Ok(batch_rows) =
+                            serde_json::from_slice::<Vec<Vec<String>>>(&batch.data)
+                        {
                             rows.extend(batch_rows);
                         }
                     }
@@ -168,7 +173,10 @@ impl WorkerClient {
         let mut client = self.get_client().await?;
 
         let query_id = Uuid::new_v4().to_string();
-        debug!("Executing streaming query {} for user {}", query_id, user_id);
+        debug!(
+            "Executing streaming query {} for user {}",
+            query_id, user_id
+        );
 
         let request = proto::ExecuteQueryRequest {
             query_id: query_id.clone(),
@@ -181,7 +189,7 @@ impl WorkerClient {
             }),
             options: Some(proto::QueryOptions {
                 timeout_seconds: 600, // 10 minutes for large queries
-                max_rows: 0,  // 0 = unlimited rows (streaming)
+                max_rows: 0,          // 0 = unlimited rows (streaming)
                 max_bytes: 0,
                 enable_profiling: false,
                 session_params: Default::default(),
@@ -215,9 +223,9 @@ impl WorkerClient {
                             continue;
                         }
                     }
-                    Some(proto::query_result_batch::Result::Error(err)) => {
-                        Ok(StreamingBatch::Error(format!("{}: {}", err.code, err.message)))
-                    }
+                    Some(proto::query_result_batch::Result::Error(err)) => Ok(
+                        StreamingBatch::Error(format!("{}: {}", err.code, err.message)),
+                    ),
                     _ => continue,
                 };
 
@@ -244,4 +252,3 @@ pub struct QueryResult {
     pub rows: Vec<Vec<String>>,
     pub total_rows: u64,
 }
-

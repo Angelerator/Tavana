@@ -189,4 +189,3 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::NotFound);
     }
 }
-

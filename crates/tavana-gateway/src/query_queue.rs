@@ -32,11 +32,11 @@
 //! - Don't wait for SmartScaler to notice
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, RwLock, Notify};
-use tracing::{debug, info, warn, error};
+use tokio::sync::{mpsc, oneshot, Notify, RwLock};
+use tracing::{debug, error, info, warn};
 
 use crate::metrics;
 
@@ -85,16 +85,27 @@ pub struct QueryToken {
 impl QueryToken {
     /// How long the query waited in queue
     pub fn queue_wait_ms(&self) -> u64 {
-        self.dispatched_at.duration_since(self.enqueued_at).as_millis() as u64
+        self.dispatched_at
+            .duration_since(self.enqueued_at)
+            .as_millis() as u64
     }
 }
 
 /// Outcome of a query execution
 #[derive(Debug, Clone)]
 pub enum QueryOutcome {
-    Success { rows: u64, bytes: u64, duration_ms: u64 },
-    Failure { error: String, duration_ms: u64 },
-    Timeout { duration_ms: u64 },
+    Success {
+        rows: u64,
+        bytes: u64,
+        duration_ms: u64,
+    },
+    Failure {
+        error: String,
+        duration_ms: u64,
+    },
+    Timeout {
+        duration_ms: u64,
+    },
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -135,7 +146,7 @@ impl Default for ResourceCeiling {
             node_allocatable_mb: 16 * 1024, // 16GB default (laptop-sized)
             max_workers: 100,
             max_memory_per_worker_mb: 400 * 1024, // 400GB from config
-            ceiling_mb: 16 * 1024, // Limited by node
+            ceiling_mb: 16 * 1024,                // Limited by node
             last_refresh: Instant::now(),
         }
     }
@@ -146,7 +157,7 @@ impl ResourceCeiling {
     pub fn at_ceiling(&self, current_total_mb: u64) -> bool {
         current_total_mb >= (self.ceiling_mb as f64 * CEILING_THRESHOLD_RATIO) as u64
     }
-    
+
     /// How much headroom we have
     pub fn headroom_mb(&self, current_total_mb: u64) -> u64 {
         self.ceiling_mb.saturating_sub(current_total_mb)
@@ -190,7 +201,7 @@ impl Default for ClusterCapacity {
     fn default() -> Self {
         Self {
             // Start with conservative estimate, will be updated from K8s
-            total_memory_mb: 512,  // 2 workers × 256MB default
+            total_memory_mb: 512, // 2 workers × 256MB default
             worker_count: 2,
             avg_memory_per_worker_mb: 256,
             used_memory_mb: 0,
@@ -251,45 +262,44 @@ pub struct QueueStats {
 pub struct QueryQueue {
     /// FIFO queue of waiting queries
     queue: RwLock<VecDeque<QueueEntry>>,
-    
+
     /// Current memory in use by active queries (MB)
     current_usage_mb: AtomicU64,
-    
+
     /// Current cluster capacity (from K8s workers)
     capacity: RwLock<ClusterCapacity>,
-    
+
     /// Resource ceiling (from K8s nodes + config)
     ceiling: RwLock<ResourceCeiling>,
-    
+
     /// Current operation mode
     mode: RwLock<OperationMode>,
-    
+
     /// Notifier for when capacity becomes available
     capacity_available: Arc<Notify>,
-    
+
     /// Active query count
     active_queries: AtomicU64,
-    
+
     /// HPA scale-up requested (proactive)
     hpa_scale_requested: AtomicBool,
-    
+
     /// Number of workers requested via HPA (pending)
     hpa_pending_workers: AtomicU64,
-    
+
     // ═══════════════════════════════════════════════════════════════════
     // METRICS
     // ═══════════════════════════════════════════════════════════════════
-    
     total_processed: AtomicU64,
     successful: AtomicU64,
     failed: AtomicU64,
-    
+
     /// Rolling window of queue wait times (for avg/p99)
     wait_times: RwLock<Vec<u64>>,
-    
+
     /// Rolling window of execution times
     execution_times: RwLock<Vec<u64>>,
-    
+
     /// HPA scale-up signal flag (for SmartScaler to read)
     hpa_scale_up_signal: RwLock<bool>,
 }
@@ -306,37 +316,37 @@ impl QueryQueue {
             active_queries: AtomicU64::new(0),
             hpa_scale_requested: AtomicBool::new(false),
             hpa_pending_workers: AtomicU64::new(0),
-            
+
             total_processed: AtomicU64::new(0),
             successful: AtomicU64::new(0),
             failed: AtomicU64::new(0),
-            
+
             wait_times: RwLock::new(Vec::with_capacity(1000)),
             execution_times: RwLock::new(Vec::with_capacity(1000)),
             hpa_scale_up_signal: RwLock::new(false),
         })
     }
-    
+
     // ═══════════════════════════════════════════════════════════════════
     // OPERATION MODE
     // ═══════════════════════════════════════════════════════════════════
-    
+
     /// Get current operation mode
     pub async fn get_mode(&self) -> OperationMode {
         *self.mode.read().await
     }
-    
+
     /// Update operation mode based on ceiling
     async fn update_mode(&self) {
         let capacity = self.capacity.read().await;
         let ceiling = self.ceiling.read().await;
-        
+
         let new_mode = if ceiling.at_ceiling(capacity.total_memory_mb) {
             OperationMode::Saturation
         } else {
             OperationMode::Scaling
         };
-        
+
         let mut mode = self.mode.write().await;
         if *mode != new_mode {
             info!(
@@ -347,28 +357,29 @@ impl QueryQueue {
                 "Operation mode changed"
             );
             *mode = new_mode;
-            
+
             metrics::set_operation_mode(match new_mode {
                 OperationMode::Scaling => "scaling",
                 OperationMode::Saturation => "saturation",
             });
         }
     }
-    
+
     // ═══════════════════════════════════════════════════════════════════
     // PROACTIVE HPA SIGNALING
     // ═══════════════════════════════════════════════════════════════════
-    
+
     /// Request HPA to scale up (proactive)
     pub fn request_hpa_scale_up(&self, additional_workers: u64) {
         let current = self.hpa_pending_workers.load(Ordering::SeqCst);
         if additional_workers > current {
-            self.hpa_pending_workers.store(additional_workers, Ordering::SeqCst);
+            self.hpa_pending_workers
+                .store(additional_workers, Ordering::SeqCst);
             self.hpa_scale_requested.store(true, Ordering::SeqCst);
             debug!("HPA scale-up requested: {} workers", additional_workers);
         }
     }
-    
+
     /// Check if HPA scale-up was requested and clear the flag
     pub fn take_hpa_request(&self) -> Option<u64> {
         if self.hpa_scale_requested.swap(false, Ordering::SeqCst) {
@@ -379,41 +390,41 @@ impl QueryQueue {
         }
         None
     }
-    
+
     // ═══════════════════════════════════════════════════════════════════
     // WAIT TIME ESTIMATION (for saturation mode)
     // ═══════════════════════════════════════════════════════════════════
-    
+
     async fn estimate_wait_time(&self) -> u64 {
         let queue = self.queue.read().await;
         let exec_times = self.execution_times.read().await;
         let capacity = self.capacity.read().await;
-        
+
         if queue.is_empty() {
             return 0;
         }
-        
+
         // Average execution time
         let avg_exec = if exec_times.is_empty() {
             1000 // Default 1 second if no data
         } else {
             exec_times.iter().sum::<u64>() / exec_times.len() as u64
         };
-        
+
         // Estimate based on queue depth and parallelism
         let parallelism = (capacity.worker_count as u64).max(1);
         let queue_depth = queue.len() as u64;
-        
+
         // estimated_wait = (queue_depth / parallelism) * avg_execution_time
         (queue_depth / parallelism) * avg_exec
     }
-    
+
     // ═══════════════════════════════════════════════════════════════════
     // ENQUEUE - Two-mode operation
     // ═══════════════════════════════════════════════════════════════════
-    
+
     /// Enqueue a query and wait until capacity is available
-    /// 
+    ///
     /// SCALING MODE (below ceiling):
     /// - Always accepts
     /// - Proactively triggers HPA if queue grows
@@ -430,7 +441,7 @@ impl QueryQueue {
     ) -> Result<QueryToken, QueueError> {
         let enqueued_at = Instant::now();
         let mode = self.get_mode().await;
-        
+
         // Check queue size limit
         {
             let queue = self.queue.read().await;
@@ -440,9 +451,11 @@ impl QueryQueue {
                     queue_depth = queue.len(),
                     "Queue full, cannot accept more queries"
                 );
-                return Err(QueueError::QueueFull { max_size: MAX_QUEUE_SIZE });
+                return Err(QueueError::QueueFull {
+                    max_size: MAX_QUEUE_SIZE,
+                });
             }
-            
+
             // SATURATION MODE: Check if wait would be too long
             if mode == OperationMode::Saturation {
                 let estimated_wait = self.estimate_wait_time().await;
@@ -454,17 +467,17 @@ impl QueryQueue {
                         mode = ?mode,
                         "Saturation mode: queue backed up, suggest retry later"
                     );
-                    return Err(QueueError::AtCapacity { 
+                    return Err(QueueError::AtCapacity {
                         retry_after_ms,
                         queue_depth: queue.len(),
                     });
                 }
             }
         }
-        
+
         // Create a channel to be notified when we're dispatched
         let (ready_tx, ready_rx) = oneshot::channel();
-        
+
         // Create queue entry
         let entry = QueueEntry {
             query_id: query_id.clone(),
@@ -472,12 +485,12 @@ impl QueryQueue {
             enqueued_at,
             ready_tx,
         };
-        
+
         // Add to queue
         let queue_depth = {
             let mut queue = self.queue.write().await;
             queue.push_back(entry);
-            
+
             let depth = queue.len();
             debug!(
                 query_id = %query_id,
@@ -486,12 +499,12 @@ impl QueryQueue {
                 mode = ?mode,
                 "Query enqueued"
             );
-            
+
             // Update metrics
             metrics::set_queue_depth(depth);
             depth
         };
-        
+
         // SCALING MODE: Proactively request HPA scale-up
         if mode == OperationMode::Scaling && queue_depth >= QUEUE_DEPTH_SCALE_UP_THRESHOLD {
             // Request 1 additional worker per 5 queries in queue
@@ -500,22 +513,22 @@ impl QueryQueue {
             *self.hpa_scale_up_signal.write().await = true;
             metrics::set_hpa_scale_up_signal(true);
         }
-        
+
         // Trigger dispatcher to check queue
         self.capacity_available.notify_one();
-        
+
         // Determine timeout based on mode
         let dispatch_timeout = match mode {
             OperationMode::Scaling => Duration::from_secs(3600), // 1 hour - HPA will add capacity
             OperationMode::Saturation => Duration::from_millis(SATURATION_MAX_WAIT_MS), // 2 min max
         };
-        
+
         // Wait until we're dispatched
         match tokio::time::timeout(dispatch_timeout, ready_rx).await {
             Ok(Ok(())) => {
                 let dispatched_at = Instant::now();
                 let wait_ms = dispatched_at.duration_since(enqueued_at).as_millis() as u64;
-                
+
                 // Record wait time
                 {
                     let mut waits = self.wait_times.write().await;
@@ -524,21 +537,21 @@ impl QueryQueue {
                         waits.remove(0);
                     }
                 }
-                
+
                 // SCALING MODE: Long wait should trigger more HPA
                 if mode == OperationMode::Scaling && wait_ms > QUEUE_WAIT_SCALE_UP_THRESHOLD_MS {
                     self.request_hpa_scale_up(2);
                     *self.hpa_scale_up_signal.write().await = true;
                     metrics::set_hpa_scale_up_signal(true);
                 }
-                
+
                 debug!(
                     query_id = %query_id,
                     wait_ms = wait_ms,
                     mode = ?mode,
                     "Query dispatched from queue"
                 );
-                
+
                 Ok(QueryToken {
                     query_id,
                     cost_mb: estimated_data_mb,
@@ -557,23 +570,26 @@ impl QueryQueue {
                     queue.retain(|e| e.query_id != query_id);
                     metrics::set_queue_depth(queue.len());
                 }
-                
+
                 warn!(query_id = %query_id, mode = ?mode, "Query timed out waiting in queue");
-                Err(QueueError::Timeout { wait_seconds: dispatch_timeout.as_secs() })
+                Err(QueueError::Timeout {
+                    wait_seconds: dispatch_timeout.as_secs(),
+                })
             }
         }
     }
-    
+
     // ═══════════════════════════════════════════════════════════════════
     // COMPLETE - Release capacity after query finishes
     // ═══════════════════════════════════════════════════════════════════
-    
+
     pub async fn complete(&self, token: QueryToken, outcome: QueryOutcome) {
         // Release capacity
-        self.current_usage_mb.fetch_sub(token.cost_mb, Ordering::SeqCst);
+        self.current_usage_mb
+            .fetch_sub(token.cost_mb, Ordering::SeqCst);
         self.active_queries.fetch_sub(1, Ordering::SeqCst);
         self.total_processed.fetch_add(1, Ordering::SeqCst);
-        
+
         // Record outcome
         let duration_ms = match &outcome {
             QueryOutcome::Success { duration_ms, .. } => {
@@ -589,7 +605,7 @@ impl QueryQueue {
                 *duration_ms
             }
         };
-        
+
         // Record execution time
         {
             let mut times = self.execution_times.write().await;
@@ -598,7 +614,7 @@ impl QueryQueue {
                 times.remove(0);
             }
         }
-        
+
         debug!(
             query_id = %token.query_id,
             cost_mb = token.cost_mb,
@@ -606,41 +622,41 @@ impl QueryQueue {
             exec_ms = duration_ms,
             "Query completed"
         );
-        
+
         // Notify dispatcher that capacity is available
         self.capacity_available.notify_one();
-        
+
         // Update metrics
         let current_usage = self.current_usage_mb.load(Ordering::SeqCst);
         let capacity = self.capacity.read().await;
         metrics::set_current_usage_mb(current_usage);
         metrics::set_available_capacity_mb(capacity.total_memory_mb.saturating_sub(current_usage));
     }
-    
+
     // ═══════════════════════════════════════════════════════════════════
     // DISPATCHER LOOP - Runs continuously, dispatches when capacity available
     // ═══════════════════════════════════════════════════════════════════
-    
+
     pub async fn start_dispatcher(self: Arc<Self>) {
         info!("Starting query dispatcher loop (VPA-first, HPA-second)");
-        
+
         loop {
             // Wait for notification or short timeout for responsiveness
             tokio::select! {
                 _ = self.capacity_available.notified() => {},
                 _ = tokio::time::sleep(Duration::from_millis(DISPATCHER_INTERVAL_MS)) => {},
             }
-            
+
             // Try to dispatch waiting queries
             self.try_dispatch().await;
-            
+
             // Update operation mode based on capacity vs ceiling
             self.update_mode().await;
         }
     }
-    
+
     /// Try to dispatch queries from the queue
-    /// 
+    ///
     /// Priority order:
     /// 1. If worker has capacity → dispatch immediately
     /// 2. If VPA can resize → dispatch (SmartScaler handles resize)
@@ -651,29 +667,30 @@ impl QueryQueue {
         let current_usage = self.current_usage_mb.load(Ordering::SeqCst);
         let available = capacity.available_mb();
         let mode = *self.mode.read().await;
-        
+
         // Look at front of queue
         let mut queue = self.queue.write().await;
-        
+
         // Dispatch as many queries as fit
         while let Some(entry) = queue.front() {
-            let can_dispatch = 
+            let can_dispatch =
                 // Case 1: We have capacity
-                entry.cost_mb <= available ||
+                entry.cost_mb <= available
                 // Case 2: No queries running (must dispatch at least one to make progress)
-                self.active_queries.load(Ordering::SeqCst) == 0 ||
+                || self.active_queries.load(Ordering::SeqCst) == 0
                 // Case 3: Query is small enough (<100MB) - always try
-                entry.cost_mb < 100;
-            
+                || entry.cost_mb < 100;
+
             if can_dispatch {
                 if let Some(entry) = queue.pop_front() {
                     // Reserve capacity
-                    self.current_usage_mb.fetch_add(entry.cost_mb, Ordering::SeqCst);
+                    self.current_usage_mb
+                        .fetch_add(entry.cost_mb, Ordering::SeqCst);
                     self.active_queries.fetch_add(1, Ordering::SeqCst);
-                    
+
                     // Notify the waiting caller
                     let _ = entry.ready_tx.send(());
-                    
+
                     debug!(
                         query_id = %entry.query_id,
                         cost_mb = entry.cost_mb,
@@ -681,7 +698,7 @@ impl QueryQueue {
                         mode = ?mode,
                         "Query dispatched"
                     );
-                    
+
                     // Update queue depth metric
                     metrics::set_queue_depth(queue.len());
                 }
@@ -690,38 +707,42 @@ impl QueryQueue {
                 // In SCALING MODE, this triggers HPA
                 if mode == OperationMode::Scaling && !queue.is_empty() {
                     // Request HPA to add capacity
-                    let needed_workers = ((entry.cost_mb as f64 / capacity.avg_memory_per_worker_mb as f64).ceil() as u64).max(1);
+                    let needed_workers = ((entry.cost_mb as f64
+                        / capacity.avg_memory_per_worker_mb as f64)
+                        .ceil() as u64)
+                        .max(1);
                     self.hpa_scale_requested.store(true, Ordering::SeqCst);
                     if needed_workers > self.hpa_pending_workers.load(Ordering::SeqCst) {
-                        self.hpa_pending_workers.store(needed_workers, Ordering::SeqCst);
+                        self.hpa_pending_workers
+                            .store(needed_workers, Ordering::SeqCst);
                     }
                 }
                 break;
             }
         }
-        
+
         // Clear HPA signal if queue is draining
         if queue.len() < QUEUE_DEPTH_SCALE_UP_THRESHOLD {
             *self.hpa_scale_up_signal.write().await = false;
             metrics::set_hpa_scale_up_signal(false);
         }
     }
-    
+
     // ═══════════════════════════════════════════════════════════════════
     // CAPACITY UPDATER - Periodically queries K8s for real capacity
     // ═══════════════════════════════════════════════════════════════════
-    
+
     pub async fn start_capacity_updater(self: Arc<Self>, k8s_client: kube::Client) {
         info!("Starting K8s capacity updater loop");
-        
+
         let mut ceiling_refresh_counter = 0u64;
-        
+
         loop {
             // Update worker capacity every 1 second
             if let Err(e) = self.update_capacity_from_k8s(&k8s_client).await {
                 warn!("Failed to update capacity from K8s: {}", e);
             }
-            
+
             // Update ceiling less frequently (every 10 seconds)
             ceiling_refresh_counter += CAPACITY_REFRESH_INTERVAL_MS;
             if ceiling_refresh_counter >= CEILING_REFRESH_INTERVAL_MS {
@@ -730,25 +751,25 @@ impl QueryQueue {
                     debug!("Failed to update ceiling from K8s: {}", e);
                 }
             }
-            
+
             tokio::time::sleep(Duration::from_millis(CAPACITY_REFRESH_INTERVAL_MS)).await;
         }
     }
-    
+
     /// Update worker capacity from K8s pods
     async fn update_capacity_from_k8s(&self, client: &kube::Client) -> anyhow::Result<()> {
         use k8s_openapi::api::core::v1::Pod;
         use kube::api::{Api, ListParams};
-        
+
         let pods: Api<Pod> = Api::namespaced(client.clone(), "tavana");
         let lp = ListParams::default().labels("app=worker");
-        
+
         let pod_list = pods.list(&lp).await?;
-        
+
         let mut total_memory_mb: u64 = 0;
         let mut used_memory_mb: u64 = 0;
         let mut worker_count: u32 = 0;
-        
+
         for pod in pod_list.items {
             // Only count running pods
             if let Some(status) = &pod.status {
@@ -756,7 +777,7 @@ impl QueryQueue {
                     continue;
                 }
             }
-            
+
             // Get memory limit and usage from container spec
             if let Some(spec) = &pod.spec {
                 for container in &spec.containers {
@@ -780,19 +801,19 @@ impl QueryQueue {
                 }
             }
         }
-        
+
         if worker_count > 0 {
             let avg = total_memory_mb / worker_count as u64;
-            
+
             let mut capacity = self.capacity.write().await;
             let old_total = capacity.total_memory_mb;
-            
+
             capacity.total_memory_mb = total_memory_mb;
             capacity.worker_count = worker_count;
             capacity.avg_memory_per_worker_mb = avg;
             capacity.used_memory_mb = self.current_usage_mb.load(Ordering::SeqCst);
             capacity.last_refresh = Instant::now();
-            
+
             if old_total != total_memory_mb {
                 let mode = self.get_mode().await;
                 info!(
@@ -804,28 +825,28 @@ impl QueryQueue {
                     "Cluster capacity updated from K8s"
                 );
             }
-            
+
             // Update metrics
             metrics::set_cluster_capacity_mb(total_memory_mb);
             metrics::set_worker_count(worker_count);
-            
+
             // Notify dispatcher in case new capacity allows more dispatches
             self.capacity_available.notify_one();
         }
-        
+
         Ok(())
     }
-    
+
     /// Update resource ceiling from K8s nodes
     async fn update_ceiling_from_k8s(&self, client: &kube::Client) -> anyhow::Result<()> {
         use k8s_openapi::api::core::v1::Node;
         use kube::api::{Api, ListParams};
-        
+
         let nodes: Api<Node> = Api::all(client.clone());
         let node_list = nodes.list(&ListParams::default()).await?;
-        
+
         let mut total_allocatable_mb: u64 = 0;
-        
+
         for node in node_list.items {
             if let Some(status) = &node.status {
                 if let Some(allocatable) = &status.allocatable {
@@ -835,18 +856,18 @@ impl QueryQueue {
                 }
             }
         }
-        
+
         if total_allocatable_mb > 0 {
             let mut ceiling = self.ceiling.write().await;
             let old_ceiling = ceiling.ceiling_mb;
-            
+
             ceiling.node_allocatable_mb = total_allocatable_mb;
             // max_workers and max_memory_per_worker come from config
             // We use conservative defaults
             let config_limit = ceiling.max_workers as u64 * ceiling.max_memory_per_worker_mb;
             ceiling.ceiling_mb = total_allocatable_mb.min(config_limit);
             ceiling.last_refresh = Instant::now();
-            
+
             if old_ceiling != ceiling.ceiling_mb {
                 info!(
                     node_allocatable_mb = total_allocatable_mb,
@@ -854,24 +875,24 @@ impl QueryQueue {
                     ceiling_mb = ceiling.ceiling_mb,
                     "Resource ceiling updated from K8s nodes"
                 );
-                
+
                 metrics::set_resource_ceiling_mb(ceiling.ceiling_mb);
             }
-            
+
             // Drop lock before updating mode
             drop(ceiling);
         }
-        
+
         // Update operation mode
         self.update_mode().await;
-        
+
         Ok(())
     }
-    
+
     // ═══════════════════════════════════════════════════════════════════
     // MANUAL CAPACITY UPDATE (for testing or when K8s is unavailable)
     // ═══════════════════════════════════════════════════════════════════
-    
+
     pub async fn set_capacity(&self, total_memory_mb: u64, worker_count: u32) {
         let mut capacity = self.capacity.write().await;
         capacity.total_memory_mb = total_memory_mb;
@@ -882,28 +903,28 @@ impl QueryQueue {
             0
         };
         capacity.last_refresh = Instant::now();
-        
+
         info!(
             total_mb = total_memory_mb,
             workers = worker_count,
             "Capacity manually set"
         );
-        
+
         // Notify dispatcher
         self.capacity_available.notify_one();
     }
-    
+
     // ═══════════════════════════════════════════════════════════════════
     // STATISTICS
     // ═══════════════════════════════════════════════════════════════════
-    
+
     pub async fn stats(&self) -> QueueStats {
         let queue = self.queue.read().await;
         let capacity = self.capacity.read().await;
         let ceiling = self.ceiling.read().await;
         let mode = *self.mode.read().await;
         let current_usage = self.current_usage_mb.load(Ordering::SeqCst);
-        
+
         let wait_times = self.wait_times.read().await;
         let avg_wait = if wait_times.is_empty() {
             0.0
@@ -917,17 +938,17 @@ impl QueryQueue {
             sorted.sort();
             sorted[sorted.len() * 99 / 100]
         };
-        
+
         let exec_times = self.execution_times.read().await;
         let avg_exec = if exec_times.is_empty() {
             0.0
         } else {
             exec_times.iter().sum::<u64>() as f64 / exec_times.len() as f64
         };
-        
+
         // Estimate wait time
         let estimated_wait = self.estimate_wait_time_internal(&queue, &exec_times, &capacity);
-        
+
         QueueStats {
             queue_depth: queue.len(),
             current_usage_mb: current_usage,
@@ -946,7 +967,7 @@ impl QueryQueue {
             estimated_wait_ms: estimated_wait,
         }
     }
-    
+
     /// Internal wait time estimation (no locks)
     fn estimate_wait_time_internal(
         &self,
@@ -957,33 +978,33 @@ impl QueryQueue {
         if queue.is_empty() {
             return 0;
         }
-        
+
         let avg_exec = if exec_times.is_empty() {
             1000
         } else {
             exec_times.iter().sum::<u64>() / exec_times.len() as u64
         };
-        
+
         let parallelism = (capacity.worker_count as u64).max(1);
         let queue_depth = queue.len() as u64;
-        
+
         (queue_depth / parallelism) * avg_exec
     }
-    
+
     // ═══════════════════════════════════════════════════════════════════
     // CEILING CONFIGURATION (for manual/config-based limits)
     // ═══════════════════════════════════════════════════════════════════
-    
+
     /// Set ceiling from config (max_workers, max_memory_per_worker)
     pub async fn set_ceiling_config(&self, max_workers: u32, max_memory_per_worker_mb: u64) {
         let mut ceiling = self.ceiling.write().await;
         ceiling.max_workers = max_workers;
         ceiling.max_memory_per_worker_mb = max_memory_per_worker_mb;
-        
+
         let config_limit = max_workers as u64 * max_memory_per_worker_mb;
         ceiling.ceiling_mb = ceiling.node_allocatable_mb.min(config_limit);
         ceiling.last_refresh = Instant::now();
-        
+
         info!(
             max_workers = max_workers,
             max_memory_per_worker_mb = max_memory_per_worker_mb,
@@ -1004,7 +1025,10 @@ pub enum QueueError {
     /// Timeout waiting for capacity
     Timeout { wait_seconds: u64 },
     /// At capacity ceiling (saturation mode) - suggest retry
-    AtCapacity { retry_after_ms: u64, queue_depth: usize },
+    AtCapacity {
+        retry_after_ms: u64,
+        queue_depth: usize,
+    },
     /// Internal dispatcher error
     DispatcherError,
 }
@@ -1014,12 +1038,12 @@ impl QueueError {
     pub fn pg_error_code(&self) -> &'static str {
         match self {
             QueueError::QueueFull { .. } => "53300", // too_many_connections
-            QueueError::Timeout { .. } => "57014", // query_canceled
+            QueueError::Timeout { .. } => "57014",   // query_canceled
             QueueError::AtCapacity { .. } => "53300", // too_many_connections
-            QueueError::DispatcherError => "XX000", // internal_error
+            QueueError::DispatcherError => "XX000",  // internal_error
         }
     }
-    
+
     /// Get retry hint in milliseconds (for 429-like behavior)
     pub fn retry_after_ms(&self) -> Option<u64> {
         match self {
@@ -1036,11 +1060,21 @@ impl std::fmt::Display for QueueError {
                 write!(f, "Query queue full (max {} queries)", max_size)
             }
             QueueError::Timeout { wait_seconds } => {
-                write!(f, "Timed out after {} seconds waiting in queue", wait_seconds)
+                write!(
+                    f,
+                    "Timed out after {} seconds waiting in queue",
+                    wait_seconds
+                )
             }
-            QueueError::AtCapacity { retry_after_ms, queue_depth } => {
-                write!(f, "Server at capacity ({} queries queued). Retry after {} ms", 
-                    queue_depth, retry_after_ms)
+            QueueError::AtCapacity {
+                retry_after_ms,
+                queue_depth,
+            } => {
+                write!(
+                    f,
+                    "Server at capacity ({} queries queued). Retry after {} ms",
+                    queue_depth, retry_after_ms
+                )
             }
             QueueError::DispatcherError => {
                 write!(f, "Internal queue dispatcher error")
@@ -1058,7 +1092,7 @@ impl std::error::Error for QueueError {}
 /// Parse K8s memory string (e.g., "512Mi", "2Gi", "1024") to MB
 fn parse_k8s_memory_to_mb(mem_str: &str) -> u64 {
     let mem_str = mem_str.trim();
-    
+
     if let Some(val) = mem_str.strip_suffix("Gi") {
         val.parse::<u64>().unwrap_or(0) * 1024
     } else if let Some(val) = mem_str.strip_suffix("Mi") {
@@ -1080,7 +1114,7 @@ fn parse_k8s_memory_to_mb(mem_str: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_parse_memory() {
         assert_eq!(parse_k8s_memory_to_mb("512Mi"), 512);
