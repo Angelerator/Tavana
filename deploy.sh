@@ -226,19 +226,20 @@ import_images() {
     
     ACR_NAME=$(echo "$ACR_LOGIN_SERVER" | cut -d'.' -f1)
     
+    # Import from Docker Hub (angelerator namespace)
     az acr import \
         --name "$ACR_NAME" \
-        --source "docker.io/tavana/gateway:$TAVANA_VERSION" \
-        --image "tavana/gateway:$TAVANA_VERSION" \
+        --source "docker.io/angelerator/tavana-gateway:$TAVANA_VERSION" \
+        --image "tavana-gateway:$TAVANA_VERSION" \
         --force || true
     
     az acr import \
         --name "$ACR_NAME" \
-        --source "docker.io/tavana/worker:$TAVANA_VERSION" \
-        --image "tavana/worker:$TAVANA_VERSION" \
+        --source "docker.io/angelerator/tavana-worker:$TAVANA_VERSION" \
+        --image "tavana-worker:$TAVANA_VERSION" \
         --force || true
     
-    print_success "Images imported"
+    print_success "Images imported to $ACR_LOGIN_SERVER"
 }
 
 deploy_tavana() {
@@ -247,18 +248,28 @@ deploy_tavana() {
     # Get values from Terraform
     cd "$EXAMPLE_DIR"
     IDENTITY_CLIENT_ID=$(terraform output -raw tavana_identity_client_id 2>/dev/null || echo "")
+    TENANT_ID=$(terraform output -raw tavana_identity_tenant_id 2>/dev/null || echo "")
     STORAGE_ACCOUNT=$(terraform output -raw storage_account_name 2>/dev/null || echo "")
+    STORAGE_ENDPOINT=$(terraform output -raw storage_primary_dfs_endpoint 2>/dev/null || echo "")
     cd - > /dev/null
     
-    # Deploy with Helm
-    helm upgrade --install tavana oci://ghcr.io/tavana/charts/tavana \
+    # Deploy with Helm from GHCR (angelerator namespace)
+    helm upgrade --install tavana oci://ghcr.io/angelerator/charts/tavana \
         --namespace tavana \
         --create-namespace \
         --set global.imageRegistry="$ACR_LOGIN_SERVER" \
         --set global.imageTag="$TAVANA_VERSION" \
         --set serviceAccount.annotations."azure\.workload\.identity/client-id"="$IDENTITY_CLIENT_ID" \
+        --set serviceAccount.annotations."azure\.workload\.identity/tenant-id"="$TENANT_ID" \
         --set gateway.env[0].name="AZURE_STORAGE_ACCOUNT" \
         --set gateway.env[0].value="$STORAGE_ACCOUNT" \
+        --set gateway.env[1].name="AZURE_STORAGE_ENDPOINT" \
+        --set gateway.env[1].value="$STORAGE_ENDPOINT" \
+        --set worker.nodeSelector.nodepool="tavana" \
+        --set worker.tolerations[0].key="workload" \
+        --set worker.tolerations[0].operator="Equal" \
+        --set worker.tolerations[0].value="tavana" \
+        --set worker.tolerations[0].effect="NoSchedule" \
         --wait \
         --timeout 10m
     
