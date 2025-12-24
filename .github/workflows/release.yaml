@@ -14,6 +14,9 @@ jobs:
       packages: write
       id-token: write  # For signing
     
+    env:
+      REPO_OWNER: ${{ github.repository_owner }}
+    
     strategy:
       matrix:
         include:
@@ -46,7 +49,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ghcr.io/${{ github.repository_owner }}/tavana-${{ matrix.image }}
+            ghcr.io/${{ env.REPO_OWNER }}/tavana-${{ matrix.image }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -73,7 +76,9 @@ jobs:
         env:
           COSIGN_EXPERIMENTAL: "true"
         run: |
-          cosign sign --yes ghcr.io/${{ github.repository_owner }}/tavana-${{ matrix.image }}@${{ steps.build.outputs.digest }}
+          # Convert to lowercase for GHCR compatibility
+          REPO_OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          cosign sign --yes ghcr.io/${REPO_OWNER_LOWER}/tavana-${{ matrix.image }}@${{ steps.build.outputs.digest }}
 
   helm-release:
     name: Package & Publish Helm Chart
@@ -111,7 +116,9 @@ jobs:
       
       - name: Push to OCI registry
         run: |
-          helm push tavana-${{ steps.version.outputs.VERSION }}.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+          # Convert to lowercase for GHCR compatibility
+          REPO_OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          helm push tavana-${{ steps.version.outputs.VERSION }}.tgz oci://ghcr.io/${REPO_OWNER_LOWER}/charts
 
   create-release:
     name: Create GitHub Release
@@ -130,6 +137,8 @@ jobs:
       
       - name: Create Release
         uses: softprops/action-gh-release@v1
+        env:
+          REPO_OWNER_LOWER: ${{ github.repository_owner }}
         with:
           generate_release_notes: true
           body: |
@@ -139,14 +148,14 @@ jobs:
             
             **GitHub Container Registry:**
             ```bash
-            docker pull ghcr.io/${{ github.repository_owner }}/tavana-gateway:${{ steps.version.outputs.VERSION }}
-            docker pull ghcr.io/${{ github.repository_owner }}/tavana-worker:${{ steps.version.outputs.VERSION }}
+            docker pull ghcr.io/angelerator/tavana-gateway:${{ steps.version.outputs.VERSION }}
+            docker pull ghcr.io/angelerator/tavana-worker:${{ steps.version.outputs.VERSION }}
             ```
             
             ### Helm Chart
             
             ```bash
-            helm install tavana oci://ghcr.io/${{ github.repository_owner }}/charts/tavana --version ${{ steps.version.outputs.VERSION }}
+            helm install tavana oci://ghcr.io/angelerator/charts/tavana --version ${{ steps.version.outputs.VERSION }}
             ```
             
             ### Quick Start
