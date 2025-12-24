@@ -1451,7 +1451,8 @@ tavana/
 ├── Dockerfile.gateway      # Multi-stage build for Gateway
 ├── Dockerfile.worker       # Multi-stage build for Worker (with DuckDB extensions)
 ├── README.md               # This file
-└── DEPLOYMENT.md           # Detailed deployment guide
+└── docs/                   # Documentation
+    └── CUSTOMER-DEPLOYMENT-GUIDE.md  # Step-by-step deployment
 ```
 
 ---
@@ -1527,7 +1528,7 @@ objectStorage:
 
 ## 📚 Additional Documentation
 
-- [Deployment Guide](./DEPLOYMENT.md) - Step-by-step deployment instructions
+- [Customer Deployment Guide](./docs/CUSTOMER-DEPLOYMENT-GUIDE.md) - Step-by-step deployment for all scenarios
 - [Helm Chart Documentation](./helm/tavana/README.md) - Helm chart reference
 - [Terraform Modules](./terraform/README.md) - Infrastructure as Code reference
 - [GitOps Template](./gitops-template/README.md) - ArgoCD setup guide
@@ -1592,7 +1593,7 @@ Apache License 2.0 - see [LICENSE](./LICENSE) file for details.
 
 - **Issues**: https://github.com/Angelerator/Tavana/issues
 - **Discussions**: https://github.com/Angelerator/Tavana/discussions
-- **Documentation**: https://github.com/Angelerator/Tavana/blob/main/DEPLOYMENT.md
+- **Documentation**: https://github.com/Angelerator/Tavana/tree/main/docs
 
 ---
 
