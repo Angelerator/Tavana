@@ -833,18 +833,18 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    Start([Query Arrives]) --> Parse[Parse SQL &<br/>Extract S3 Paths]
+    Start([Query Arrives]) --> Parse[Parse SQL and<br/>Extract S3 Paths]
     Parse --> Estimate[Estimate Query Cost<br/>via DataSizer]
     
     Estimate --> Check{Available<br/>Capacity?}
     
-    Check -->|Yes: cost <= available| Dispatch[Dispatch to Worker]
+    Check -->|Yes: cost within limit| Dispatch[Dispatch to Worker]
     
-    Check -->|No: cost > available| CheckCeiling{At Resource<br/>Ceiling?}
+    Check -->|No: cost exceeds limit| CheckCeiling{At Resource<br/>Ceiling?}
     
     CheckCeiling -->|No: Can Scale| Signal[Signal HPA<br/>Scale-Up]
     Signal --> Queue[Add to FIFO Queue]
-    Queue --> Wait[Block & Wait<br/>for Capacity]
+    Queue --> Wait[Block and Wait<br/>for Capacity]
     Wait --> Recheck{Capacity<br/>Available?}
     Recheck -->|No| Wait
     Recheck -->|Yes| Dispatch
@@ -852,13 +852,13 @@ flowchart TD
     CheckCeiling -->|Yes: Max Capacity| Saturation[Enter Saturation Mode]
     Saturation --> EstWait[Estimate Wait Time<br/>Based on Active Queries]
     EstWait --> QueueSat[Add to FIFO Queue]
-    QueueSat --> WaitSat[Block & Wait<br/>Return Est. Time]
+    QueueSat --> WaitSat[Block and Wait<br/>Return Est Time]
     WaitSat --> RecheckSat{Capacity<br/>Freed?}
     RecheckSat -->|No| WaitSat
     RecheckSat -->|Yes| Dispatch
     
     Dispatch --> VPACheck{VPA Resize<br/>Needed?}
-    VPACheck -->|Yes: cost > 80% limit| Resize[Resize Worker<br/>Memory]
+    VPACheck -->|Yes: cost exceeds 80 percent| Resize[Resize Worker<br/>Memory]
     VPACheck -->|No| Execute[Execute Query<br/>on Worker]
     Resize --> Execute
     
@@ -883,29 +883,29 @@ flowchart TD
     CheckMode -->|Scaling Mode| ScalingChecks[Check Scale Triggers]
     CheckMode -->|Saturation Mode| SaturationChecks[Conservative Scaling]
     
-    ScalingChecks --> QueueDepth{Queue<br/>Depth > 0?}
-    QueueDepth -->|Yes| ScaleUp[Scale Up<br/>+2 to +4 Workers]
+    ScalingChecks --> QueueDepth{Queue<br/>Depth greater than 0?}
+    QueueDepth -->|Yes| ScaleUp[Scale Up<br/>Add 2 to 4 Workers]
     
-    QueueDepth -->|No| WaitTime{Avg Wait<br/>Time > 30s?}
+    QueueDepth -->|No| WaitTime{Avg Wait<br/>Time over 30s?}
     WaitTime -->|Yes| ScaleUp
     
-    WaitTime -->|No| CPUHigh{CPU > 70%<br/>or Mem > 80%?}
+    WaitTime -->|No| CPUHigh{CPU over 70 percent<br/>or Mem over 80 percent?}
     CPUHigh -->|Yes| ScaleUp
     
     CPUHigh -->|No| IdleCheck{Queue Empty<br/>for 5+ min?}
     IdleCheck -->|Yes| ActiveQ{Active<br/>Queries?}
-    ActiveQ -->|No| Utilization{Worker<br/>Util < 30%?}
-    Utilization -->|Yes| ScaleDown[Scale Down<br/>Remove 50% Workers<br/>Min: 2]
+    ActiveQ -->|No| Utilization{Worker<br/>Util under 30 percent?}
+    Utilization -->|Yes| ScaleDown[Scale Down<br/>Remove 50 percent Workers<br/>Min: 2]
     Utilization -->|No| NoAction[No Action]
     ActiveQ -->|Yes| NoAction
     IdleCheck -->|No| NoAction
     
-    SaturationChecks --> SatQueueDepth{Queue<br/>Very Deep?<br/>> 20}
+    SaturationChecks --> SatQueueDepth{Queue<br/>Very Deep?<br/>Over 20}
     SatQueueDepth -->|Yes| TryScaleUp{Can Add<br/>Workers?}
-    TryScaleUp -->|Yes: Below ceiling| ScaleUpSat[Scale Up<br/>+1 Worker<br/>Conservative]
+    TryScaleUp -->|Yes: Below ceiling| ScaleUpSat[Scale Up<br/>Add 1 Worker<br/>Conservative]
     TryScaleUp -->|No: At ceiling| NoActionSat[No Action<br/>Wait for Capacity]
-    SatQueueDepth -->|No| LongIdle{Idle<br/>> 10 min?}
-    LongIdle -->|Yes| ScaleDownSat[Scale Down<br/>-1 Worker<br/>Slow & Safe]
+    SatQueueDepth -->|No| LongIdle{Idle<br/>over 10 min?}
+    LongIdle -->|Yes| ScaleDownSat[Scale Down<br/>Remove 1 Worker<br/>Slow and Safe]
     LongIdle -->|No| NoActionSat
     
     ScaleUp --> UpdateMetrics[Update Metrics<br/>hpa_scale_up_signal]
@@ -934,31 +934,31 @@ flowchart TD
     
     EstCost --> PreCheck{Pre-Assignment<br/>Check}
     
-    PreCheck --> CalcNeeded[Calculate Needed Memory<br/>needed = cost * 1.5]
+    PreCheck --> CalcNeeded[Calculate Needed Memory<br/>needed equals cost times 1.5]
     CalcNeeded --> GetCurrent[Get Worker Current Limit]
-    GetCurrent --> Compare{needed ><br/>current * 0.8?}
+    GetCurrent --> Compare{needed greater than<br/>current times 0.8?}
     
-    Compare -->|needed > current * 0.8| PreResize[Pre-Assignment Resize]
-    PreResize --> CalcNew[new = max(needed, current)]
-    CalcNew --> CapNew{new ><br/>12GB max?}
+    Compare -->|Yes| PreResize[Pre-Assignment Resize]
+    PreResize --> CalcNew[Calculate new size<br/>max of needed and current]
+    CalcNew --> CapNew{new greater than<br/>12GB max?}
     CapNew -->|new > 12GB| SetMax[Set to 12GB max]
-    CapNew -->|new <= 12GB| SetNew[Set to new]
+    CapNew -->|new <= 12GB| SetNew[Set to new value]
     SetMax --> ApplyPre[Apply VPA Resize<br/>K8s API]
     SetNew --> ApplyPre
     ApplyPre --> WaitReady[Wait for Pod Ready<br/>10-30s]
     WaitReady --> Execute[Execute Query]
     
-    Compare -->|needed <= current * 0.8| Execute
+    Compare -->|No| Execute
     
     Execute --> Monitor[Monitor Execution]
     
     Monitor --> ElasticCheck{During Execution<br/>Memory Usage?}
     
-    ElasticCheck --> CheckUtil{Util ><br/>80% limit?}
-    CheckUtil -->|Yes| ElasticGrow[Elastic Growth<br/>new = current * 1.5]
-    ElasticGrow --> CapElastic{new ><br/>12GB max?}
+    ElasticCheck --> CheckUtil{Util greater than<br/>80 percent limit?}
+    CheckUtil -->|Yes| ElasticGrow[Elastic Growth<br/>new equals current times 1.5]
+    ElasticGrow --> CapElastic{new greater than<br/>12GB max?}
     CapElastic -->|Yes| ElasticMax[Set to 12GB max]
-    CapElastic -->|No| ElasticSet[Set to new]
+    CapElastic -->|No| ElasticSet[Set to new value]
     ElasticMax --> ApplyElastic[Apply VPA Resize<br/>In-Place if K8s 1.27+]
     ElasticSet --> ApplyElastic
     ApplyElastic --> ContinueExec[Continue Execution]
@@ -972,7 +972,7 @@ flowchart TD
     IdleCheck -->|No| WaitIdle[Wait...]
     WaitIdle --> IdleCheck
     IdleCheck -->|Yes| NoQueries{No active<br/>queries?}
-    NoQueries -->|Yes| Shrink[Smart Shrink<br/>new = 512MB min]
+    NoQueries -->|Yes| Shrink[Smart Shrink<br/>new equals 512MB min]
     NoQueries -->|No| NoShrink[No Shrink<br/>Keep Current]
     Shrink --> ApplyShrink[Apply VPA Resize]
     ApplyShrink --> End([Ready for Next Query])
@@ -996,31 +996,31 @@ stateDiagram-v2
     
     CalculatingCeiling --> EvaluatingUtilization: Calculate Total<br/>Allocatable Memory
     
-    EvaluatingUtilization --> ScalingMode: Utilization < 80%
-    EvaluatingUtilization --> ApproachingCeiling: Utilization 80-90%
-    EvaluatingUtilization --> SaturationMode: Utilization > 90%
+    EvaluatingUtilization --> ScalingMode: Utilization under 80 percent
+    EvaluatingUtilization --> ApproachingCeiling: Utilization 80 to 90 percent
+    EvaluatingUtilization --> SaturationMode: Utilization over 90 percent
     
-    ScalingMode --> MonitoringScaling: Update Mode Metric<br/>operation_mode=0
+    ScalingMode --> MonitoringScaling: Update Mode Metric<br/>operation_mode equals 0
     MonitoringScaling --> FetchingNodeInfo: Wait 60s
     
     ApproachingCeiling --> MonitoringApproaching: Log Warning<br/>Approaching Limits
     MonitoringApproaching --> FetchingNodeInfo: Wait 30s
     
-    SaturationMode --> MonitoringSaturation: Update Mode Metric<br/>operation_mode=1<br/>Alert Operators
+    SaturationMode --> MonitoringSaturation: Update Mode Metric<br/>operation_mode equals 1<br/>Alert Operators
     MonitoringSaturation --> FetchingNodeInfo: Wait 15s
     
     state ScalingMode {
         [*] --> Proactive
-        Proactive --> AggressiveHPA: Queue Depth > 0
-        AggressiveHPA --> [*]: Scale +4 Workers
+        Proactive --> AggressiveHPA: Queue Depth over 0
+        AggressiveHPA --> [*]: Scale add 4 Workers
         Proactive --> NormalVPA: Query Cost High
         NormalVPA --> [*]: Resize Freely
     }
     
     state SaturationMode {
         [*] --> Conservative
-        Conservative --> SlowHPA: Queue Depth > 20
-        SlowHPA --> [*]: Scale +1 Worker<br/>If Possible
+        Conservative --> SlowHPA: Queue Depth over 20
+        SlowHPA --> [*]: Scale add 1 Worker<br/>If Possible
         Conservative --> NoVPA: High Cost Query
         NoVPA --> [*]: Reject or<br/>Warn User
     }
@@ -1048,7 +1048,7 @@ sequenceDiagram
     participant Cache as Estimation Cache
     
     QR->>QR: Parse SQL
-    Note over QR: Extract S3 path:<br/>'s3://bucket/sales/*.parquet'
+    Note over QR: Extract S3 path<br/>s3://bucket/sales/*.parquet
     
     QR->>DS: Estimate cost for path
     activate DS
@@ -1059,9 +1059,9 @@ sequenceDiagram
     DS->>DS: Expand wildcard
     Note over DS: List all matching files
     
-    DS->>S3: S3 LIST objects<br/>'bucket/sales/'
+    DS->>S3: S3 LIST objects<br/>bucket/sales/
     activate S3
-    S3-->>DS: [file1.parquet,<br/>file2.parquet,<br/>...]
+    S3-->>DS: file1.parquet<br/>file2.parquet<br/>and more
     deactivate S3
     
     loop For each file
@@ -1076,9 +1076,9 @@ sequenceDiagram
     Note over DS: Total raw size: 2GB
     
     DS->>DS: Apply estimation formula
-    Note over DS: Estimated memory =<br/>raw_size * compression_ratio * safety_factor<br/>= 2GB * 0.3 * 1.5<br/>= 900MB
+    Note over DS: Estimated memory equals<br/>raw_size times ratio times factor<br/>2GB times 0.3 times 1.5<br/>equals 900MB
     
-    DS->>Cache: Store result<br/>(TTL: 5 min)
+    DS->>Cache: Store result<br/>TTL: 5 min
     
     DS-->>QR: Estimated cost: 900MB
     deactivate DS
@@ -1090,10 +1090,10 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    A[Raw Data Size<br/>from S3] --> B[Compression Ratio<br/>Parquet: 0.2-0.4x<br/>CSV: 1.0x]
-    B --> C[Decompressed Size<br/>= raw * ratio]
-    C --> D[Working Set<br/>+ columnar projections<br/>+ filters]
-    D --> E[Safety Factor<br/>* 1.5]
+    A[Raw Data Size<br/>from S3] --> B[Compression Ratio<br/>Parquet: 0.2 to 0.4x<br/>CSV: 1.0x]
+    B --> C[Decompressed Size<br/>equals raw times ratio]
+    C --> D[Working Set<br/>plus columnar projections<br/>plus filters]
+    D --> E[Safety Factor<br/>times 1.5]
     E --> F[Final Estimate]
     
     style A fill:#e1f5ff
@@ -1150,19 +1150,19 @@ Result: Assign worker with at least 90MB free memory
 stateDiagram-v2
     [*] --> Empty
     
-    Empty --> Queued: Query Arrives<br/>(No Capacity)
-    Empty --> Bypassed: Query Arrives<br/>(Has Capacity)
+    Empty --> Queued: Query Arrives<br/>No Capacity
+    Empty --> Bypassed: Query Arrives<br/>Has Capacity
     
     Bypassed --> Executing: Dispatch Immediately
     Bypassed --> [*]: Query Complete
     
     Queued --> Waiting: Signal HPA<br/>Start Wait Timer
     
-    Waiting --> Waiting: More Queries Arrive<br/>(FIFO Order)
+    Waiting --> Waiting: More Queries Arrive<br/>FIFO Order
     
     Waiting --> Dispatching: Capacity Available<br/>Worker Freed
     
-    Dispatching --> Executing: Dequeue & Execute<br/>(First in Queue)
+    Dispatching --> Executing: Dequeue and Execute<br/>First in Queue
     
     Dispatching --> Waiting: More in Queue<br/>Process Next
     
@@ -1175,16 +1175,16 @@ stateDiagram-v2
     
     state Waiting {
         [*] --> CheckTimeout
-        CheckTimeout --> WithinLimit: Wait < 5min
-        CheckTimeout --> Timeout: Wait > 5min
+        CheckTimeout --> WithinLimit: Wait under 5min
+        CheckTimeout --> Timeout: Wait over 5min
         Timeout --> [*]: Return Error<br/>to Client
         WithinLimit --> [*]
     }
     
     state Executing {
         [*] --> MonitorMemory
-        MonitorMemory --> Normal: Memory < 80%
-        MonitorMemory --> NearLimit: Memory > 80%
+        MonitorMemory --> Normal: Memory under 80 percent
+        MonitorMemory --> NearLimit: Memory over 80 percent
         NearLimit --> VPAResize: Trigger Elastic Growth
         VPAResize --> MonitorMemory
         Normal --> [*]
@@ -1192,16 +1192,16 @@ stateDiagram-v2
     
     note right of Queued
         Queue Metrics:
-        - tavana_query_queue_depth
-        - tavana_query_queue_wait_seconds
-        - tavana_estimated_wait_ms
+        tavana_query_queue_depth
+        tavana_query_queue_wait_seconds
+        tavana_estimated_wait_ms
     end note
     
     note right of Executing
         Execution Metrics:
-        - tavana_active_queries
-        - tavana_query_duration_seconds
-        - tavana_worker_memory_bytes
+        tavana_active_queries
+        tavana_query_duration_seconds
+        tavana_worker_memory_bytes
     end note
 ```
 
@@ -1296,9 +1296,9 @@ graph TD
     end
     
     subgraph "Cluster Capacity"
-        N1[Node 1:<br/>Allocatable 32GB]
-        N2[Node 2:<br/>Allocatable 32GB]
-        TC[Total Ceiling:<br/>64GB]
+        N1[Node 1<br/>Allocatable 32GB]
+        N2[Node 2<br/>Allocatable 32GB]
+        TC[Total Ceiling<br/>64GB]
         
         N1 --> TC
         N2 --> TC
@@ -1310,16 +1310,16 @@ graph TD
         W3A[Worker 3: 1GB] --> TotalAvail
         WNA[Worker N: 500MB] --> TotalAvail
         
-        TotalAvail --> Calc[Σ Available = 6.5GB]
+        TotalAvail --> Calc[Sum Available equals 6.5GB]
     end
     
     subgraph "Admission Decision"
         QC[Query Cost: 2GB]
-        Calc --> Compare{2GB <= 6.5GB?}
+        Calc --> Compare{2GB within 6.5GB?}
         Compare -->|Yes| Admit[Admit Query<br/>Dispatch to Worker 1]
         Compare -->|No| CheckCeil{Can Scale?}
-        CheckCeil -->|Used < Ceiling| ScaleHPA[Signal HPA<br/>Add Workers]
-        CheckCeil -->|Used >= Ceiling| QueueWait[Queue & Wait<br/>Saturation Mode]
+        CheckCeil -->|Used under Ceiling| ScaleHPA[Signal HPA<br/>Add Workers]
+        CheckCeil -->|Used at Ceiling| QueueWait[Queue and Wait<br/>Saturation Mode]
     end
     
     style Admit fill:#d4edda
