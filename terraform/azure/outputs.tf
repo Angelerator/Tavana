@@ -156,20 +156,11 @@ output "helm_values_snippet" {
 # Copy this to your tavana-config repo's values file
 global:
   imageRegistry: "${azurerm_container_registry.main.login_server}"
-  imageTag: "latest"  # Replace with specific version
-
-cloud:
-  azure:
-    enabled: true
-    useWorkloadIdentity: true
-
-serviceAccount:
-  name: "${var.tavana_service_account_name}"
-  annotations:
-    azure.workload.identity/client-id: "${azurerm_user_assigned_identity.tavana.client_id}"
-    azure.workload.identity/tenant-id: "${data.azuread_client_config.current.tenant_id}"
+  imageTag: "v1.0.0"  # Replace with specific version
 
 gateway:
+  image:
+    repository: tavana-gateway
   env:
     - name: AZURE_STORAGE_ACCOUNT
       value: "${azurerm_storage_account.main.name}"
@@ -179,6 +170,8 @@ gateway:
       value: "${azurerm_storage_account.main.primary_dfs_endpoint}"
 
 worker:
+  image:
+    repository: tavana-worker
   nodeSelector:
     nodepool: tavana
   tolerations:
@@ -186,6 +179,10 @@ worker:
       operator: "Equal"
       value: "tavana"
       effect: "NoSchedule"
+
+serviceAccount:
+  create: false  # Already created by Terraform
+  name: "${var.tavana_service_account_name}"
 EOT
 }
 
@@ -207,21 +204,23 @@ echo "Importing Tavana images version: $VERSION"
 
 az acr login --name $ACR_NAME
 
-# Import gateway
+# Import gateway (from angelerator Docker Hub)
 az acr import \
   --name $ACR_NAME \
-  --source docker.io/tavana/gateway:$VERSION \
-  --image tavana/gateway:$VERSION
+  --source docker.io/angelerator/tavana-gateway:$VERSION \
+  --image tavana-gateway:$VERSION \
+  --force
 
-# Import worker
+# Import worker (from angelerator Docker Hub)
 az acr import \
   --name $ACR_NAME \
-  --source docker.io/tavana/worker:$VERSION \
-  --image tavana/worker:$VERSION
+  --source docker.io/angelerator/tavana-worker:$VERSION \
+  --image tavana-worker:$VERSION \
+  --force
 
 echo "✓ Images imported successfully"
-echo "Use: ${azurerm_container_registry.main.login_server}/tavana/gateway:$VERSION"
-echo "Use: ${azurerm_container_registry.main.login_server}/tavana/worker:$VERSION"
+echo "Use: ${azurerm_container_registry.main.login_server}/tavana-gateway:$VERSION"
+echo "Use: ${azurerm_container_registry.main.login_server}/tavana-worker:$VERSION"
 EOT
 }
 

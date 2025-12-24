@@ -51,8 +51,9 @@ output "next_steps" {
 1. Configure kubectl:
    ${module.tavana.kube_config_command}
 
-2. Import Tavana images to your ACR:
-   ${module.tavana.import_images_script}
+2. Import Tavana images to your ACR (run this script):
+   Save the import_images_script output and execute it with version tag:
+   ./import_images.sh v1.0.0
 
 3. Get ArgoCD password:
    ${module.tavana.argocd_initial_password_command}
@@ -61,10 +62,15 @@ output "next_steps" {
    ${module.tavana.argocd_server_url}
 
 5. Create your GitOps config repository using the template at:
-   https://github.com/tavana/tavana-config-template
+   https://github.com/Angelerator/Tavana/tree/main/gitops-template
 
 6. Add the following to your GitOps values file:
 ${module.tavana.helm_values_snippet}
+
+7. Install Tavana via Helm (or use ArgoCD):
+   helm upgrade --install tavana oci://ghcr.io/angelerator/charts/tavana \
+     --namespace tavana \
+     -f your-values.yaml
 
 ═══════════════════════════════════════════════════════════════════════════════
 EOT
