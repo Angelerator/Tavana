@@ -4,9 +4,7 @@
 # Global settings
 global:
   namespace: tavana
-  # Image registry - set to your private registry (e.g., myacr.azurecr.io)
-  # Default: Docker Hub (tavana/) or GHCR (ghcr.io/tavana/)
-  imageRegistry: ""
+  imageRegistry: "ghcr.io/angelerator"
   imagePullPolicy: IfNotPresent
   imageTag: "latest"
 
@@ -20,10 +18,7 @@ gateway:
   enabled: true
   replicaCount: 2
   image:
-    # Full image name (registry/repo:tag) or just repo name
-    # If global.imageRegistry is set, image will be: {global.imageRegistry}/tavana-gateway:{tag}
-    # If global.imageRegistry is empty, image will be: tavana/gateway:{tag} (Docker Hub)
-    repository: "gateway"
+    repository: "tavana-gateway"
     tag: ""  # Defaults to global.imageTag
   
   service:
@@ -61,7 +56,7 @@ worker:
   minReplicas: 2
   maxReplicas: 20
   image:
-    repository: "worker"
+    repository: "tavana-worker"
     tag: ""  # Defaults to global.imageTag
   
   resources:
