@@ -25,36 +25,23 @@ RUN useradd -m -u 1000 -s /bin/bash tavana && \
     chown -R tavana:tavana /home/tavana /tmp/duckdb
 
 # Pre-download DuckDB extensions for fast pod startup
-# Supports: linux/amd64, linux/arm64
-# TARGETARCH is set by Docker buildx; fallback to runtime detection for plain builds
-ARG TARGETARCH
+# Hardcoded for linux/amd64 (our target platform)
 ARG DUCKDB_VERSION=v1.4.3
-RUN set -eux && \
-    # Determine architecture: prefer TARGETARCH (buildx), fallback to uname
-    if [ -n "${TARGETARCH:-}" ]; then \
-        case "$TARGETARCH" in \
-            amd64) DUCKDB_ARCH="linux_amd64" ;; \
-            arm64) DUCKDB_ARCH="linux_arm64" ;; \
-            *) echo "ERROR: Unsupported TARGETARCH: $TARGETARCH" && exit 1 ;; \
-        esac; \
-    else \
-        UNAME_ARCH=$(uname -m); \
-        case "$UNAME_ARCH" in \
-            x86_64)  DUCKDB_ARCH="linux_amd64" ;; \
-            aarch64) DUCKDB_ARCH="linux_arm64" ;; \
-            arm64)   DUCKDB_ARCH="linux_arm64" ;; \
-            *) echo "ERROR: Unsupported architecture: $UNAME_ARCH" && exit 1 ;; \
-        esac; \
-    fi && \
+ARG DUCKDB_ARCH=linux_amd64
+RUN set -ex && \
     EXT_DIR="/home/tavana/.duckdb/extensions/${DUCKDB_VERSION}/${DUCKDB_ARCH}" && \
     mkdir -p "$EXT_DIR" && \
-    echo "Downloading DuckDB ${DUCKDB_VERSION} extensions for ${DUCKDB_ARCH}..." && \
-    # Download and install extensions
-    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/httpfs.duckdb_extension.gz" | gunzip > "$EXT_DIR/httpfs.duckdb_extension" && \
-    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/parquet.duckdb_extension.gz" | gunzip > "$EXT_DIR/parquet.duckdb_extension" && \
+    echo "=== Downloading DuckDB ${DUCKDB_VERSION} extensions for ${DUCKDB_ARCH} ===" && \
+    curl -v -fSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/httpfs.duckdb_extension.gz" -o /tmp/httpfs.gz && \
+    gunzip -c /tmp/httpfs.gz > "$EXT_DIR/httpfs.duckdb_extension" && \
+    rm /tmp/httpfs.gz && \
+    curl -v -fSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/parquet.duckdb_extension.gz" -o /tmp/parquet.gz && \
+    gunzip -c /tmp/parquet.gz > "$EXT_DIR/parquet.duckdb_extension" && \
+    rm /tmp/parquet.gz && \
     chmod 644 "$EXT_DIR"/*.duckdb_extension && \
     chown -R tavana:tavana /home/tavana/.duckdb && \
-    echo "✓ Extensions installed: httpfs, parquet (${DUCKDB_ARCH})"
+    ls -la "$EXT_DIR" && \
+    echo "=== Extensions installed: httpfs, parquet (${DUCKDB_ARCH}) ==="
 
 COPY --from=builder /app/target/release/tavana-worker /usr/local/bin/
 
