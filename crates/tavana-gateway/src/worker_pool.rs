@@ -52,8 +52,8 @@ impl Default for PreSizingConfig {
             min_memory_mb: 256,
             max_memory_mb: 400 * 1024, // 400GB
             enabled: true,
-            namespace: "tavana".to_string(),
-            worker_label_selector: "app=tavana-worker".to_string(),
+            namespace: std::env::var("KUBERNETES_NAMESPACE").unwrap_or_else(|_| "tavana".to_string()),
+            worker_label_selector: std::env::var("WORKER_LABEL_SELECTOR").unwrap_or_else(|_| "app=tavana-worker".to_string()),
             elastic_threshold: 0.80, // 80% - resize when usage exceeds this
             elastic_growth_factor: 1.5, // Grow by 50% when threshold exceeded
             elastic_check_interval_secs: 2, // Check every 2 seconds
