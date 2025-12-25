@@ -21,7 +21,7 @@
 
 | Scenario | Internet Access | Can Pull Public Images | Typical Customer |
 |----------|-----------------|------------------------|------------------|
-| **A: Air-Gapped** | ❌ None | ❌ No | Customer, Banks, Military |
+| **A: Air-Gapped** | ❌ None | ❌ No | Banks, Government, Military |
 | **B: ACR Only** | ⚠️ ACR Only | ❌ No | Enterprise with strict policies |
 | **C: Standard** | ✅ Outbound | ✅ Yes | Most enterprises |
 | **D: Open** | ✅ Full | ✅ Yes | Startups, Dev environments |
@@ -54,7 +54,7 @@
 
 ## Scenario A: Fully Restricted (Air-Gapped)
 
-**For: Customer, Banks, Military, Government**
+**For: Banks, Military, Government, Enterprises with strict security**
 
 This is the most secure deployment where the customer's Kubernetes cluster has **zero internet access**.
 
@@ -131,21 +131,21 @@ cd tavana-offline-v1.0.0
 
   Please provide the following information:
 
-  Azure Container Registry name (e.g., mycompanyacr): customer-prod-acr
+  Azure Container Registry name (e.g., mycompanyacr): mycompany-prod-acr
   ▶ Fetching ACR details...
-  ✓ ACR found: customer-prod-acr.azurecr.io
+  ✓ ACR found: mycompany-prod-acr.azurecr.io
 
   Kubernetes namespace [tavana]: tavana-prod
 
   ▶ Detected version: v1.0.0
 
-  Azure Storage Account name (for data lake, optional): customerdatalake
+  Azure Storage Account name (for data lake, optional): mycompanydatalake
 
   Configuration Summary:
-    ACR:             customer-prod-acr.azurecr.io
+    ACR:             mycompany-prod-acr.azurecr.io
     Namespace:       tavana-prod
     Version:         v1.0.0
-    Storage Account: customerdatalake
+    Storage Account: mycompanydatalake
 
   Proceed with deployment? (Y/n): Y
 ```
