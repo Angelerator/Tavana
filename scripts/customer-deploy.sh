@@ -5,7 +5,7 @@
 # This is the ONLY script customers need to run.
 # It handles everything: image import, Helm deployment, verification.
 #
-# For network-restricted environments like Nokia's Azure setup.
+# For network-restricted environments (enterprise Azure, air-gapped, etc.).
 #
 # Usage:
 #   ./customer-deploy.sh

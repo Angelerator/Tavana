@@ -21,7 +21,7 @@
 
 | Scenario | Internet Access | Can Pull Public Images | Typical Customer |
 |----------|-----------------|------------------------|------------------|
-| **A: Air-Gapped** | ❌ None | ❌ No | Nokia, Banks, Military |
+| **A: Air-Gapped** | ❌ None | ❌ No | Banks, Government, Military |
 | **B: ACR Only** | ⚠️ ACR Only | ❌ No | Enterprise with strict policies |
 | **C: Standard** | ✅ Outbound | ✅ Yes | Most enterprises |
 | **D: Open** | ✅ Full | ✅ Yes | Startups, Dev environments |
@@ -54,7 +54,7 @@
 
 ## Scenario A: Fully Restricted (Air-Gapped)
 
-**For: Nokia, Banks, Military, Government**
+**For: Banks, Military, Government, Enterprises with strict security**
 
 This is the most secure deployment where the customer's Kubernetes cluster has **zero internet access**.
 
@@ -90,14 +90,14 @@ dist/tavana-offline-v1.0.0/
 **Option A: Secure File Transfer**
 ```bash
 # SCP to customer's bastion host
-scp dist/tavana-offline-v1.0.0.tar.gz customer@bastion.nokia.com:/packages/
+scp dist/tavana-offline-v1.0.0.tar.gz customer@bastion.example.com:/packages/
 ```
 
 **Option B: Azure Storage (if they have storage access)**
 ```bash
 # Upload to shared Azure Storage
 az storage blob upload \
-  --account-name nokiasharedstorage \
+  --account-name customersharedstorage \
   --container-name packages \
   --file dist/tavana-offline-v1.0.0.tar.gz \
   --name tavana-offline-v1.0.0.tar.gz
@@ -131,21 +131,21 @@ cd tavana-offline-v1.0.0
 
   Please provide the following information:
 
-  Azure Container Registry name (e.g., mycompanyacr): nokia-prod-acr
+  Azure Container Registry name (e.g., mycompanyacr): mycompany-prod-acr
   ▶ Fetching ACR details...
-  ✓ ACR found: nokia-prod-acr.azurecr.io
+  ✓ ACR found: mycompany-prod-acr.azurecr.io
 
   Kubernetes namespace [tavana]: tavana-prod
 
   ▶ Detected version: v1.0.0
 
-  Azure Storage Account name (for data lake, optional): nokiadatalake
+  Azure Storage Account name (for data lake, optional): mycompanydatalake
 
   Configuration Summary:
-    ACR:             nokia-prod-acr.azurecr.io
+    ACR:             mycompany-prod-acr.azurecr.io
     Namespace:       tavana-prod
     Version:         v1.0.0
-    Storage Account: nokiadatalake
+    Storage Account: mycompanydatalake
 
   Proceed with deployment? (Y/n): Y
 ```

@@ -118,7 +118,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Initialize SmartScaler (Adaptive Formula-Based Scaling)
-    let smart_scaler = match smart_scaler::SmartScaler::new("tavana", "worker").await {
+    let namespace = std::env::var("KUBERNETES_NAMESPACE").unwrap_or_else(|_| "tavana".to_string());
+    let smart_scaler = match smart_scaler::SmartScaler::new(&namespace, "worker").await {
         Ok(ss) => {
             // Logging is done inside SmartScaler::new()
             Some(Arc::new(ss))

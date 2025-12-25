@@ -761,8 +761,10 @@ impl QueryQueue {
         use k8s_openapi::api::core::v1::Pod;
         use kube::api::{Api, ListParams};
 
-        let pods: Api<Pod> = Api::namespaced(client.clone(), "tavana");
-        let lp = ListParams::default().labels("app=worker");
+        let namespace = std::env::var("KUBERNETES_NAMESPACE").unwrap_or_else(|_| "tavana".to_string());
+        let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+        let worker_label = std::env::var("WORKER_LABEL_SELECTOR").unwrap_or_else(|_| "app=tavana-worker".to_string());
+        let lp = ListParams::default().labels(&worker_label);
 
         let pod_list = pods.list(&lp).await?;
 

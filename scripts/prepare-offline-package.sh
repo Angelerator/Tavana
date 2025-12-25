@@ -3,7 +3,7 @@
 #                TAVANA - Prepare Offline/Restricted Deployment Package
 # ═══════════════════════════════════════════════════════════════════════════════
 # This script creates a self-contained package for deploying Tavana in 
-# network-restricted environments (like Nokia's Azure setup).
+# network-restricted environments (enterprise Azure, air-gapped, etc.).
 #
 # The package includes:
 #   - Docker images as tarballs (can be imported to customer's ACR)
