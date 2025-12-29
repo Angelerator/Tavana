@@ -58,6 +58,7 @@ jsonwebtoken = "9"
 # Security / TLS
 rustls = "0.23"
 rustls-pemfile = "2"
+tokio-rustls = "0.26"
 rcgen = "0.13"
 ring = "0.17"
 

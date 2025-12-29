@@ -21,6 +21,7 @@ mod query_router;
 mod redis_queue; // Stub for removed Redis functionality
 mod smart_scaler;
 mod telemetry;
+mod tls_config;
 mod worker_client;
 mod worker_pool;
 
@@ -172,6 +173,14 @@ async fn main() -> anyhow::Result<()> {
         warn!("Failed to create K8s client - using default capacity estimates");
     }
 
+    // Load TLS configuration if enabled
+    let tls_config = if args.tls_enabled {
+        tls_config::load_tls_config_from_env()
+    } else {
+        info!("TLS disabled via --tls-enabled=false");
+        None
+    };
+
     // Start PostgreSQL wire protocol server with SmartScaler + shared QueryQueue
     let pg_auth = auth_service.clone();
     let pg_port = args.pg_port;
@@ -180,11 +189,13 @@ async fn main() -> anyhow::Result<()> {
     let pg_pool = pool_manager.clone();
     let pg_scaler = smart_scaler.clone();
     let pg_queue = query_queue.clone();
+    let pg_tls = tls_config.clone();
     let pg_handle = tokio::spawn(async move {
-        let server = pg_wire::PgWireServer::with_smart_scaler_and_queue(
+        let mut server = pg_wire::PgWireServer::with_smart_scaler_and_queue(
             pg_port, pg_auth, pg_worker, pg_router, pg_pool, pg_scaler, pg_queue,
         )
         .await;
+        server.set_tls(pg_tls);
         if let Err(e) = server.start().await {
             tracing::error!("PostgreSQL server error: {}", e);
         }

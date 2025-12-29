@@ -55,6 +55,26 @@ spec:
               value: "{{ .Values.gateway.service.pgPort }}"
             - name: HTTP_PORT
               value: "{{ .Values.gateway.service.httpPort }}"
+            # TLS configuration
+            - name: TLS_ENABLED
+              value: "{{ .Values.gateway.tls.enabled | default false }}"
+            {{- if .Values.gateway.tls.enabled }}
+            - name: TAVANA_TLS_ENABLED
+              value: "true"
+            {{- if .Values.gateway.tls.existingSecret }}
+            - name: TAVANA_TLS_CERT_PATH
+              value: "/etc/tls/{{ .Values.gateway.tls.existingSecretCertKey | default "tls.crt" }}"
+            - name: TAVANA_TLS_KEY_PATH
+              value: "/etc/tls/{{ .Values.gateway.tls.existingSecretKeyKey | default "tls.key" }}"
+            - name: TAVANA_TLS_SELF_SIGNED
+              value: "false"
+            {{- else }}
+            - name: TAVANA_TLS_SELF_SIGNED
+              value: "{{ .Values.gateway.tls.selfSigned | default true }}"
+            - name: TAVANA_TLS_COMMON_NAME
+              value: "{{ .Values.gateway.tls.commonName | default "tavana.local" }}"
+            {{- end }}
+            {{- end }}
             {{- with .Values.gateway.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -79,9 +99,19 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if and .Values.gateway.tls.enabled .Values.gateway.tls.existingSecret }}
+            - name: tls-certs
+              mountPath: /etc/tls
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if and .Values.gateway.tls.enabled .Values.gateway.tls.existingSecret }}
+        - name: tls-certs
+          secret:
+            secretName: {{ .Values.gateway.tls.existingSecret }}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
