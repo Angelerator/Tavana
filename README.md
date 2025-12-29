@@ -32,6 +32,7 @@ Traditional data lake query engines face a classic dilemma:
 
 ### Core Capabilities
 - ✅ **PostgreSQL Wire Protocol** - Works with any PostgreSQL client (psql, DBeaver, Tableau, Python, JDBC)
+- ✅ **SSL/TLS Support** - Optional encrypted connections with self-signed or custom certificates
 - ✅ **DuckDB Engine** - 10-100x faster than traditional engines for analytical queries
 - ✅ **S3-Compatible Storage** - Query Parquet/CSV/JSON files from S3, ADLS Gen2, GCS, MinIO
 - ✅ **Streaming Results** - Memory-efficient row-by-row streaming for large result sets
@@ -1472,6 +1473,12 @@ tavana/
 | `MAX_WORKERS` | Maximum worker pods (HPA limit) | `20` |
 | `MIN_WORKERS` | Minimum worker pods (HPA limit) | `2` |
 | `QUEUE_TIMEOUT_MS` | Max time query can wait in queue | `300000` (5 min) |
+| `TLS_ENABLED` | Enable TLS/SSL for PostgreSQL connections | `false` |
+| `TAVANA_TLS_ENABLED` | Same as TLS_ENABLED (env var used internally) | `false` |
+| `TAVANA_TLS_CERT_PATH` | Path to TLS certificate (PEM format) | - |
+| `TAVANA_TLS_KEY_PATH` | Path to TLS private key (PEM format) | - |
+| `TAVANA_TLS_SELF_SIGNED` | Generate self-signed certificate | `true` |
+| `TAVANA_TLS_COMMON_NAME` | Common name for self-signed cert | `tavana.local` |
 
 #### Worker
 | Variable | Description | Default |
@@ -1516,6 +1523,16 @@ hpa:
   enabled: true
   targetCPUUtilizationPercentage: 70
   targetMemoryUtilizationPercentage: 80
+
+# TLS/SSL configuration
+gateway:
+  tls:
+    enabled: true                       # Enable SSL support
+    selfSigned: true                    # Use self-signed cert (dev)
+    commonName: "tavana.example.com"    # CN for self-signed
+    existingSecret: ""                  # Use existing K8s secret
+    existingSecretCertKey: "tls.crt"    # Cert key in secret
+    existingSecretKeyKey: "tls.key"     # Private key in secret
 
 objectStorage:
   endpoint: ""                       # e.g., s3.amazonaws.com or minio.local:9000

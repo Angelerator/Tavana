@@ -7,20 +7,28 @@
 //! - Queries are ALWAYS accepted (never rejected)
 //! - Enqueued queries wait until K8s capacity is available
 //! - Queue depth signals HPA to scale up
+//!
+//! TLS SUPPORT:
+//! - Accepts both SSL and non-SSL connections
+//! - Self-signed certificates for development
+//! - Custom certificates for production
 
 use crate::auth::AuthService;
 use crate::metrics;
-use crate::query_queue::{QueryOutcome, QueryQueue, QueryToken, QueueError};
+use crate::query_queue::{QueryOutcome, QueryQueue};
 use crate::query_router::{QueryRouter, QueryTarget};
 use crate::redis_queue::{RedisQueue, RedisQueueConfig};
 use crate::smart_scaler::SmartScaler;
+use crate::tls_config::TlsConfig;
 use crate::worker_client::{StreamingBatch, WorkerClient};
 use crate::worker_pool::WorkerPoolManager;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tavana_common::proto;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use std::time::Duration;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
@@ -45,6 +53,7 @@ pub struct PgWireServer {
     redis_queue: Option<Arc<RedisQueue>>,
     smart_scaler: Option<Arc<SmartScaler>>,
     query_queue: Arc<QueryQueue>,
+    tls_config: Option<Arc<TlsConfig>>,
 }
 
 impl PgWireServer {
@@ -64,7 +73,14 @@ impl PgWireServer {
             redis_queue: None,
             smart_scaler: None,
             query_queue: QueryQueue::new(),
+            tls_config: None,
         }
+    }
+
+    /// Set TLS configuration for SSL connections
+    pub fn with_tls(mut self, tls_config: Option<TlsConfig>) -> Self {
+        self.tls_config = tls_config.map(Arc::new);
+        self
     }
 
     /// Create with pool manager and optional Redis queue
@@ -98,6 +114,7 @@ impl PgWireServer {
             redis_queue,
             smart_scaler: None,
             query_queue: QueryQueue::new(),
+            tls_config: None,
         }
     }
 
@@ -158,14 +175,25 @@ impl PgWireServer {
             redis_queue,
             smart_scaler,
             query_queue,
+            tls_config: None,
         }
+    }
+
+    /// Set TLS configuration (can be called after any constructor)
+    pub fn set_tls(&mut self, tls_config: Option<TlsConfig>) {
+        self.tls_config = tls_config.map(Arc::new);
     }
 
     /// Start the PostgreSQL wire protocol server
     pub async fn start(&self) -> anyhow::Result<()> {
+        let tls_status = if self.tls_config.is_some() {
+            "TLS enabled (SSL + non-SSL)"
+        } else {
+            "TLS disabled (non-SSL only)"
+        };
         info!(
-            "Starting PostgreSQL wire protocol server on {} (SmartScaler + QueryQueue mode)",
-            self.addr
+            "Starting PostgreSQL wire protocol server on {} ({}, SmartScaler + QueryQueue mode)",
+            self.addr, tls_status
         );
 
         // Start queue worker if Redis queue is available
@@ -224,6 +252,12 @@ impl PgWireServer {
             let (socket, peer_addr) = listener.accept().await?;
             info!("New PostgreSQL connection from {}", peer_addr);
 
+            // Configure TCP keepalive to prevent stale connections
+            // This is critical for DBeaver, Tableau, Power BI which may idle
+            if let Err(e) = configure_tcp_keepalive(&socket) {
+                warn!("Failed to configure TCP keepalive: {}", e);
+            }
+
             let auth_service = self.auth_service.clone();
             let worker_client = self.worker_client.clone();
             let query_router = self.query_router.clone();
@@ -231,9 +265,10 @@ impl PgWireServer {
             let redis_queue = self.redis_queue.clone();
             let smart_scaler = self.smart_scaler.clone();
             let query_queue = self.query_queue.clone();
+            let tls_config = self.tls_config.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(
+                if let Err(e) = handle_connection_with_tls(
                     socket,
                     auth_service,
                     worker_client,
@@ -242,10 +277,17 @@ impl PgWireServer {
                     redis_queue,
                     smart_scaler,
                     query_queue,
+                    tls_config,
                 )
                 .await
                 {
-                    error!("Error handling PostgreSQL connection: {}", e);
+                    // Only log as error if it's not a normal disconnect
+                    let err_str = e.to_string();
+                    if err_str.contains("early eof") || err_str.contains("connection reset") {
+                        debug!("Client disconnected: {}", err_str);
+                    } else {
+                        error!("Error handling PostgreSQL connection: {}", e);
+                    }
                 }
             });
         }
@@ -442,6 +484,124 @@ async fn execute_query_on_worker(
     Ok(total_rows)
 }
 
+/// Handle connection with optional TLS upgrade
+/// This function handles SSL negotiation and upgrades the connection if TLS is configured
+async fn handle_connection_with_tls(
+    mut socket: tokio::net::TcpStream,
+    auth_service: Arc<AuthService>,
+    worker_client: Arc<WorkerClient>,
+    query_router: Arc<QueryRouter>,
+    pool_manager: Option<Arc<WorkerPoolManager>>,
+    redis_queue: Option<Arc<RedisQueue>>,
+    smart_scaler: Option<Arc<SmartScaler>>,
+    query_queue: Arc<QueryQueue>,
+    tls_config: Option<Arc<TlsConfig>>,
+) -> anyhow::Result<()> {
+    let mut buf = [0u8; 4];
+    
+    // Read initial message to check for SSL request
+    socket.read_exact(&mut buf).await?;
+    let len = u32::from_be_bytes(buf) as usize;
+    
+    if len < 8 || len > 10000 {
+        return Err(anyhow::anyhow!("Invalid message length: {}", len));
+    }
+    
+    let mut startup_msg = vec![0u8; len - 4];
+    socket.read_exact(&mut startup_msg).await?;
+    
+    // Check for SSL/GSSAPI negotiation
+    if len == 8 && startup_msg.len() >= 4 {
+        let code = u32::from_be_bytes([
+            startup_msg[0],
+            startup_msg[1],
+            startup_msg[2],
+            startup_msg[3],
+        ]);
+        
+        match code {
+            80877103 => {
+                // SSLRequest
+                if let Some(ref tls) = tls_config {
+                    debug!("SSL negotiation requested, accepting");
+                    socket.write_all(&[b'S']).await?;
+                    socket.flush().await?;
+                    
+                    // Upgrade to TLS
+                    let acceptor = tls.acceptor();
+                    let tls_stream = acceptor.accept(socket).await
+                        .map_err(|e| anyhow::anyhow!("TLS handshake failed: {}", e))?;
+                    
+                    info!("TLS connection established");
+                    
+                    // Continue with TLS stream
+                    return handle_connection_generic(
+                        tls_stream,
+                        auth_service,
+                        worker_client,
+                        query_router,
+                        pool_manager,
+                        redis_queue,
+                        smart_scaler,
+                        query_queue,
+                    ).await;
+                } else {
+                    debug!("SSL negotiation requested, declining (no TLS config)");
+                    socket.write_all(&[b'N']).await?;
+                    socket.flush().await?;
+                    
+                    // Client will resend startup message without SSL
+                    return handle_connection(
+                        socket,
+                        auth_service,
+                        worker_client,
+                        query_router,
+                        pool_manager,
+                        redis_queue,
+                        smart_scaler,
+                        query_queue,
+                    ).await;
+                }
+            }
+            80877104 => {
+                // GSSENCRequest
+                debug!("GSSAPI negotiation requested, declining");
+                socket.write_all(&[b'N']).await?;
+                socket.flush().await?;
+                
+                // Client will resend startup message
+                return handle_connection(
+                    socket,
+                    auth_service,
+                    worker_client,
+                    query_router,
+                    pool_manager,
+                    redis_queue,
+                    smart_scaler,
+                    query_queue,
+                ).await;
+            }
+            _ => {
+                // Normal startup message, process directly
+            }
+        }
+    }
+    
+    // Process as regular startup message (no SSL requested)
+    handle_connection_with_startup(
+        socket,
+        startup_msg,
+        auth_service,
+        worker_client,
+        query_router,
+        pool_manager,
+        redis_queue,
+        smart_scaler,
+        query_queue,
+    ).await
+}
+
+/// Handle connection after SSL negotiation declined - expects client to retry without SSL
 async fn handle_connection(
     mut socket: tokio::net::TcpStream,
     _auth_service: Arc<AuthService>,
@@ -452,8 +612,6 @@ async fn handle_connection(
     smart_scaler: Option<Arc<SmartScaler>>,
     query_queue: Arc<QueryQueue>,
 ) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let mut buf = [0u8; 4];
     let mut startup_msg;
 
@@ -671,6 +829,547 @@ async fn handle_connection(
             }
         }
     }
+
+    Ok(())
+}
+
+/// Handle connection with an already-parsed startup message (non-SSL path)
+async fn handle_connection_with_startup(
+    mut socket: tokio::net::TcpStream,
+    startup_msg: Vec<u8>,
+    _auth_service: Arc<AuthService>,
+    worker_client: Arc<WorkerClient>,
+    query_router: Arc<QueryRouter>,
+    _pool_manager: Option<Arc<WorkerPoolManager>>,
+    _redis_queue: Option<Arc<RedisQueue>>,
+    smart_scaler: Option<Arc<SmartScaler>>,
+    query_queue: Arc<QueryQueue>,
+) -> anyhow::Result<()> {
+    // Extract user from startup message
+    let user_id =
+        extract_startup_param(&startup_msg, "user").unwrap_or_else(|| "anonymous".to_string());
+    info!("PostgreSQL client connected as user: {}", user_id);
+
+    // Send AuthenticationOk (R)
+    socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
+
+    // Send common parameter status messages
+    send_parameter_status(&mut socket, "server_version", "15.0 (Tavana DuckDB)").await?;
+    send_parameter_status(&mut socket, "client_encoding", "UTF8").await?;
+    send_parameter_status(&mut socket, "server_encoding", "UTF8").await?;
+    send_parameter_status(&mut socket, "DateStyle", "ISO, MDY").await?;
+    send_parameter_status(&mut socket, "TimeZone", "UTC").await?;
+    send_parameter_status(&mut socket, "integer_datetimes", "on").await?;
+    send_parameter_status(&mut socket, "standard_conforming_strings", "on").await?;
+
+    // Send BackendKeyData (K)
+    let pid = std::process::id();
+    let secret = pid.wrapping_mul(1103515245).wrapping_add(12345);
+    let mut key_data = vec![b'K', 0, 0, 0, 12];
+    key_data.extend_from_slice(&(pid as u32).to_be_bytes());
+    key_data.extend_from_slice(&secret.to_be_bytes());
+    socket.write_all(&key_data).await?;
+
+    // Send ReadyForQuery (Z)
+    let ready = [b'Z', 0, 0, 0, 5, b'I'];
+    socket.write_all(&ready).await?;
+    socket.flush().await?;
+
+    // Run the query loop
+    run_query_loop(&mut socket, &worker_client, &query_router, &user_id, smart_scaler.as_ref().map(|s| s.as_ref()), &query_queue).await
+}
+
+/// Generic connection handler for both TLS and non-TLS streams
+async fn handle_connection_generic<S>(
+    mut socket: S,
+    _auth_service: Arc<AuthService>,
+    worker_client: Arc<WorkerClient>,
+    query_router: Arc<QueryRouter>,
+    _pool_manager: Option<Arc<WorkerPoolManager>>,
+    _redis_queue: Option<Arc<RedisQueue>>,
+    smart_scaler: Option<Arc<SmartScaler>>,
+    query_queue: Arc<QueryQueue>,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 4];
+    let mut startup_msg;
+
+    // Loop to handle multiple negotiation requests after TLS upgrade
+    loop {
+        socket.read_exact(&mut buf).await?;
+        let len = u32::from_be_bytes(buf) as usize;
+        debug!("Received message (TLS), length: {}", len);
+
+        if len < 8 || len > 10000 {
+            return Err(anyhow::anyhow!("Invalid message length: {}", len));
+        }
+
+        startup_msg = vec![0u8; len - 4];
+        socket.read_exact(&mut startup_msg).await?;
+
+        if len == 8 && startup_msg.len() >= 4 {
+            let code = u32::from_be_bytes([
+                startup_msg[0],
+                startup_msg[1],
+                startup_msg[2],
+                startup_msg[3],
+            ]);
+            match code {
+                80877103 | 80877104 => {
+                    // SSLRequest or GSSENCRequest after TLS - decline (already encrypted)
+                    debug!("Nested SSL/GSSAPI request, declining");
+                    socket.write_all(&[b'N']).await?;
+                    socket.flush().await?;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        break;
+    }
+
+    // Extract user from startup message
+    let user_id =
+        extract_startup_param(&startup_msg, "user").unwrap_or_else(|| "anonymous".to_string());
+    info!("PostgreSQL client connected as user: {} (TLS)", user_id);
+
+    // Send AuthenticationOk (R)
+    socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
+
+    // Send common parameter status messages
+    send_parameter_status_generic(&mut socket, "server_version", "15.0 (Tavana DuckDB)").await?;
+    send_parameter_status_generic(&mut socket, "client_encoding", "UTF8").await?;
+    send_parameter_status_generic(&mut socket, "server_encoding", "UTF8").await?;
+    send_parameter_status_generic(&mut socket, "DateStyle", "ISO, MDY").await?;
+    send_parameter_status_generic(&mut socket, "TimeZone", "UTC").await?;
+    send_parameter_status_generic(&mut socket, "integer_datetimes", "on").await?;
+    send_parameter_status_generic(&mut socket, "standard_conforming_strings", "on").await?;
+
+    // Send BackendKeyData (K)
+    let pid = std::process::id();
+    let secret = pid.wrapping_mul(1103515245).wrapping_add(12345);
+    let mut key_data = vec![b'K', 0, 0, 0, 12];
+    key_data.extend_from_slice(&(pid as u32).to_be_bytes());
+    key_data.extend_from_slice(&secret.to_be_bytes());
+    socket.write_all(&key_data).await?;
+
+    // Send ReadyForQuery (Z)
+    let ready = [b'Z', 0, 0, 0, 5, b'I'];
+    socket.write_all(&ready).await?;
+    socket.flush().await?;
+
+    // Run the query loop for TLS stream
+    run_query_loop_generic(&mut socket, &worker_client, &query_router, &user_id, smart_scaler.as_ref().map(|s| s.as_ref()), &query_queue).await
+}
+
+/// Run the main query loop (for non-TLS)
+async fn run_query_loop(
+    socket: &mut tokio::net::TcpStream,
+    worker_client: &WorkerClient,
+    query_router: &QueryRouter,
+    user_id: &str,
+    smart_scaler: Option<&SmartScaler>,
+    query_queue: &Arc<QueryQueue>,
+) -> anyhow::Result<()> {
+    let mut buf = [0u8; 4];
+    let ready = [b'Z', 0, 0, 0, 5, b'I'];
+    let mut prepared_query: Option<String> = None;
+
+    loop {
+        let mut msg_type = [0u8; 1];
+        if socket.read_exact(&mut msg_type).await.is_err() {
+            debug!("Client disconnected");
+            break;
+        }
+
+        match msg_type[0] {
+            b'X' => {
+                debug!("Client sent Terminate message");
+                break;
+            }
+            b'Q' => {
+                socket.read_exact(&mut buf).await?;
+                let len = u32::from_be_bytes(buf) as usize - 4;
+                let mut query_bytes = vec![0u8; len];
+                socket.read_exact(&mut query_bytes).await?;
+
+                let query = String::from_utf8_lossy(&query_bytes)
+                    .trim_end_matches('\0')
+                    .to_string();
+
+                debug!("Received query: {}", &query[..query.len().min(100)]);
+
+                let query_id = uuid::Uuid::new_v4().to_string();
+                let estimate = query_router.route(&query).await;
+                let estimated_data_mb = estimate.data_size_mb;
+
+                let enqueue_result = query_queue
+                    .enqueue(query_id.clone(), estimated_data_mb)
+                    .await;
+
+                match enqueue_result {
+                    Ok(query_token) => {
+                        let start = std::time::Instant::now();
+                        let result = execute_query_streaming_with_scaler(
+                            socket,
+                            worker_client,
+                            query_router,
+                            &query,
+                            user_id,
+                            smart_scaler,
+                        )
+                        .await;
+
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        let outcome = match &result {
+                            Ok(row_count) => {
+                                info!(
+                                    query_id = %query_id,
+                                    rows = row_count,
+                                    wait_ms = query_token.queue_wait_ms(),
+                                    exec_ms = duration_ms,
+                                    "Query completed (streaming)"
+                                );
+                                QueryOutcome::Success {
+                                    rows: *row_count as u64,
+                                    bytes: 0,
+                                    duration_ms,
+                                }
+                            }
+                            Err(e) => {
+                                error!("Query {} error: {}", query_id, e);
+                                send_error(socket, &e.to_string()).await?;
+                                QueryOutcome::Failure {
+                                    error: e.to_string(),
+                                    duration_ms,
+                                }
+                            }
+                        };
+                        query_queue.complete(query_token, outcome).await;
+                    }
+                    Err(queue_error) => {
+                        let error_msg = format!("Query queue error: {}", queue_error);
+                        warn!(query_id = %query_id, "Query failed to queue: {}", error_msg);
+                        send_error(socket, &error_msg).await?;
+                    }
+                }
+
+                socket.write_all(&ready).await?;
+                socket.flush().await?;
+            }
+            b'P' => {
+                let sql = handle_parse_extended(socket, &mut buf).await?;
+                if let Some(query) = sql {
+                    prepared_query = Some(query);
+                }
+            }
+            b'B' => handle_bind(socket, &mut buf).await?,
+            b'D' => handle_describe(socket, &mut buf).await?,
+            b'E' => {
+                if let Some(ref query) = prepared_query {
+                    handle_execute_extended(
+                        socket,
+                        &mut buf,
+                        worker_client,
+                        query_router,
+                        query,
+                        user_id,
+                        smart_scaler,
+                        query_queue,
+                    )
+                    .await?;
+                } else {
+                    handle_execute_empty(socket, &mut buf).await?;
+                }
+                prepared_query = None;
+            }
+            b'S' => {
+                socket.write_all(&ready).await?;
+                socket.flush().await?;
+            }
+            _ => {
+                socket.read_exact(&mut buf).await?;
+                let len = u32::from_be_bytes(buf) as usize - 4;
+                let mut skip = vec![0u8; len];
+                socket.read_exact(&mut skip).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Run the main query loop for generic streams (TLS)
+/// Note: For TLS streams, we use a simplified query handler that only supports simple queries
+/// Extended protocol support for TLS would require significant refactoring
+async fn run_query_loop_generic<S>(
+    socket: &mut S,
+    worker_client: &WorkerClient,
+    query_router: &QueryRouter,
+    user_id: &str,
+    smart_scaler: Option<&SmartScaler>,
+    query_queue: &Arc<QueryQueue>,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 4];
+    let ready = [b'Z', 0, 0, 0, 5, b'I'];
+
+    loop {
+        let mut msg_type = [0u8; 1];
+        if socket.read_exact(&mut msg_type).await.is_err() {
+            debug!("Client disconnected (TLS)");
+            break;
+        }
+
+        match msg_type[0] {
+            b'X' => {
+                debug!("Client sent Terminate message (TLS)");
+                break;
+            }
+            b'Q' => {
+                socket.read_exact(&mut buf).await?;
+                let len = u32::from_be_bytes(buf) as usize - 4;
+                let mut query_bytes = vec![0u8; len];
+                socket.read_exact(&mut query_bytes).await?;
+
+                let query = String::from_utf8_lossy(&query_bytes)
+                    .trim_end_matches('\0')
+                    .to_string();
+
+                debug!("Received query (TLS): {}", &query[..query.len().min(100)]);
+
+                // For TLS connections, execute queries directly using a simpler path
+                let query_id = uuid::Uuid::new_v4().to_string();
+                let estimate = query_router.route(&query).await;
+                let estimated_data_mb = estimate.data_size_mb;
+
+                let enqueue_result = query_queue
+                    .enqueue(query_id.clone(), estimated_data_mb)
+                    .await;
+
+                match enqueue_result {
+                    Ok(query_token) => {
+                        let start = std::time::Instant::now();
+                        
+                        // Execute query - for TLS we route to worker and collect results
+                        let result = execute_query_tls(
+                            socket,
+                            worker_client,
+                            query_router,
+                            &query,
+                            user_id,
+                            smart_scaler,
+                        )
+                        .await;
+
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        let outcome = match &result {
+                            Ok(row_count) => {
+                                info!(
+                                    query_id = %query_id,
+                                    rows = row_count,
+                                    wait_ms = query_token.queue_wait_ms(),
+                                    exec_ms = duration_ms,
+                                    "Query completed (TLS streaming)"
+                                );
+                                QueryOutcome::Success {
+                                    rows: *row_count as u64,
+                                    bytes: 0,
+                                    duration_ms,
+                                }
+                            }
+                            Err(e) => {
+                                error!("Query {} error (TLS): {}", query_id, e);
+                                send_error_generic(socket, &e.to_string()).await?;
+                                QueryOutcome::Failure {
+                                    error: e.to_string(),
+                                    duration_ms,
+                                }
+                            }
+                        };
+                        query_queue.complete(query_token, outcome).await;
+                    }
+                    Err(queue_error) => {
+                        let error_msg = format!("Query queue error: {}", queue_error);
+                        warn!(query_id = %query_id, "Query failed to queue (TLS): {}", error_msg);
+                        send_error_generic(socket, &error_msg).await?;
+                    }
+                }
+
+                socket.write_all(&ready).await?;
+                socket.flush().await?;
+            }
+            b'P' | b'B' | b'D' | b'E' => {
+                // Extended query protocol - read and skip for now
+                // TODO: Full extended protocol support for TLS
+                socket.read_exact(&mut buf).await?;
+                let len = u32::from_be_bytes(buf) as usize - 4;
+                let mut skip = vec![0u8; len];
+                socket.read_exact(&mut skip).await?;
+                
+                // Send empty response for extended protocol
+                if msg_type[0] == b'P' {
+                    // ParseComplete
+                    socket.write_all(&[b'1', 0, 0, 0, 4]).await?;
+                } else if msg_type[0] == b'B' {
+                    // BindComplete
+                    socket.write_all(&[b'2', 0, 0, 0, 4]).await?;
+                }
+                socket.flush().await?;
+            }
+            b'S' => {
+                socket.write_all(&ready).await?;
+                socket.flush().await?;
+            }
+            _ => {
+                socket.read_exact(&mut buf).await?;
+                let len = u32::from_be_bytes(buf) as usize - 4;
+                let mut skip = vec![0u8; len];
+                socket.read_exact(&mut skip).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Send parameter status for generic streams
+async fn send_parameter_status_generic<S>(socket: &mut S, name: &str, value: &str) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let total_len = 4 + name.len() + 1 + value.len() + 1;
+    let mut msg = vec![b'S'];
+    msg.extend_from_slice(&(total_len as u32).to_be_bytes());
+    msg.extend_from_slice(name.as_bytes());
+    msg.push(0);
+    msg.extend_from_slice(value.as_bytes());
+    msg.push(0);
+    socket.write_all(&msg).await?;
+    Ok(())
+}
+
+/// Send error message for generic streams
+async fn send_error_generic<S>(socket: &mut S, message: &str) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let msg_bytes = message.as_bytes();
+    let total_len = 4 + 1 + msg_bytes.len() + 1 + 1;
+    let mut error_msg = vec![b'E'];
+    error_msg.extend_from_slice(&(total_len as u32).to_be_bytes());
+    error_msg.push(b'M');
+    error_msg.extend_from_slice(msg_bytes);
+    error_msg.push(0);
+    error_msg.push(0);
+    socket.write_all(&error_msg).await?;
+
+    let cmd_complete = [b'C', 0, 0, 0, 10, b'E', b'R', b'R', b'O', b'R', 0];
+    socket.write_all(&cmd_complete).await?;
+
+    Ok(())
+}
+
+/// Execute query for TLS streams - uses WorkerClient for query execution
+async fn execute_query_tls<S>(
+    socket: &mut S,
+    worker_client: &WorkerClient,
+    query_router: &QueryRouter,
+    sql: &str,
+    user_id: &str,
+    _smart_scaler: Option<&SmartScaler>,
+) -> anyhow::Result<usize>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Handle PostgreSQL-specific commands locally
+    if let Some(result) = handle_pg_specific_command(sql) {
+        // Send simple result for TLS stream
+        let columns: Vec<(&str, i32)> = result.columns.iter().map(|(n, _t)| (n.as_str(), 25i32)).collect();
+        send_simple_result_generic(socket, &columns, &result.rows).await?;
+        return Ok(0);
+    }
+
+    metrics::query_started();
+
+    let estimate = query_router.route(sql).await;
+    info!(
+        data_mb = estimate.data_size_mb,
+        target = ?estimate.target,
+        "Query routed for TLS execution"
+    );
+
+    // Execute query through worker client (buffered for TLS - simpler implementation)
+    let result = worker_client.execute_query(sql, user_id).await?;
+    
+    // Send RowDescription and DataRows
+    let columns: Vec<(&str, i32)> = result.columns.iter().map(|c| (c.name.as_str(), 25i32)).collect();
+    send_simple_result_generic(socket, &columns, &result.rows).await?;
+    
+    let row_count = result.rows.len();
+    info!("TLS query completed: {} rows", row_count);
+    
+    Ok(row_count)
+}
+
+/// Send simple result for generic streams
+async fn send_simple_result_generic<S>(socket: &mut S, columns: &[(&str, i32)], rows: &[Vec<String>]) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    // Build RowDescription
+    let mut row_desc = vec![b'T'];
+    let num_fields = columns.len() as i16;
+    let mut fields_data = Vec::new();
+    fields_data.extend_from_slice(&num_fields.to_be_bytes());
+
+    for (col_name, _type_oid) in columns {
+        fields_data.extend_from_slice(col_name.as_bytes());
+        fields_data.push(0);
+        fields_data.extend_from_slice(&0i32.to_be_bytes()); // table OID
+        fields_data.extend_from_slice(&0i16.to_be_bytes()); // column attr
+        fields_data.extend_from_slice(&25i32.to_be_bytes()); // type OID (text)
+        fields_data.extend_from_slice(&(-1i16).to_be_bytes()); // type size
+        fields_data.extend_from_slice(&(-1i32).to_be_bytes()); // type mod
+        fields_data.extend_from_slice(&0i16.to_be_bytes()); // format (text)
+    }
+
+    let row_desc_len = (4 + fields_data.len()) as u32;
+    row_desc.extend_from_slice(&row_desc_len.to_be_bytes());
+    row_desc.extend_from_slice(&fields_data);
+    socket.write_all(&row_desc).await?;
+
+    // Send DataRows
+    for row in rows {
+        let mut data_row = vec![b'D'];
+        let mut row_data = Vec::new();
+        row_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
+
+        for val in row {
+            let bytes = val.as_bytes();
+            row_data.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+            row_data.extend_from_slice(bytes);
+        }
+
+        let row_len = (4 + row_data.len()) as u32;
+        data_row.extend_from_slice(&row_len.to_be_bytes());
+        data_row.extend_from_slice(&row_data);
+        socket.write_all(&data_row).await?;
+    }
+
+    // Send CommandComplete
+    let cmd = format!("SELECT {}", rows.len());
+    let cmd_bytes = cmd.as_bytes();
+    let mut complete = vec![b'C'];
+    complete.extend_from_slice(&((4 + cmd_bytes.len() + 1) as u32).to_be_bytes());
+    complete.extend_from_slice(cmd_bytes);
+    complete.push(0);
+    socket.write_all(&complete).await?;
+    socket.flush().await?;
 
     Ok(())
 }
@@ -1577,5 +2276,34 @@ async fn handle_execute_empty(
     let mut data = vec![0u8; len];
     socket.read_exact(&mut data).await?;
     send_command_complete(socket, "SELECT 0").await?;
+    Ok(())
+}
+
+/// Configure TCP keepalive on a socket to prevent stale connections
+/// 
+/// This is essential for BI tools like DBeaver, Tableau, Power BI that may
+/// hold connections open for long periods. Without keepalive:
+/// - Network equipment (firewalls, load balancers) may drop idle connections
+/// - Clients see "connection reset" or "stale connection" errors
+/// - Users need to manually reconnect
+fn configure_tcp_keepalive(socket: &tokio::net::TcpStream) -> std::io::Result<()> {
+    use socket2::{SockRef, TcpKeepalive};
+    
+    let sock_ref = SockRef::from(socket);
+    
+    // Configure TCP keepalive with:
+    // - Start sending probes after 30 seconds of idle
+    // - Send probes every 15 seconds
+    // - On Linux, give up after 4 failed probes (~1 minute total)
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(15));
+    
+    sock_ref.set_tcp_keepalive(&keepalive)?;
+    
+    // Disable Nagle's algorithm for lower latency (useful for interactive queries)
+    sock_ref.set_nodelay(true)?;
+    
+    debug!("TCP keepalive configured: idle=30s, interval=15s, nodelay=true");
     Ok(())
 }

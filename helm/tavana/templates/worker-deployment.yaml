@@ -95,13 +95,12 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
-            # Note: Do NOT mount over /home/tavana - it contains pre-installed DuckDB extensions
-            - name: duckdb-data
-              mountPath: /home/tavana/data
+            - name: duckdb-home
+              mountPath: /home/tavana
       volumes:
         - name: tmp
           emptyDir: {}
-        - name: duckdb-data
+        - name: duckdb-home
           emptyDir: {}
 ---
 apiVersion: v1

@@ -41,6 +41,9 @@ jsonwebtoken = { workspace = true }
 
 # TLS
 rustls = { workspace = true, features = ["ring"] }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
 
 # Observability
 tracing = { workspace = true }
@@ -94,4 +97,7 @@ redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
 # HTTP types for K8s API requests
 http = "1.1"
+
+# Socket options (TCP keepalive)
+socket2 = { version = "0.5", features = ["all"] }
 
