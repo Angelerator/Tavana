@@ -23,19 +23,22 @@ gateway:
   
   service:
     type: ClusterIP
-    pgPort: 5432       # PostgreSQL wire protocol (internal)
+    pgPort: 5432       # PostgreSQL wire protocol
     httpPort: 8080     # Health + Metrics
-    # External port for LoadBalancer/Ingress (some policies block 5432)
-    externalPgPort: 5432  # Change to 8081 if Azure Policy blocks 5432
   
-  # Optional: Internal LoadBalancer for direct PostgreSQL access
-  # Requires AKS to have Network Contributor role on the VNet
-  loadBalancer:
+  # TLS configuration for PostgreSQL wire protocol
+  tls:
+    # Enable TLS/SSL support (accepts both SSL and non-SSL connections)
     enabled: false
-    annotations:
-      service.beta.kubernetes.io/azure-load-balancer-internal: "true"
-      # For AWS: service.beta.kubernetes.io/aws-load-balancer-internal: "true"
-      # For GCP: cloud.google.com/load-balancer-type: "Internal"
+    # Self-signed certificate generation (for development/testing)
+    selfSigned: true
+    # Common name for self-signed certificate
+    commonName: "tavana.local"
+    # Use existing TLS secret instead of self-signed
+    existingSecret: ""
+    # Keys in the existing secret (PEM format)
+    existingSecretCertKey: "tls.crt"
+    existingSecretKeyKey: "tls.key"
   
   resources:
     requests:
@@ -157,25 +160,12 @@ ingress:
   enabled: false
   className: ""
   annotations: {}
-    # Azure Application Gateway example:
-    # kubernetes.io/ingress.class: azure/application-gateway
-    # appgw.ingress.kubernetes.io/use-private-ip: "true"
-    # appgw.ingress.kubernetes.io/backend-protocol: "http"
-    # appgw.ingress.kubernetes.io/health-probe-path: "/health"
-    # appgw.ingress.kubernetes.io/ssl-redirect: "true"
-    # 
-    # Nginx Ingress example:
-    # kubernetes.io/ingress.class: nginx
-    # nginx.ingress.kubernetes.io/ssl-redirect: "true"
   hosts:
     - host: tavana.example.com
       paths:
         - path: /
           pathType: Prefix
   tls: []
-    # - secretName: tavana-tls
-    #   hosts:
-    #     - tavana.example.com
 
 # Monitoring
 monitoring:
