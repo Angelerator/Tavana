@@ -1619,57 +1619,29 @@ where
     S: AsyncWrite + Unpin,
 {
     // CopyOutResponse (H) - indicates server is starting COPY OUT
-    // Format: 'H' + length(4) + format_code(1) + num_columns(2) + format_per_column(2*n)
+    // Use TEXT format (0) since postgres_scanner can handle it and we don't need to
+    // convert our string values to proper binary format for each type
     let num_cols = columns.len() as i16;
     let msg_len = 4 + 1 + 2 + (2 * columns.len() as i32);
     let mut copy_out_resp = vec![b'H'];
     copy_out_resp.extend_from_slice(&(msg_len as u32).to_be_bytes());
-    copy_out_resp.push(1); // Overall format: 1 = binary
+    copy_out_resp.push(0); // Overall format: 0 = TEXT
     copy_out_resp.extend_from_slice(&num_cols.to_be_bytes());
     for _ in 0..columns.len() {
-        copy_out_resp.extend_from_slice(&1i16.to_be_bytes()); // Format per column: 1 = binary
+        copy_out_resp.extend_from_slice(&0i16.to_be_bytes()); // Format per column: 0 = TEXT
     }
     socket.write_all(&copy_out_resp).await?;
     
-    // Build ALL binary COPY data in a single CopyData message
-    // This ensures the client can read the header correctly
-    let mut binary_data: Vec<u8> = Vec::new();
-    
-    // Binary COPY header: "PGCOPY\n\xff\r\n\0" (11 bytes)
-    binary_data.extend_from_slice(&[
-        b'P', b'G', b'C', b'O', b'P', b'Y',  // "PGCOPY"
-        0x0a,                                  // \n (newline)
-        0xff,                                  // \xff (255)
-        0x0d,                                  // \r (carriage return)
-        0x0a,                                  // \n (newline)
-        0x00,                                  // \0 (null)
-    ]);
-    // Flags field (4 bytes) - 0 for no OID
-    binary_data.extend_from_slice(&0u32.to_be_bytes());
-    // Header extension area length (4 bytes) - 0 for no extension
-    binary_data.extend_from_slice(&0u32.to_be_bytes());
-    
-    // Add all tuples
+    // Send each row as CopyData with TEXT format (tab-separated, newline terminated)
     for row in rows {
-        // Number of fields (2 bytes)
-        binary_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
+        let row_text = row.join("\t") + "\n";
+        let row_bytes = row_text.as_bytes();
         
-        // Each field: length (4 bytes) + data
-        for val in row {
-            let bytes = val.as_bytes();
-            binary_data.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
-            binary_data.extend_from_slice(bytes);
-        }
+        let mut copy_data = vec![b'd'];
+        copy_data.extend_from_slice(&((4 + row_bytes.len()) as u32).to_be_bytes());
+        copy_data.extend_from_slice(row_bytes);
+        socket.write_all(&copy_data).await?;
     }
-    
-    // File trailer: -1 as i16 (0xffff)
-    binary_data.extend_from_slice(&(-1i16).to_be_bytes());
-    
-    // Send everything as ONE CopyData message
-    let mut copy_data = vec![b'd'];
-    copy_data.extend_from_slice(&((4 + binary_data.len()) as u32).to_be_bytes());
-    copy_data.extend_from_slice(&binary_data);
-    socket.write_all(&copy_data).await?;
     
     // CopyDone (c)
     socket.write_all(&[b'c', 0, 0, 0, 4]).await?;
