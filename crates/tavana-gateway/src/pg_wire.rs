@@ -1416,6 +1416,9 @@ where
         return Ok(0);
     }
     
+    // Check if this is a COPY command - need to send COPY protocol response
+    let is_copy_command = sql.trim().to_uppercase().starts_with("COPY");
+    
     // Handle COPY commands by extracting inner query
     // COPY (SELECT ...) TO STDOUT -> execute the inner SELECT
     let actual_sql = if let Some(inner) = extract_copy_inner_query(sql) {
@@ -1456,12 +1459,19 @@ where
         }
     };
     
-    // Send RowDescription and DataRows
-    let col_refs: Vec<(&str, i32)> = columns.iter().map(|(n, _t)| (n.as_str(), 25i32)).collect();
-    send_simple_result_generic(socket, &col_refs, &rows).await?;
-    
     let row_count = rows.len();
-    info!("TLS query completed: {} rows", row_count);
+    
+    if is_copy_command {
+        // Send COPY protocol response for COPY commands
+        // This is what postgres_scanner expects
+        send_copy_out_response(socket, &columns, &rows).await?;
+    } else {
+        // Send regular RowDescription and DataRows for SELECT
+        let col_refs: Vec<(&str, i32)> = columns.iter().map(|(n, _t)| (n.as_str(), 25i32)).collect();
+        send_simple_result_generic(socket, &col_refs, &rows).await?;
+    }
+    
+    info!("TLS query completed: {} rows (copy={})", row_count, is_copy_command);
     
     Ok(row_count)
 }
@@ -1594,6 +1604,59 @@ where
     socket.write_all(&complete).await?;
     socket.flush().await?;
 
+    Ok(())
+}
+
+/// Send COPY OUT protocol response for COPY TO STDOUT commands
+/// This is what postgres_scanner and DuckDB postgres_query expect
+async fn send_copy_out_response<S>(
+    socket: &mut S,
+    columns: &[(String, String)],
+    rows: &[Vec<String>],
+) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    // CopyOutResponse (H) - indicates server is starting COPY OUT
+    // Format: 'H' + length(4) + format_code(1) + num_columns(2) + format_per_column(2*n)
+    let num_cols = columns.len() as i16;
+    let msg_len = 4 + 1 + 2 + (2 * columns.len() as i32);
+    let mut copy_out_resp = vec![b'H'];
+    copy_out_resp.extend_from_slice(&(msg_len as u32).to_be_bytes());
+    copy_out_resp.push(0); // Overall format: 0 = text
+    copy_out_resp.extend_from_slice(&num_cols.to_be_bytes());
+    for _ in 0..columns.len() {
+        copy_out_resp.extend_from_slice(&0i16.to_be_bytes()); // Format per column: 0 = text
+    }
+    socket.write_all(&copy_out_resp).await?;
+    
+    // Send each row as CopyData (d)
+    for row in rows {
+        // Format row as tab-separated values with newline
+        let row_text = row.join("\t") + "\n";
+        let row_bytes = row_text.as_bytes();
+        
+        let mut copy_data = vec![b'd'];
+        copy_data.extend_from_slice(&((4 + row_bytes.len()) as u32).to_be_bytes());
+        copy_data.extend_from_slice(row_bytes);
+        socket.write_all(&copy_data).await?;
+    }
+    
+    // CopyDone (c)
+    socket.write_all(&[b'c', 0, 0, 0, 4]).await?;
+    
+    // CommandComplete (C) with COPY row count
+    let cmd = format!("COPY {}", rows.len());
+    let cmd_bytes = cmd.as_bytes();
+    let mut complete = vec![b'C'];
+    complete.extend_from_slice(&((4 + cmd_bytes.len() + 1) as u32).to_be_bytes());
+    complete.extend_from_slice(cmd_bytes);
+    complete.push(0);
+    socket.write_all(&complete).await?;
+    
+    socket.flush().await?;
+    
+    info!("Sent COPY OUT response: {} rows", rows.len());
     Ok(())
 }
 
