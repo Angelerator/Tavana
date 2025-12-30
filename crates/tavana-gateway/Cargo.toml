@@ -101,3 +101,7 @@ http = "1.1"
 # Socket options (TCP keepalive)
 socket2 = { version = "0.5", features = ["all"] }
 
+# MD5 authentication for PostgreSQL wire protocol
+md5 = "0.7"
+rand = "0.8"
+
