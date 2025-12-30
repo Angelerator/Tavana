@@ -1609,6 +1609,7 @@ where
 
 /// Send COPY OUT protocol response for COPY TO STDOUT commands
 /// This is what postgres_scanner and DuckDB postgres_query expect
+/// Sends binary format as that's what postgres_query requests
 async fn send_copy_out_response<S>(
     socket: &mut S,
     columns: &[(String, String)],
@@ -1623,24 +1624,54 @@ where
     let msg_len = 4 + 1 + 2 + (2 * columns.len() as i32);
     let mut copy_out_resp = vec![b'H'];
     copy_out_resp.extend_from_slice(&(msg_len as u32).to_be_bytes());
-    copy_out_resp.push(0); // Overall format: 0 = text
+    copy_out_resp.push(1); // Overall format: 1 = binary
     copy_out_resp.extend_from_slice(&num_cols.to_be_bytes());
     for _ in 0..columns.len() {
-        copy_out_resp.extend_from_slice(&0i16.to_be_bytes()); // Format per column: 0 = text
+        copy_out_resp.extend_from_slice(&1i16.to_be_bytes()); // Format per column: 1 = binary
     }
     socket.write_all(&copy_out_resp).await?;
     
-    // Send each row as CopyData (d)
+    // Build binary COPY data in a single CopyData message
+    let mut binary_data: Vec<u8> = Vec::new();
+    
+    // Binary COPY header: "PGCOPY\n\xff\r\n\0" (11 bytes)
+    binary_data.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+    // Flags field (4 bytes) - 0 for no OID
+    binary_data.extend_from_slice(&0u32.to_be_bytes());
+    // Header extension area length (4 bytes) - 0 for no extension
+    binary_data.extend_from_slice(&0u32.to_be_bytes());
+    
+    // Send header as first CopyData
+    let mut copy_data = vec![b'd'];
+    copy_data.extend_from_slice(&((4 + binary_data.len()) as u32).to_be_bytes());
+    copy_data.extend_from_slice(&binary_data);
+    socket.write_all(&copy_data).await?;
+    
+    // Send each row as CopyData with binary tuple format
     for row in rows {
-        // Format row as tab-separated values with newline
-        let row_text = row.join("\t") + "\n";
-        let row_bytes = row_text.as_bytes();
+        let mut tuple_data: Vec<u8> = Vec::new();
+        // Number of fields (2 bytes)
+        tuple_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
+        
+        // Each field: length (4 bytes) + data
+        for val in row {
+            let bytes = val.as_bytes();
+            tuple_data.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+            tuple_data.extend_from_slice(bytes);
+        }
         
         let mut copy_data = vec![b'd'];
-        copy_data.extend_from_slice(&((4 + row_bytes.len()) as u32).to_be_bytes());
-        copy_data.extend_from_slice(row_bytes);
+        copy_data.extend_from_slice(&((4 + tuple_data.len()) as u32).to_be_bytes());
+        copy_data.extend_from_slice(&tuple_data);
         socket.write_all(&copy_data).await?;
     }
+    
+    // Send file trailer (-1 as 2-byte integer)
+    let trailer: Vec<u8> = vec![0xff, 0xff]; // -1 as i16
+    let mut copy_data = vec![b'd'];
+    copy_data.extend_from_slice(&((4 + trailer.len()) as u32).to_be_bytes());
+    copy_data.extend_from_slice(&trailer);
+    socket.write_all(&copy_data).await?;
     
     // CopyDone (c)
     socket.write_all(&[b'c', 0, 0, 0, 4]).await?;
@@ -1656,7 +1687,7 @@ where
     
     socket.flush().await?;
     
-    info!("Sent COPY OUT response: {} rows", rows.len());
+    info!("Sent COPY OUT binary response: {} rows", rows.len());
     Ok(())
 }
 
