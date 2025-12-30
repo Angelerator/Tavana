@@ -253,7 +253,7 @@ impl DuckDbExecutor {
             // Set storage account name if provided
             if let Some(account) = &account_name {
                 conn.execute(
-                    &format!("SET azure_storage_account_name = '{}'", account),
+                    &format!("SET azure_account_name = '{}'", account),
                     params![],
                 )?;
             }
@@ -391,7 +391,7 @@ impl DuckDbExecutor {
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
             conn.execute(
-                &format!("SET azure_storage_account_name = '{}'", account_name),
+                &format!("SET azure_account_name = '{}'", account_name),
                 params![],
             )?;
         }
@@ -418,7 +418,7 @@ impl DuckDbExecutor {
 
             // Set storage account name (always required)
             conn.execute(
-                &format!("SET azure_storage_account_name = '{}'", account_name),
+                &format!("SET azure_account_name = '{}'", account_name),
                 params![],
             )?;
 
