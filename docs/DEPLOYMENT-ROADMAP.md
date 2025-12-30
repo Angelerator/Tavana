@@ -1049,7 +1049,7 @@ TAVANA_AGENT_TOKEN=tat_xxxx
 ## Next Steps
 
 1. **Immediate**: Build `tavana-admin` CLI with `generate` command
-2. **Short-term**: Test deployment flow with Nokia
+2. **Short-term**: Test deployment flow with -
 3. **Medium-term**: Add license validation (Phase 2)
 4. **Long-term**: Full control plane when customer base grows
 
