@@ -191,24 +191,43 @@ impl DuckDbExecutor {
                 tracing::warn!("Could not set azure_account_name: {}", e);
             }
             
-            // Create Azure secret with credential chain for workload identity
-            // This is more reliable than SET azure_credential_chain for K8s workload identity
-            let secret_sql = format!(
-                "CREATE SECRET IF NOT EXISTS azure_storage (
-                    TYPE azure,
-                    PROVIDER credential_chain,
-                    ACCOUNT_NAME '{}'
-                )",
-                account_name
-            );
-            if let Err(e) = connection.execute(&secret_sql, params![]) {
-                tracing::warn!("Could not create Azure secret: {}", e);
-                // Fallback to SET-based configuration
-                if let Err(e) = connection.execute("SET azure_credential_chain = 'default'", params![]) {
-                    tracing::warn!("Could not set azure_credential_chain: {}", e);
+            // Try to get an access token for workload identity (needed for delta_scan)
+            let access_token = Self::get_azure_access_token();
+            
+            if let Some(token) = access_token {
+                // Use access_token provider for delta extension compatibility
+                let secret_sql = format!(
+                    "CREATE SECRET IF NOT EXISTS azure_storage (
+                        TYPE azure,
+                        PROVIDER access_token,
+                        ACCESS_TOKEN '{}',
+                        ACCOUNT_NAME '{}'
+                    )",
+                    token, account_name
+                );
+                if let Err(e) = connection.execute(&secret_sql, params![]) {
+                    tracing::warn!("Could not create Azure secret with access_token: {}", e);
+                } else {
+                    tracing::info!("Azure secret created with access_token provider (delta_scan compatible)");
                 }
             } else {
-                tracing::info!("Azure secret created with credential_chain provider");
+                // Fallback to credential_chain (works for read_parquet but not delta_scan in K8s)
+                let secret_sql = format!(
+                    "CREATE SECRET IF NOT EXISTS azure_storage (
+                        TYPE azure,
+                        PROVIDER credential_chain,
+                        ACCOUNT_NAME '{}'
+                    )",
+                    account_name
+                );
+                if let Err(e) = connection.execute(&secret_sql, params![]) {
+                    tracing::warn!("Could not create Azure secret: {}", e);
+                    if let Err(e) = connection.execute("SET azure_credential_chain = 'default'", params![]) {
+                        tracing::warn!("Could not set azure_credential_chain: {}", e);
+                    }
+                } else {
+                    tracing::info!("Azure secret created with credential_chain provider");
+                }
             }
             
             // Set CA bundle for SSL if available
@@ -222,6 +241,82 @@ impl DuckDbExecutor {
         }
 
         Ok(connection)
+    }
+
+    /// Get Azure access token by exchanging federated token (for Kubernetes Workload Identity)
+    /// This is needed because delta_scan uses object_store which doesn't support workload identity natively
+    fn get_azure_access_token() -> Option<String> {
+        // Check if we have workload identity environment variables
+        let federated_token_file = std::env::var("AZURE_FEDERATED_TOKEN_FILE").ok()?;
+        let client_id = std::env::var("AZURE_CLIENT_ID").ok()?;
+        let tenant_id = std::env::var("AZURE_TENANT_ID").ok()?;
+        
+        tracing::info!("Attempting to get Azure access token via workload identity");
+        
+        // Read the federated token
+        let federated_token = match std::fs::read_to_string(&federated_token_file) {
+            Ok(token) => token.trim().to_string(),
+            Err(e) => {
+                tracing::warn!("Could not read federated token file {}: {}", federated_token_file, e);
+                return None;
+            }
+        };
+        
+        // Exchange federated token for access token
+        let token_url = format!(
+            "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
+            tenant_id
+        );
+        
+        let params = [
+            ("grant_type", "client_credentials"),
+            ("client_id", &client_id),
+            ("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"),
+            ("client_assertion", &federated_token),
+            ("scope", "https://storage.azure.com/.default"),
+        ];
+        
+        // Use blocking HTTP client since this runs during initialization
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build() 
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Could not create HTTP client: {}", e);
+                return None;
+            }
+        };
+        
+        let response = match client.post(&token_url).form(&params).send() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Failed to request Azure access token: {}", e);
+                return None;
+            }
+        };
+        
+        if !response.status().is_success() {
+            tracing::warn!("Azure token request failed with status: {}", response.status());
+            if let Ok(body) = response.text() {
+                tracing::debug!("Token error response: {}", body);
+            }
+            return None;
+        }
+        
+        // Parse the JSON response to extract access_token
+        let json: serde_json::Value = match response.json() {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!("Failed to parse Azure token response: {}", e);
+                return None;
+            }
+        };
+        
+        let access_token = json.get("access_token")?.as_str()?.to_string();
+        tracing::info!("Successfully obtained Azure access token via workload identity");
+        
+        Some(access_token)
     }
 
     /// Configure S3 for all connections from environment variables
