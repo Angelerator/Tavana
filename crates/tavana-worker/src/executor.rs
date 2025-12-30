@@ -100,10 +100,16 @@ impl DuckDbExecutor {
         connection.execute(&format!("SET memory_limit = '{}B'", max_memory), params![])?;
         connection.execute(&format!("SET threads = {}", threads), params![])?;
 
-        // Enable auto-install for httpfs extension (required for S3 access)
-        // Kind cluster should have network egress enabled
+        // Enable auto-install for extensions (allows on-demand installation at query time)
+        // Extensions not pre-installed will be downloaded from DuckDB's extension repository
         connection.execute("SET autoinstall_known_extensions = true", params![])?;
         connection.execute("SET autoload_known_extensions = true", params![])?;
+        
+        // Allow community extensions (not just core extensions)
+        // This enables installation of any extension from the DuckDB community repository
+        if let Err(e) = connection.execute("SET allow_community_extensions = true", params![]) {
+            tracing::debug!("Could not enable community extensions: {}", e);
+        }
 
         // Load pre-installed extensions from Docker image
         // Extensions are pre-downloaded at build time for faster startup and offline support
