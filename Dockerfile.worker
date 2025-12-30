@@ -50,11 +50,16 @@ RUN set -eux && \
     mkdir -p "$EXT_DIR" && \
     echo "Downloading DuckDB ${DUCKDB_VERSION} extensions for ${DUCKDB_ARCH}..." && \
     # Download and install extensions
+    # Core extensions
     curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/httpfs.duckdb_extension.gz" | gunzip > "$EXT_DIR/httpfs.duckdb_extension" && \
     curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/parquet.duckdb_extension.gz" | gunzip > "$EXT_DIR/parquet.duckdb_extension" && \
+    # Databricks/Delta Lake support
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/delta.duckdb_extension.gz" | gunzip > "$EXT_DIR/delta.duckdb_extension" && \
+    # Azure ADLS Gen2 support (for Databricks on Azure)
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/azure.duckdb_extension.gz" | gunzip > "$EXT_DIR/azure.duckdb_extension" && \
     chmod 644 "$EXT_DIR"/*.duckdb_extension && \
     chown -R tavana:tavana /home/tavana/.duckdb && \
-    echo "✓ Extensions installed: httpfs, parquet (${DUCKDB_ARCH})"
+    echo "✓ Extensions installed: httpfs, parquet, delta, azure (${DUCKDB_ARCH})"
 
 COPY --from=builder /app/target/release/tavana-worker /usr/local/bin/
 
