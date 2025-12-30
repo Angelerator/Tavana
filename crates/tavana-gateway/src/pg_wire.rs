@@ -1117,6 +1117,7 @@ where
 {
     let mut buf = [0u8; 4];
     let ready = [b'Z', 0, 0, 0, 5, b'I'];
+    let mut prepared_query: Option<String> = None;
 
     loop {
         let mut msg_type = [0u8; 1];
@@ -1203,23 +1204,115 @@ where
                 socket.write_all(&ready).await?;
                 socket.flush().await?;
             }
-            b'P' | b'B' | b'D' | b'E' => {
-                // Extended query protocol - read and skip for now
-                // TODO: Full extended protocol support for TLS
+            b'P' => {
+                // Parse - extract and store the prepared statement
                 socket.read_exact(&mut buf).await?;
                 let len = u32::from_be_bytes(buf) as usize - 4;
-                let mut skip = vec![0u8; len];
-                socket.read_exact(&mut skip).await?;
+                let mut data = vec![0u8; len];
+                socket.read_exact(&mut data).await?;
                 
-                // Send empty response for extended protocol
-                if msg_type[0] == b'P' {
-                    // ParseComplete
-                    socket.write_all(&[b'1', 0, 0, 0, 4]).await?;
-                } else if msg_type[0] == b'B' {
-                    // BindComplete
-                    socket.write_all(&[b'2', 0, 0, 0, 4]).await?;
+                // Extract query from Parse message
+                let stmt_end = data.iter().position(|&b| b == 0).unwrap_or(0);
+                let query_start = stmt_end + 1;
+                let query_end = data[query_start..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(data.len() - query_start)
+                    + query_start;
+                let query = String::from_utf8_lossy(&data[query_start..query_end]).to_string();
+                
+                if !query.is_empty() {
+                    prepared_query = Some(query);
+                }
+                
+                socket.write_all(&[b'1', 0, 0, 0, 4]).await?; // ParseComplete
+                socket.flush().await?;
+            }
+            b'B' => {
+                // Bind
+                socket.read_exact(&mut buf).await?;
+                let len = u32::from_be_bytes(buf) as usize - 4;
+                let mut data = vec![0u8; len];
+                socket.read_exact(&mut data).await?;
+                socket.write_all(&[b'2', 0, 0, 0, 4]).await?; // BindComplete
+                socket.flush().await?;
+            }
+            b'D' => {
+                // Describe - return column info
+                socket.read_exact(&mut buf).await?;
+                let len = u32::from_be_bytes(buf) as usize - 4;
+                let mut data = vec![0u8; len];
+                socket.read_exact(&mut data).await?;
+                
+                // Send ParameterDescription (no parameters)
+                socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
+                
+                // Get column descriptions if we have a prepared query
+                if let Some(ref sql) = prepared_query {
+                    // Check for PG-specific commands first
+                    if let Some(result) = handle_pg_specific_command(sql) {
+                        if result.columns.is_empty() {
+                            socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                        } else {
+                            send_row_description_generic(socket, &result.columns).await?;
+                        }
+                    } else {
+                        // Execute query to get column info
+                        match worker_client.execute_query(sql, user_id).await {
+                            Ok(result) => {
+                                let columns: Vec<(String, String)> = result.columns.iter()
+                                    .map(|c| (c.name.clone(), c.type_name.clone()))
+                                    .collect();
+                                if columns.is_empty() {
+                                    socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                                } else {
+                                    send_row_description_generic(socket, &columns).await?;
+                                }
+                            }
+                            Err(_) => {
+                                socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                            }
+                        }
+                    }
+                } else {
+                    socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
                 }
                 socket.flush().await?;
+            }
+            b'E' => {
+                // Execute
+                socket.read_exact(&mut buf).await?;
+                let len = u32::from_be_bytes(buf) as usize - 4;
+                let mut data = vec![0u8; len];
+                socket.read_exact(&mut data).await?;
+                
+                if let Some(ref sql) = prepared_query {
+                    // Execute the prepared query
+                    let result = execute_query_tls(
+                        socket,
+                        worker_client,
+                        query_router,
+                        sql,
+                        user_id,
+                        smart_scaler,
+                    ).await;
+                    
+                    if let Err(e) = result {
+                        send_error_generic(socket, &e.to_string()).await?;
+                    }
+                }
+                
+                // Send CommandComplete
+                let cmd = b"SELECT 0";
+                let cmd_len = (4 + cmd.len() + 1) as u32;
+                let mut msg = vec![b'C'];
+                msg.extend_from_slice(&cmd_len.to_be_bytes());
+                msg.extend_from_slice(cmd);
+                msg.push(0);
+                socket.write_all(&msg).await?;
+                socket.flush().await?;
+                
+                prepared_query = None;
             }
             b'S' => {
                 socket.write_all(&ready).await?;
@@ -2449,6 +2542,37 @@ async fn send_row_description_for_describe(
     }
     
     // Fill in the length
+    let len = (msg.len() - 1) as u32;
+    msg[1..5].copy_from_slice(&len.to_be_bytes());
+    
+    socket.write_all(&msg).await?;
+    Ok(())
+}
+
+/// Send RowDescription for generic streams (TLS)
+async fn send_row_description_generic<S>(
+    socket: &mut S,
+    columns: &[(String, String)],
+) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut msg = Vec::new();
+    msg.push(b'T'); // RowDescription
+    msg.extend_from_slice(&[0, 0, 0, 0]); // Length placeholder
+    msg.extend_from_slice(&(columns.len() as i16).to_be_bytes()); // Field count
+    
+    for (name, type_name) in columns {
+        msg.extend_from_slice(name.as_bytes());
+        msg.push(0);
+        msg.extend_from_slice(&0u32.to_be_bytes()); // table OID
+        msg.extend_from_slice(&0i16.to_be_bytes()); // column attr
+        msg.extend_from_slice(&pg_type_oid(type_name).to_be_bytes());
+        msg.extend_from_slice(&pg_type_len(type_name).to_be_bytes());
+        msg.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
+        msg.extend_from_slice(&0i16.to_be_bytes()); // format code
+    }
+    
     let len = (msg.len() - 1) as u32;
     msg[1..5].copy_from_slice(&len.to_be_bytes());
     
