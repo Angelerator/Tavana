@@ -1286,6 +1286,8 @@ async fn execute_query_tls<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    use crate::query_router::QueryTarget;
+    
     // Handle PostgreSQL-specific commands locally
     if let Some(result) = handle_pg_specific_command(sql) {
         // Send simple result for TLS stream
@@ -1303,17 +1305,108 @@ where
         "Query routed for TLS execution"
     );
 
-    // Execute query through worker client (buffered for TLS - simpler implementation)
-    let result = worker_client.execute_query(sql, user_id).await?;
+    // Execute query on the routed target worker
+    let (columns, rows) = match &estimate.target {
+        QueryTarget::PreSizedWorker { address, worker_name } => {
+            info!("Executing on pre-sized worker: {} ({})", worker_name, address);
+            execute_query_on_worker_buffered(address, sql, user_id).await?
+        }
+        QueryTarget::TenantPool { service_addr, tenant_id } => {
+            info!("Executing on tenant pool: {} ({})", tenant_id, service_addr);
+            execute_query_on_worker_buffered(service_addr, sql, user_id).await?
+        }
+        QueryTarget::WorkerPool => {
+            // Fallback to default worker client
+            let result = worker_client.execute_query(sql, user_id).await?;
+            let cols: Vec<(String, String)> = result.columns.iter()
+                .map(|c| (c.name.clone(), c.type_name.clone()))
+                .collect();
+            let rows = result.rows;
+            (cols, rows)
+        }
+    };
     
     // Send RowDescription and DataRows
-    let columns: Vec<(&str, i32)> = result.columns.iter().map(|c| (c.name.as_str(), 25i32)).collect();
-    send_simple_result_generic(socket, &columns, &result.rows).await?;
+    let col_refs: Vec<(&str, i32)> = columns.iter().map(|(n, _t)| (n.as_str(), 25i32)).collect();
+    send_simple_result_generic(socket, &col_refs, &rows).await?;
     
-    let row_count = result.rows.len();
+    let row_count = rows.len();
     info!("TLS query completed: {} rows", row_count);
     
     Ok(row_count)
+}
+
+/// Execute query on a specific worker address and return buffered results
+async fn execute_query_on_worker_buffered(
+    worker_addr: &str,
+    sql: &str,
+    user_id: &str,
+) -> anyhow::Result<(Vec<(String, String)>, Vec<Vec<String>>)> {
+    const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
+
+    let channel = Channel::from_shared(worker_addr.to_string())?
+        .timeout(std::time::Duration::from_secs(1800))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
+        .connect()
+        .await?;
+
+    let mut client = proto::query_service_client::QueryServiceClient::new(channel)
+        .max_decoding_message_size(MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_MESSAGE_SIZE);
+
+    let query_id = uuid::Uuid::new_v4().to_string();
+
+    let request = proto::ExecuteQueryRequest {
+        query_id: query_id.clone(),
+        sql: sql.to_string(),
+        user: Some(proto::UserIdentity {
+            user_id: user_id.to_string(),
+            tenant_id: "default".to_string(),
+            scopes: vec!["query:execute".to_string()],
+            claims: Default::default(),
+        }),
+        options: Some(proto::QueryOptions {
+            timeout_seconds: 1800,
+            max_rows: 0,
+            max_bytes: 0,
+            enable_profiling: false,
+            session_params: Default::default(),
+        }),
+        allocated_resources: None,
+    };
+
+    let response = client.execute_query(request).await?;
+    let mut stream = response.into_inner();
+
+    let mut columns: Vec<(String, String)> = Vec::new();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+
+    while let Some(batch) = stream.message().await? {
+        match batch.result {
+            Some(proto::query_result_batch::Result::Metadata(meta)) => {
+                // Extract columns from metadata
+                columns = meta.columns.iter()
+                    .zip(meta.column_types.iter())
+                    .map(|(name, type_name)| (name.clone(), type_name.clone()))
+                    .collect();
+            }
+            Some(proto::query_result_batch::Result::RecordBatch(batch_data)) => {
+                // Decode JSON data
+                if !batch_data.data.is_empty() {
+                    if let Ok(batch_rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch_data.data) {
+                        rows.extend(batch_rows);
+                    }
+                }
+            }
+            Some(proto::query_result_batch::Result::Error(err)) => {
+                return Err(anyhow::anyhow!("{}: {}", err.code, err.message));
+            }
+            _ => {}
+        }
+    }
+
+    Ok((columns, rows))
 }
 
 /// Send simple result for generic streams
