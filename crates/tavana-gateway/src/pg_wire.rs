@@ -1400,6 +1400,16 @@ where
         send_simple_result_generic(socket, &columns, &result.rows).await?;
         return Ok(0);
     }
+    
+    // Handle COPY commands by extracting inner query
+    // COPY (SELECT ...) TO STDOUT -> execute the inner SELECT
+    let actual_sql = if let Some(inner) = extract_copy_inner_query(sql) {
+        info!("Rewrote COPY command to inner query: {}", &inner[..inner.len().min(80)]);
+        inner
+    } else {
+        sql.to_string()
+    };
+    let sql = &actual_sql;
 
     metrics::query_started();
 
@@ -1954,6 +1964,48 @@ async fn execute_query_buffered(
             warn!("Worker pool error: {}", e);
             execute_local_fallback(sql).await
         }
+    }
+}
+
+/// Extract inner SELECT from COPY command if present
+/// COPY (SELECT ...) TO STDOUT (FORMAT "binary") -> SELECT ...
+fn extract_copy_inner_query(sql: &str) -> Option<String> {
+    let sql_upper = sql.to_uppercase();
+    let sql_trimmed = sql_upper.trim();
+    
+    // Check if it's a COPY (...) TO STDOUT command
+    if !sql_trimmed.starts_with("COPY (") && !sql_trimmed.starts_with("COPY(") {
+        return None;
+    }
+    
+    // Find the matching closing parenthesis for the subquery
+    let start_idx = sql.find('(')? + 1;
+    let mut depth = 1;
+    let mut end_idx = start_idx;
+    
+    for (i, c) in sql[start_idx..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end_idx = start_idx + i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    if depth != 0 {
+        return None;
+    }
+    
+    let inner_query = sql[start_idx..end_idx].trim().to_string();
+    if inner_query.to_uppercase().starts_with("SELECT") {
+        Some(inner_query)
+    } else {
+        None
     }
 }
 
