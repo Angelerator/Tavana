@@ -191,9 +191,24 @@ impl DuckDbExecutor {
                 tracing::warn!("Could not set azure_account_name: {}", e);
             }
             
-            // Use managed identity / credential chain for authentication
-            if let Err(e) = connection.execute("SET azure_credential_chain = 'default'", params![]) {
-                tracing::warn!("Could not set azure_credential_chain: {}", e);
+            // Create Azure secret with credential chain for workload identity
+            // This is more reliable than SET azure_credential_chain for K8s workload identity
+            let secret_sql = format!(
+                "CREATE SECRET IF NOT EXISTS azure_storage (
+                    TYPE azure,
+                    PROVIDER credential_chain,
+                    ACCOUNT_NAME '{}'
+                )",
+                account_name
+            );
+            if let Err(e) = connection.execute(&secret_sql, params![]) {
+                tracing::warn!("Could not create Azure secret: {}", e);
+                // Fallback to SET-based configuration
+                if let Err(e) = connection.execute("SET azure_credential_chain = 'default'", params![]) {
+                    tracing::warn!("Could not set azure_credential_chain: {}", e);
+                }
+            } else {
+                tracing::info!("Azure secret created with credential_chain provider");
             }
             
             // Set CA bundle for SSL if available
@@ -307,9 +322,23 @@ impl DuckDbExecutor {
                     tracing::warn!("Could not set azure_sas_token: {}", e);
                 }
             } else if use_managed_identity {
-                // Use Azure Default Credential (works with AKS Workload Identity)
-                if let Err(e) = conn.execute("SET azure_credential_chain = 'default'", params![]) {
-                    tracing::warn!("Could not set azure_credential_chain: {}", e);
+                // Use Azure credential_chain provider via secret (better for workload identity)
+                if let Some(account) = &account_name {
+                    let secret_sql = format!(
+                        "CREATE SECRET IF NOT EXISTS azure_storage (
+                            TYPE azure,
+                            PROVIDER credential_chain,
+                            ACCOUNT_NAME '{}'
+                        )",
+                        account
+                    );
+                    if let Err(e) = conn.execute(&secret_sql, params![]) {
+                        tracing::warn!("Could not create Azure secret: {}, trying SET", e);
+                        // Fallback to SET-based configuration
+                        if let Err(e) = conn.execute("SET azure_credential_chain = 'default'", params![]) {
+                            tracing::warn!("Could not set azure_credential_chain: {}", e);
+                        }
+                    }
                 }
             }
         }
