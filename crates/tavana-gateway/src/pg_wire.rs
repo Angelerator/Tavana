@@ -659,8 +659,8 @@ async fn handle_connection(
         extract_startup_param(&startup_msg, "user").unwrap_or_else(|| "anonymous".to_string());
     info!("PostgreSQL client connected as user: {}", user_id);
 
-    // Send AuthenticationOk (R)
-    socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
+    // Perform MD5 password authentication (Tableau/DBeaver compatibility)
+    perform_md5_auth(&mut socket, &user_id).await?;
 
     // Send common parameter status messages
     send_parameter_status(&mut socket, "server_version", "15.0 (Tavana DuckDB)").await?;
@@ -850,8 +850,8 @@ async fn handle_connection_with_startup(
         extract_startup_param(&startup_msg, "user").unwrap_or_else(|| "anonymous".to_string());
     info!("PostgreSQL client connected as user: {}", user_id);
 
-    // Send AuthenticationOk (R)
-    socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
+    // Perform MD5 password authentication (Tableau/DBeaver compatibility)
+    perform_md5_auth(&mut socket, &user_id).await?;
 
     // Send common parameter status messages
     send_parameter_status(&mut socket, "server_version", "15.0 (Tavana DuckDB)").await?;
@@ -935,8 +935,8 @@ where
         extract_startup_param(&startup_msg, "user").unwrap_or_else(|| "anonymous".to_string());
     info!("PostgreSQL client connected as user: {} (TLS)", user_id);
 
-    // Send AuthenticationOk (R)
-    socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
+    // Perform MD5 password authentication (Tableau/DBeaver compatibility)
+    perform_md5_auth_generic(&mut socket, &user_id).await?;
 
     // Send common parameter status messages
     send_parameter_status_generic(&mut socket, "server_version", "15.0 (Tavana DuckDB)").await?;
@@ -2108,6 +2108,97 @@ fn pg_type_len(type_name: &str) -> i16 {
         "bool" | "boolean" => 1,
         _ => -1, // Variable length
     }
+}
+
+// ===== MD5 Password Authentication =====
+// Required for Tableau Desktop, DBeaver, and other PostgreSQL clients
+// that expect proper password authentication handshake
+
+/// Perform MD5 password authentication for TcpStream
+/// This is required for Tableau and DBeaver which expect a proper auth handshake
+async fn perform_md5_auth(socket: &mut tokio::net::TcpStream, user: &str) -> anyhow::Result<()> {
+    // Generate random salt
+    let salt: [u8; 4] = rand::random();
+    
+    // Send AuthenticationMD5Password (R with auth type 5)
+    // Format: 'R' + length(12) + auth_type(5) + salt(4 bytes)
+    let mut auth_req = vec![b'R'];
+    auth_req.extend_from_slice(&12u32.to_be_bytes()); // length
+    auth_req.extend_from_slice(&5u32.to_be_bytes());  // auth type 5 = MD5
+    auth_req.extend_from_slice(&salt);
+    socket.write_all(&auth_req).await?;
+    socket.flush().await?;
+    
+    debug!("Sent MD5 auth request to client for user: {}", user);
+    
+    // Read password response
+    let mut msg_type = [0u8; 1];
+    socket.read_exact(&mut msg_type).await?;
+    
+    if msg_type[0] != b'p' {
+        return Err(anyhow::anyhow!("Expected password message, got: {:?}", msg_type[0]));
+    }
+    
+    let mut len_buf = [0u8; 4];
+    socket.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize - 4;
+    
+    let mut password_data = vec![0u8; len];
+    socket.read_exact(&mut password_data).await?;
+    
+    // Password format: "md5" + md5(md5(password + user) + salt) + null
+    // We accept any password since this is primarily for protocol compatibility
+    debug!("Received password response, accepting (trust mode with MD5 handshake)");
+    
+    // Send AuthenticationOk (R with auth type 0)
+    socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
+    socket.flush().await?;
+    
+    info!("MD5 authentication completed for user: {}", user);
+    Ok(())
+}
+
+/// Perform MD5 password authentication for generic async streams (TLS connections)
+async fn perform_md5_auth_generic<S>(socket: &mut S, user: &str) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Generate random salt
+    let salt: [u8; 4] = rand::random();
+    
+    // Send AuthenticationMD5Password (R with auth type 5)
+    let mut auth_req = vec![b'R'];
+    auth_req.extend_from_slice(&12u32.to_be_bytes()); // length
+    auth_req.extend_from_slice(&5u32.to_be_bytes());  // auth type 5 = MD5
+    auth_req.extend_from_slice(&salt);
+    socket.write_all(&auth_req).await?;
+    socket.flush().await?;
+    
+    debug!("Sent MD5 auth request to client for user: {} (TLS)", user);
+    
+    // Read password response
+    let mut msg_type = [0u8; 1];
+    socket.read_exact(&mut msg_type).await?;
+    
+    if msg_type[0] != b'p' {
+        return Err(anyhow::anyhow!("Expected password message, got: {:?}", msg_type[0]));
+    }
+    
+    let mut len_buf = [0u8; 4];
+    socket.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize - 4;
+    
+    let mut password_data = vec![0u8; len];
+    socket.read_exact(&mut password_data).await?;
+    
+    debug!("Received password response, accepting (trust mode with MD5 handshake)");
+    
+    // Send AuthenticationOk
+    socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
+    socket.flush().await?;
+    
+    info!("MD5 authentication completed for user: {} (TLS)", user);
+    Ok(())
 }
 
 // ===== Extended Query Protocol Handlers =====
