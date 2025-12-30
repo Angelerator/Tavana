@@ -1635,7 +1635,15 @@ where
     let mut binary_data: Vec<u8> = Vec::new();
     
     // Binary COPY header: "PGCOPY\n\xff\r\n\0" (11 bytes)
-    binary_data.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+    // Using explicit bytes to ensure correct encoding
+    binary_data.extend_from_slice(&[
+        b'P', b'G', b'C', b'O', b'P', b'Y',  // "PGCOPY"
+        0x0a,                                  // \n (newline)
+        0xff,                                  // \xff (255)
+        0x0d,                                  // \r (carriage return)
+        0x0a,                                  // \n (newline)
+        0x00,                                  // \0 (null)
+    ]);
     // Flags field (4 bytes) - 0 for no OID
     binary_data.extend_from_slice(&0u32.to_be_bytes());
     // Header extension area length (4 bytes) - 0 for no extension
