@@ -49,17 +49,36 @@ RUN set -eux && \
     EXT_DIR="/home/tavana/.duckdb/extensions/${DUCKDB_VERSION}/${DUCKDB_ARCH}" && \
     mkdir -p "$EXT_DIR" && \
     echo "Downloading DuckDB ${DUCKDB_VERSION} extensions for ${DUCKDB_ARCH}..." && \
-    # Download and install extensions
-    # Core extensions
-    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/httpfs.duckdb_extension.gz" | gunzip > "$EXT_DIR/httpfs.duckdb_extension" && \
+    # ===== Core Data Format Extensions =====
     curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/parquet.duckdb_extension.gz" | gunzip > "$EXT_DIR/parquet.duckdb_extension" && \
-    # Databricks/Delta Lake support
-    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/delta.duckdb_extension.gz" | gunzip > "$EXT_DIR/delta.duckdb_extension" && \
-    # Azure ADLS Gen2 support (for Databricks on Azure)
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/json.duckdb_extension.gz" | gunzip > "$EXT_DIR/json.duckdb_extension" && \
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/avro.duckdb_extension.gz" | gunzip > "$EXT_DIR/avro.duckdb_extension" && \
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/excel.duckdb_extension.gz" | gunzip > "$EXT_DIR/excel.duckdb_extension" && \
+    # ===== Cloud Storage Extensions =====
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/httpfs.duckdb_extension.gz" | gunzip > "$EXT_DIR/httpfs.duckdb_extension" && \
     curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/azure.duckdb_extension.gz" | gunzip > "$EXT_DIR/azure.duckdb_extension" && \
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/aws.duckdb_extension.gz" | gunzip > "$EXT_DIR/aws.duckdb_extension" && \
+    # ===== Data Lake Extensions =====
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/delta.duckdb_extension.gz" | gunzip > "$EXT_DIR/delta.duckdb_extension" && \
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/iceberg.duckdb_extension.gz" | gunzip > "$EXT_DIR/iceberg.duckdb_extension" && \
+    # ===== Database Connectors =====
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/postgres.duckdb_extension.gz" | gunzip > "$EXT_DIR/postgres.duckdb_extension" && \
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/mysql.duckdb_extension.gz" | gunzip > "$EXT_DIR/mysql.duckdb_extension" && \
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/sqlite.duckdb_extension.gz" | gunzip > "$EXT_DIR/sqlite.duckdb_extension" && \
+    # ===== Utility Extensions =====
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/icu.duckdb_extension.gz" | gunzip > "$EXT_DIR/icu.duckdb_extension" && \
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/fts.duckdb_extension.gz" | gunzip > "$EXT_DIR/fts.duckdb_extension" && \
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/inet.duckdb_extension.gz" | gunzip > "$EXT_DIR/inet.duckdb_extension" && \
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/spatial.duckdb_extension.gz" | gunzip > "$EXT_DIR/spatial.duckdb_extension" && \
+    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/vss.duckdb_extension.gz" | gunzip > "$EXT_DIR/vss.duckdb_extension" && \
     chmod 644 "$EXT_DIR"/*.duckdb_extension && \
     chown -R tavana:tavana /home/tavana/.duckdb && \
-    echo "✓ Extensions installed: httpfs, parquet, delta, azure (${DUCKDB_ARCH})"
+    echo "✓ Extensions installed for ${DUCKDB_ARCH}:" && \
+    echo "  Data formats: parquet, json, avro, excel" && \
+    echo "  Cloud storage: httpfs, azure, aws" && \
+    echo "  Data lakes: delta, iceberg" && \
+    echo "  Databases: postgres, mysql, sqlite" && \
+    echo "  Utilities: icu, fts, inet, spatial, vss"
 
 COPY --from=builder /app/target/release/tavana-worker /usr/local/bin/
 

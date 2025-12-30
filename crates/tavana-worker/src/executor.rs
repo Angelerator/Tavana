@@ -109,19 +109,36 @@ impl DuckDbExecutor {
         // Extensions are pre-downloaded at build time for faster startup and offline support
         // See Dockerfile.worker for the list of pre-installed extensions
         
-        // httpfs: S3/HTTP/HTTPS support
-        if let Err(e) = connection.execute("LOAD httpfs", params![]) {
-            tracing::warn!("Could not load httpfs: {} (is it pre-installed?)", e);
-        }
-
-        // delta: Databricks Delta Lake support
-        if let Err(e) = connection.execute("LOAD delta", params![]) {
-            tracing::warn!("Could not load delta: {} (is it pre-installed?)", e);
-        }
-
-        // azure: Azure ADLS Gen2 / Databricks on Azure storage
-        if let Err(e) = connection.execute("LOAD azure", params![]) {
-            tracing::warn!("Could not load azure: {} (is it pre-installed?)", e);
+        // List of extensions to load (order matters for dependencies)
+        let extensions = [
+            // Core data formats
+            ("parquet", "Parquet file support"),
+            ("json", "JSON operations"),
+            ("avro", "Avro file support"),
+            ("excel", "Excel file support"),
+            // Cloud storage
+            ("httpfs", "HTTP/HTTPS/S3 file access"),
+            ("azure", "Azure Blob Storage / ADLS Gen2"),
+            ("aws", "AWS SDK features"),
+            // Data lakes
+            ("delta", "Delta Lake support"),
+            ("iceberg", "Apache Iceberg support"),
+            // Database connectors
+            ("postgres", "PostgreSQL database connector"),
+            ("mysql", "MySQL database connector"),
+            ("sqlite", "SQLite database connector"),
+            // Utilities
+            ("icu", "Time zones and collations"),
+            ("fts", "Full-text search"),
+            ("inet", "IP address operations"),
+            ("spatial", "Geospatial functions"),
+            ("vss", "Vector similarity search"),
+        ];
+        
+        for (ext_name, description) in extensions {
+            if let Err(e) = connection.execute(&format!("LOAD {}", ext_name), params![]) {
+                tracing::debug!("Could not load {}: {} ({})", ext_name, e, description);
+            }
         }
 
         // Enable external file cache for S3/remote files (DuckDB 1.3+)
