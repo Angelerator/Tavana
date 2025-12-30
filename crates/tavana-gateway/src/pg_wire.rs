@@ -1631,11 +1631,11 @@ where
     }
     socket.write_all(&copy_out_resp).await?;
     
-    // Build binary COPY data in a single CopyData message
+    // Build ALL binary COPY data in a single CopyData message
+    // This ensures the client can read the header correctly
     let mut binary_data: Vec<u8> = Vec::new();
     
     // Binary COPY header: "PGCOPY\n\xff\r\n\0" (11 bytes)
-    // Using explicit bytes to ensure correct encoding
     binary_data.extend_from_slice(&[
         b'P', b'G', b'C', b'O', b'P', b'Y',  // "PGCOPY"
         0x0a,                                  // \n (newline)
@@ -1649,36 +1649,26 @@ where
     // Header extension area length (4 bytes) - 0 for no extension
     binary_data.extend_from_slice(&0u32.to_be_bytes());
     
-    // Send header as first CopyData
-    let mut copy_data = vec![b'd'];
-    copy_data.extend_from_slice(&((4 + binary_data.len()) as u32).to_be_bytes());
-    copy_data.extend_from_slice(&binary_data);
-    socket.write_all(&copy_data).await?;
-    
-    // Send each row as CopyData with binary tuple format
+    // Add all tuples
     for row in rows {
-        let mut tuple_data: Vec<u8> = Vec::new();
         // Number of fields (2 bytes)
-        tuple_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
+        binary_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
         
         // Each field: length (4 bytes) + data
         for val in row {
             let bytes = val.as_bytes();
-            tuple_data.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
-            tuple_data.extend_from_slice(bytes);
+            binary_data.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+            binary_data.extend_from_slice(bytes);
         }
-        
-        let mut copy_data = vec![b'd'];
-        copy_data.extend_from_slice(&((4 + tuple_data.len()) as u32).to_be_bytes());
-        copy_data.extend_from_slice(&tuple_data);
-        socket.write_all(&copy_data).await?;
     }
     
-    // Send file trailer (-1 as 2-byte integer)
-    let trailer: Vec<u8> = vec![0xff, 0xff]; // -1 as i16
+    // File trailer: -1 as i16 (0xffff)
+    binary_data.extend_from_slice(&(-1i16).to_be_bytes());
+    
+    // Send everything as ONE CopyData message
     let mut copy_data = vec![b'd'];
-    copy_data.extend_from_slice(&((4 + trailer.len()) as u32).to_be_bytes());
-    copy_data.extend_from_slice(&trailer);
+    copy_data.extend_from_slice(&((4 + binary_data.len()) as u32).to_be_bytes());
+    copy_data.extend_from_slice(&binary_data);
     socket.write_all(&copy_data).await?;
     
     // CopyDone (c)
