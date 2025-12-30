@@ -1225,10 +1225,17 @@ where
                     + query_start;
                 let query = String::from_utf8_lossy(&data[query_start..query_end]).to_string();
                 
-                info!("TLS Extended Protocol - Parse: {}", &query[..query.len().min(80)]);
+                // Extract inner query from COPY commands at parse time
+                let actual_query = if let Some(inner) = extract_copy_inner_query(&query) {
+                    info!("TLS Extended Protocol - Parse (COPY->SELECT): {}", &inner[..inner.len().min(80)]);
+                    inner
+                } else {
+                    info!("TLS Extended Protocol - Parse: {}", &query[..query.len().min(80)]);
+                    query
+                };
                 
-                if !query.is_empty() {
-                    prepared_query = Some(query);
+                if !actual_query.is_empty() {
+                    prepared_query = Some(actual_query);
                 }
                 
                 socket.write_all(&[b'1', 0, 0, 0, 4]).await?; // ParseComplete
@@ -1256,6 +1263,7 @@ where
                 socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
                 
                 // Get column descriptions if we have a prepared query
+                // Note: COPY commands were already rewritten to SELECT at Parse time
                 if let Some(ref sql) = prepared_query {
                     // Check for PG-specific commands first
                     if let Some(result) = handle_pg_specific_command(sql) {
