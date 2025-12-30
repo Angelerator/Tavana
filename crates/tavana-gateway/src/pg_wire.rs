@@ -796,7 +796,7 @@ async fn handle_connection(
                 }
             }
             b'B' => handle_bind(&mut socket, &mut buf).await?,
-            b'D' => handle_describe(&mut socket, &mut buf).await?,
+            b'D' => handle_describe(&mut socket, &mut buf, prepared_query.as_deref(), &worker_client, &user_id).await?,
             b'E' => {
                 // Execute - run the prepared statement with SmartScaler + QueryQueue
                 if let Some(ref query) = prepared_query {
@@ -1066,7 +1066,7 @@ async fn run_query_loop(
                 }
             }
             b'B' => handle_bind(socket, &mut buf).await?,
-            b'D' => handle_describe(socket, &mut buf).await?,
+            b'D' => handle_describe(socket, &mut buf, prepared_query.as_deref(), worker_client, user_id).await?,
             b'E' => {
                 if let Some(ref query) = prepared_query {
                     handle_execute_extended(
@@ -2353,14 +2353,106 @@ async fn handle_bind(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4]) -> a
 async fn handle_describe(
     socket: &mut tokio::net::TcpStream,
     buf: &mut [u8; 4],
+    prepared_query: Option<&str>,
+    worker_client: &WorkerClient,
+    user_id: &str,
 ) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     socket.read_exact(buf).await?;
     let len = u32::from_be_bytes(*buf) as usize - 4;
     let mut data = vec![0u8; len];
     socket.read_exact(&mut data).await?;
-    socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+    
+    // Describe message: first byte is 'S' (statement) or 'P' (portal)
+    // followed by the name (null-terminated)
+    let describe_type = if data.is_empty() { b'S' } else { data[0] };
+    
+    debug!("Extended query protocol - Describe type: {}", describe_type as char);
+    
+    // If we have a prepared query, execute it to get column info
+    if let Some(sql) = prepared_query {
+        // Check for PostgreSQL-specific commands first
+        if let Some(result) = handle_pg_specific_command(sql) {
+            // Send ParameterDescription (no parameters)
+            socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?; // 0 parameters
+            
+            // Send RowDescription for the columns
+            if result.columns.is_empty() {
+                socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+            } else {
+                send_row_description_for_describe(socket, &result.columns).await?;
+            }
+        } else {
+            // Execute query to get column metadata
+            match worker_client.execute_query(sql, user_id).await {
+                Ok(result) => {
+                    // Send ParameterDescription (no parameters)
+                    socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?; // 0 parameters
+                    
+                    // Build columns list
+                    let columns: Vec<(String, String)> = result.columns.iter()
+                        .map(|c| (c.name.clone(), c.type_name.clone()))
+                        .collect();
+                    
+                    if columns.is_empty() {
+                        socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                    } else {
+                        send_row_description_for_describe(socket, &columns).await?;
+                    }
+                }
+                Err(e) => {
+                    debug!("Failed to describe query: {}", e);
+                    // Send ParameterDescription (no parameters) and NoData as fallback
+                    socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
+                    socket.write_all(&[b'n', 0, 0, 0, 4]).await?;
+                }
+            }
+        }
+    } else {
+        // No prepared statement - send NoData
+        socket.write_all(&[b'n', 0, 0, 0, 4]).await?;
+    }
+    
     socket.flush().await?;
+    Ok(())
+}
+
+/// Send RowDescription message for Describe response (columns with types)
+async fn send_row_description_for_describe(
+    socket: &mut tokio::net::TcpStream,
+    columns: &[(String, String)],
+) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    
+    let mut msg = Vec::new();
+    msg.push(b'T'); // RowDescription
+    msg.extend_from_slice(&[0, 0, 0, 0]); // Length placeholder
+    msg.extend_from_slice(&(columns.len() as i16).to_be_bytes()); // Field count
+    
+    for (name, type_name) in columns {
+        // Field name (null-terminated)
+        msg.extend_from_slice(name.as_bytes());
+        msg.push(0);
+        
+        // Table OID (0 = no table)
+        msg.extend_from_slice(&0u32.to_be_bytes());
+        // Column attribute number (0 = no column)
+        msg.extend_from_slice(&0i16.to_be_bytes());
+        // Type OID
+        msg.extend_from_slice(&pg_type_oid(type_name).to_be_bytes());
+        // Type size
+        msg.extend_from_slice(&pg_type_len(type_name).to_be_bytes());
+        // Type modifier (-1 = no modifier)
+        msg.extend_from_slice(&(-1i32).to_be_bytes());
+        // Format code (0 = text)
+        msg.extend_from_slice(&0i16.to_be_bytes());
+    }
+    
+    // Fill in the length
+    let len = (msg.len() - 1) as u32;
+    msg[1..5].copy_from_slice(&len.to_be_bytes());
+    
+    socket.write_all(&msg).await?;
     Ok(())
 }
 
