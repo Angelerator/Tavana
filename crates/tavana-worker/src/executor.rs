@@ -180,6 +180,32 @@ impl DuckDbExecutor {
             tracing::warn!("Could not increase threads for remote: {}", e);
         }
 
+        // Configure Azure authentication from environment variables
+        if let Ok(account_name) = std::env::var("AZURE_STORAGE_ACCOUNT_NAME") {
+            tracing::info!("Configuring Azure for account: {}", account_name);
+            
+            // Set the account name
+            if let Err(e) = connection.execute(
+                &format!("SET azure_account_name = '{}'", account_name), params![]
+            ) {
+                tracing::warn!("Could not set azure_account_name: {}", e);
+            }
+            
+            // Use managed identity / credential chain for authentication
+            if let Err(e) = connection.execute("SET azure_credential_chain = 'default'", params![]) {
+                tracing::warn!("Could not set azure_credential_chain: {}", e);
+            }
+            
+            // Set CA bundle for SSL if available
+            if let Ok(ca_bundle) = std::env::var("CURL_CA_BUNDLE") {
+                if let Err(e) = connection.execute(
+                    &format!("SET ca_cert_file = '{}'", ca_bundle), params![]
+                ) {
+                    tracing::debug!("Could not set ca_cert_file: {}", e);
+                }
+            }
+        }
+
         Ok(connection)
     }
 
