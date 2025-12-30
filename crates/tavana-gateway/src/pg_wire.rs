@@ -1226,11 +1226,12 @@ where
                 let query = String::from_utf8_lossy(&data[query_start..query_end]).to_string();
                 
                 // Extract inner query from COPY commands at parse time
+                let is_copy = query.trim().to_uppercase().starts_with("COPY");
                 let actual_query = if let Some(inner) = extract_copy_inner_query(&query) {
-                    info!("TLS Extended Protocol - Parse (COPY->SELECT): {}", &inner[..inner.len().min(80)]);
+                    info!("TLS Extended Protocol - Parse: COPY detected, extracted inner: {}", &inner[..inner.len().min(80)]);
                     inner
                 } else {
-                    info!("TLS Extended Protocol - Parse: {}", &query[..query.len().min(80)]);
+                    info!("TLS Extended Protocol - Parse (is_copy={}): {}", is_copy, &query[..query.len().min(80)]);
                     query
                 };
                 
