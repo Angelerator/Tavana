@@ -61,11 +61,8 @@ RUN set -eux && \
     # ===== Data Lake Extensions =====
     curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/delta.duckdb_extension.gz" | gunzip > "$EXT_DIR/delta.duckdb_extension" && \
     curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/iceberg.duckdb_extension.gz" | gunzip > "$EXT_DIR/iceberg.duckdb_extension" && \
-    # ===== Database Connectors =====
-    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/postgres.duckdb_extension.gz" | gunzip > "$EXT_DIR/postgres.duckdb_extension" && \
-    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/mysql.duckdb_extension.gz" | gunzip > "$EXT_DIR/mysql.duckdb_extension" && \
-    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/sqlite.duckdb_extension.gz" | gunzip > "$EXT_DIR/sqlite.duckdb_extension" && \
     # ===== Utility Extensions =====
+    # Note: postgres, mysql, sqlite extensions are not available as pre-built binaries for v1.4.3
     curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/icu.duckdb_extension.gz" | gunzip > "$EXT_DIR/icu.duckdb_extension" && \
     curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/fts.duckdb_extension.gz" | gunzip > "$EXT_DIR/fts.duckdb_extension" && \
     curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/inet.duckdb_extension.gz" | gunzip > "$EXT_DIR/inet.duckdb_extension" && \
@@ -77,7 +74,6 @@ RUN set -eux && \
     echo "  Data formats: parquet, json, avro, excel" && \
     echo "  Cloud storage: httpfs, azure, aws" && \
     echo "  Data lakes: delta, iceberg" && \
-    echo "  Databases: postgres, mysql, sqlite" && \
     echo "  Utilities: icu, fts, inet, spatial, vss"
 
 COPY --from=builder /app/target/release/tavana-worker /usr/local/bin/

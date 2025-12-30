@@ -110,6 +110,7 @@ impl DuckDbExecutor {
         // See Dockerfile.worker for the list of pre-installed extensions
         
         // List of extensions to load (order matters for dependencies)
+        // Note: postgres, mysql, sqlite extensions not available as pre-built binaries for v1.4.3
         let extensions = [
             // Core data formats
             ("parquet", "Parquet file support"),
@@ -123,10 +124,6 @@ impl DuckDbExecutor {
             // Data lakes
             ("delta", "Delta Lake support"),
             ("iceberg", "Apache Iceberg support"),
-            // Database connectors
-            ("postgres", "PostgreSQL database connector"),
-            ("mysql", "MySQL database connector"),
-            ("sqlite", "SQLite database connector"),
             // Utilities
             ("icu", "Time zones and collations"),
             ("fts", "Full-text search"),
