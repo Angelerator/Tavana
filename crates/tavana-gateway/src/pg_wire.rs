@@ -1221,6 +1221,8 @@ where
                     + query_start;
                 let query = String::from_utf8_lossy(&data[query_start..query_end]).to_string();
                 
+                info!("TLS Extended Protocol - Parse: {}", &query[..query.len().min(80)]);
+                
                 if !query.is_empty() {
                     prepared_query = Some(query);
                 }
@@ -1243,6 +1245,8 @@ where
                 let len = u32::from_be_bytes(buf) as usize - 4;
                 let mut data = vec![0u8; len];
                 socket.read_exact(&mut data).await?;
+                
+                info!("TLS Extended Protocol - Describe (has_query={})", prepared_query.is_some());
                 
                 // Send ParameterDescription (no parameters)
                 socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
