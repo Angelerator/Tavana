@@ -818,6 +818,8 @@ async fn handle_connection(
                 prepared_query = None; // Clear after execution
             }
             b'S' => {
+                // Sync message has length field (4 bytes with value 4)
+                socket.read_exact(&mut buf).await?;
                 socket.write_all(&ready).await?;
                 socket.flush().await?;
             }
@@ -1086,6 +1088,8 @@ async fn run_query_loop(
                 prepared_query = None;
             }
             b'S' => {
+                // Sync message has length field (4 bytes with value 4)
+                socket.read_exact(&mut buf).await?;
                 socket.write_all(&ready).await?;
                 socket.flush().await?;
             }
@@ -1319,12 +1323,14 @@ where
                 prepared_query = None;
             }
             b'S' => {
+                // Sync message has length field (4 bytes with value 4)
+                socket.read_exact(&mut buf).await?;
                 info!("TLS Extended Protocol - Sync, sending ReadyForQuery");
                 socket.write_all(&ready).await?;
                 socket.flush().await?;
             }
             _ => {
-                info!("TLS Extended Protocol - Unknown message type: {}", msg_type[0]);
+                info!("TLS Extended Protocol - Unknown message type: 0x{:02x}", msg_type[0]);
                 socket.read_exact(&mut buf).await?;
                 let len = u32::from_be_bytes(buf) as usize - 4;
                 let mut skip = vec![0u8; len];
