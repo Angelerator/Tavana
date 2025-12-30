@@ -1225,18 +1225,11 @@ where
                     + query_start;
                 let query = String::from_utf8_lossy(&data[query_start..query_end]).to_string();
                 
-                // Log raw query BEFORE extraction
-                info!("TLS Extended Protocol - Parse RAW: {}", &query[..query.len().min(100)]);
-                
                 // Extract inner query from COPY commands at parse time
-                let is_copy = query.trim().to_uppercase().starts_with("COPY");
+                // This enables DuckDB postgres_query() with text protocol
                 let actual_query = if let Some(inner) = extract_copy_inner_query(&query) {
-                    info!("TLS Extended Protocol - Parse: COPY->SELECT: {}", &inner[..inner.len().min(80)]);
+                    debug!("Extended Protocol - Converted COPY to SELECT");
                     inner
-                } else if is_copy {
-                    // COPY command but couldn't extract - log warning
-                    warn!("TLS Extended Protocol - Parse: COPY but could not extract inner query");
-                    query
                 } else {
                     query
                 };
@@ -1264,7 +1257,7 @@ where
                 let mut data = vec![0u8; len];
                 socket.read_exact(&mut data).await?;
                 
-                info!("TLS Extended Protocol - Describe (has_query={})", prepared_query.is_some());
+                debug!("Extended Protocol - Describe");
                 
                 // Send ParameterDescription (no parameters)
                 socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
@@ -1340,12 +1333,12 @@ where
             b'S' => {
                 // Sync message has length field (4 bytes with value 4)
                 socket.read_exact(&mut buf).await?;
-                info!("TLS Extended Protocol - Sync, sending ReadyForQuery");
+                debug!("Extended Protocol - Sync");
                 socket.write_all(&ready).await?;
                 socket.flush().await?;
             }
             _ => {
-                info!("TLS Extended Protocol - Unknown message type: 0x{:02x}", msg_type[0]);
+                debug!("Unknown protocol message type: 0x{:02x}", msg_type[0]);
                 socket.read_exact(&mut buf).await?;
                 let len = u32::from_be_bytes(buf) as usize - 4;
                 let mut skip = vec![0u8; len];
@@ -1471,7 +1464,7 @@ where
         send_simple_result_generic(socket, &col_refs, &rows).await?;
     }
     
-    info!("TLS query completed: {} rows (copy={})", row_count, is_copy_command);
+    debug!("Query completed: {} rows", row_count);
     
     Ok(row_count)
 }
@@ -1608,8 +1601,8 @@ where
 }
 
 /// Send COPY OUT protocol response for COPY TO STDOUT commands
-/// This is what postgres_scanner and DuckDB postgres_query expect
-/// Sends binary format as that's what postgres_query requests
+/// Used by DuckDB postgres_query() with pg_use_text_protocol=true
+/// Sends TEXT format (tab-separated values) which is simpler and compatible
 async fn send_copy_out_response<S>(
     socket: &mut S,
     columns: &[(String, String)],
@@ -1657,7 +1650,7 @@ where
     
     socket.flush().await?;
     
-    info!("Sent COPY OUT binary response: {} rows", rows.len());
+    debug!("Sent COPY OUT text response: {} rows", rows.len());
     Ok(())
 }
 
