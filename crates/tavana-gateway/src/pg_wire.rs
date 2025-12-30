@@ -1319,10 +1319,12 @@ where
                 prepared_query = None;
             }
             b'S' => {
+                info!("TLS Extended Protocol - Sync, sending ReadyForQuery");
                 socket.write_all(&ready).await?;
                 socket.flush().await?;
             }
             _ => {
+                info!("TLS Extended Protocol - Unknown message type: {}", msg_type[0]);
                 socket.read_exact(&mut buf).await?;
                 let len = u32::from_be_bytes(buf) as usize - 4;
                 let mut skip = vec![0u8; len];
