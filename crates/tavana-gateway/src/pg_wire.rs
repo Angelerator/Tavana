@@ -998,6 +998,8 @@ async fn run_query_loop(
     let mut prepared_query: Option<String> = None;
     // Track whether Describe sent RowDescription (true) or NoData (false)
     let mut describe_sent_row_description = false;
+    // Cache the column count from Describe to ensure Execute sends matching data
+    let mut describe_column_count: usize = 0;
     // Server-side cursor storage for this connection
     let mut cursors: HashMap<String, CursorState> = HashMap::new();
 
@@ -1139,7 +1141,9 @@ async fn run_query_loop(
             }
             b'B' => handle_bind(socket, &mut buf).await?,
             b'D' => {
-                describe_sent_row_description = handle_describe(socket, &mut buf, prepared_query.as_deref(), worker_client, user_id).await?;
+                let (sent_row_desc, col_count) = handle_describe(socket, &mut buf, prepared_query.as_deref(), worker_client, user_id).await?;
+                describe_sent_row_description = sent_row_desc;
+                describe_column_count = col_count;
             }
             b'E' => {
                 if let Some(ref query) = prepared_query {
@@ -1222,6 +1226,8 @@ where
     // Track whether Describe sent RowDescription (true) or NoData (false)
     // This ensures Execute phase is consistent with Describe phase
     let mut describe_sent_row_description = false;
+    // Cache the column count from Describe to ensure Execute sends matching data
+    let mut describe_column_count: usize = 0;
     // Server-side cursor storage for this connection
     // Enables DECLARE CURSOR / FETCH / CLOSE for large result sets
     let mut cursors: HashMap<String, CursorState> = HashMap::new();
@@ -1410,6 +1416,7 @@ where
                 
                 // Reset state for this Describe
                 describe_sent_row_description = false;
+                describe_column_count = 0;
                 
                 // Send ParameterDescription (no parameters)
                 socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
@@ -1424,6 +1431,7 @@ where
                             socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
                         } else {
                             info!("Extended Protocol - Describe: PG command returns {} columns", result.columns.len());
+                            describe_column_count = result.columns.len();
                             send_row_description_generic(socket, &result.columns).await?;
                             describe_sent_row_description = true;
                         }
@@ -1442,6 +1450,7 @@ where
                                         columns.len(), 
                                         columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
                                     );
+                                    describe_column_count = columns.len();
                                     send_row_description_generic(socket, &columns).await?;
                                     describe_sent_row_description = true;
                                 }
@@ -1488,7 +1497,7 @@ where
                         socket.flush().await?;
                     } else {
                         // Describe sent RowDescription, so we can send DataRows
-                        info!("Extended Protocol - Execute: Describe sent RowDescription, executing query");
+                        info!("Extended Protocol - Execute: Describe sent RowDescription ({} cols), executing query", describe_column_count);
                         let result = execute_query_extended_protocol(
                             socket,
                             worker_client,
@@ -1496,6 +1505,7 @@ where
                             sql,
                             user_id,
                             smart_scaler,
+                            describe_column_count,
                         ).await;
                         
                         if let Err(e) = result {
@@ -1520,6 +1530,7 @@ where
                 prepared_query = None;
                 // Reset state after Execute
                 describe_sent_row_description = false;
+                describe_column_count = 0;
             }
             b'S' => {
                 // Sync message has length field (4 bytes with value 4)
@@ -1689,7 +1700,8 @@ where
 
 /// Execute query for Extended Query Protocol (Parse/Bind/Describe/Execute)
 /// Unlike execute_query_tls, this does NOT send RowDescription because
-/// it was already sent during the Describe phase
+/// it was already sent during the Describe phase.
+/// `expected_column_count` ensures DataRow column count matches RowDescription.
 async fn execute_query_extended_protocol<S>(
     socket: &mut S,
     worker_client: &WorkerClient,
@@ -1697,6 +1709,7 @@ async fn execute_query_extended_protocol<S>(
     sql: &str,
     user_id: &str,
     _smart_scaler: Option<&SmartScaler>,
+    expected_column_count: usize,
 ) -> anyhow::Result<usize>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1706,7 +1719,7 @@ where
     // Handle PostgreSQL-specific commands locally
     if let Some(result) = handle_pg_specific_command(sql) {
         // For extended protocol, don't send RowDescription again (it was sent during Describe or NoData was sent)
-        send_data_rows_only_generic(socket, &result.rows, result.rows.len(), result.command_tag.as_deref()).await?;
+        send_data_rows_only_generic(socket, &result.rows, result.rows.len(), result.command_tag.as_deref(), expected_column_count).await?;
         return Ok(result.rows.len());
     }
     
@@ -1752,7 +1765,8 @@ where
     
     // For Extended Protocol, only send DataRows and CommandComplete
     // RowDescription was already sent during Describe phase
-    send_data_rows_only_generic(socket, &rows, row_count, None).await?;
+    // Use expected_column_count to ensure DataRow column count matches
+    send_data_rows_only_generic(socket, &rows, row_count, None, expected_column_count).await?;
     
     debug!("Extended Protocol Execute completed: {} rows", row_count);
     
@@ -1901,7 +1915,8 @@ where
 
 /// Send only DataRows (no RowDescription) for Extended Query Protocol Execute phase
 /// In Extended Protocol, RowDescription is sent during Describe, not Execute
-async fn send_data_rows_only_generic<S>(socket: &mut S, rows: &[Vec<String>], row_count: usize, command_tag: Option<&str>) -> anyhow::Result<()>
+/// `expected_column_count` ensures DataRow column count matches RowDescription declaration
+async fn send_data_rows_only_generic<S>(socket: &mut S, rows: &[Vec<String>], row_count: usize, command_tag: Option<&str>, expected_column_count: usize) -> anyhow::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
@@ -1909,12 +1924,23 @@ where
     for row in rows {
         let mut data_row = vec![b'D'];
         let mut row_data = Vec::new();
-        row_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
+        
+        // CRITICAL: Use expected_column_count to match RowDescription
+        // This prevents "Index N out of bounds" errors in JDBC drivers
+        let actual_cols = row.len();
+        let cols_to_send = if expected_column_count > 0 { expected_column_count } else { actual_cols };
+        
+        row_data.extend_from_slice(&(cols_to_send as i16).to_be_bytes());
 
-        for val in row {
-            let bytes = val.as_bytes();
-            row_data.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
-            row_data.extend_from_slice(bytes);
+        for i in 0..cols_to_send {
+            if i < actual_cols {
+                let bytes = row[i].as_bytes();
+                row_data.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                row_data.extend_from_slice(bytes);
+            } else {
+                // Column expected but not in row - send NULL (-1 length)
+                row_data.extend_from_slice(&(-1i32).to_be_bytes());
+            }
         }
 
         let row_len = (4 + row_data.len()) as u32;
@@ -3206,14 +3232,16 @@ async fn handle_bind(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4]) -> a
 }
 
 /// Handle Describe message for extended query protocol
-/// Returns true if RowDescription was sent, false if NoData was sent
+/// Returns (sent_row_description, column_count) tuple:
+/// - sent_row_description: true if RowDescription was sent, false if NoData was sent
+/// - column_count: number of columns declared in RowDescription (0 if NoData)
 async fn handle_describe(
     socket: &mut tokio::net::TcpStream,
     buf: &mut [u8; 4],
     prepared_query: Option<&str>,
     worker_client: &WorkerClient,
     user_id: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(bool, usize)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     socket.read_exact(buf).await?;
     let len = u32::from_be_bytes(*buf) as usize - 4;
@@ -3236,10 +3264,11 @@ async fn handle_describe(
             // Send RowDescription for the columns
             if result.columns.is_empty() {
                 socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
-                return Ok(false);
+                return Ok((false, 0));
             } else {
+                let col_count = result.columns.len();
                 send_row_description_for_describe(socket, &result.columns).await?;
-                return Ok(true);
+                return Ok((true, col_count));
             }
         } else {
             // Execute query to get column metadata
@@ -3255,14 +3284,15 @@ async fn handle_describe(
                     
                     if columns.is_empty() {
                         socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
-                        return Ok(false);
+                        return Ok((false, 0));
                     } else {
+                        let col_count = columns.len();
                         info!("Extended Protocol (non-TLS) - Describe: {} columns: {:?}", 
-                            columns.len(), 
+                            col_count, 
                             columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
                         );
                         send_row_description_for_describe(socket, &columns).await?;
-                        return Ok(true);
+                        return Ok((true, col_count));
                     }
                 }
                 Err(e) => {
@@ -3270,7 +3300,7 @@ async fn handle_describe(
                     // Send ParameterDescription (no parameters) and NoData as fallback
                     socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
                     socket.write_all(&[b'n', 0, 0, 0, 4]).await?;
-                    return Ok(false);
+                    return Ok((false, 0));
                 }
             }
         }
@@ -3278,7 +3308,7 @@ async fn handle_describe(
         // No prepared statement - send NoData
         socket.write_all(&[b'n', 0, 0, 0, 4]).await?;
         socket.flush().await?;
-        return Ok(false);
+        return Ok((false, 0));
     }
 }
 
