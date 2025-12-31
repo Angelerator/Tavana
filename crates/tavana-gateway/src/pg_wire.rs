@@ -1260,6 +1260,7 @@ where
                 break;
             }
             b'Q' => {
+                info!("Simple Query message received (TLS)"); // Debug: confirm message type is received
                 socket.read_exact(&mut buf).await?;
                 let len = u32::from_be_bytes(buf) as usize - 4;
                 let mut query_bytes = vec![0u8; len];
@@ -1269,7 +1270,7 @@ where
                     .trim_end_matches('\0')
                     .to_string();
 
-                debug!("Received query (TLS): {}", &query[..query.len().min(100)]);
+                info!("Received query (TLS): {}", &query[..query.len().min(100)]); // DEBUG: Always log query
 
                 // Check for cursor commands first (require connection-level state)
                 let query_upper = query.to_uppercase();
@@ -1279,7 +1280,7 @@ where
                 if query_trimmed.contains("CURSOR") || query_trimmed.starts_with("DECLARE") || query_trimmed.starts_with("FETCH") {
                     info!(
                         query_preview = %&query_trimmed[..query_trimmed.len().min(80)],
-                        "Processing potential cursor command"
+                        "Processing potential cursor command - matched cursor detection"
                     );
                 }
                 
