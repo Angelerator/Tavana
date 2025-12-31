@@ -61,3 +61,8 @@ num_cpus = "1.16"
 # HTTP client for Azure token exchange
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 
+# Cursor manager dependencies
+dashmap = "6"
+parking_lot = "0.12"
+hex = "0.4"
+

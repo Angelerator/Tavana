@@ -34,9 +34,11 @@ impl Default for ExecutorConfig {
 }
 
 /// A single DuckDB connection wrapper
-struct PooledConnection {
-    connection: Mutex<Connection>,
-    id: usize,
+pub struct PooledConnection {
+    /// The DuckDB connection (public for cursor manager access)
+    pub connection: Mutex<Connection>,
+    /// Connection ID for debugging
+    pub id: usize,
 }
 
 /// Azure token state for automatic refresh (shared between executor and background thread)
@@ -208,6 +210,17 @@ impl DuckDbExecutor {
 
         connection.execute(&format!("SET memory_limit = '{}B'", max_memory), params![])?;
         connection.execute(&format!("SET threads = {}", threads), params![])?;
+
+        // Enable parallel streaming for large result sets (DuckDB 1.1.0+)
+        // This allows results to be streamed to clients without full materialization
+        let streaming_buffer = std::env::var("DUCKDB_STREAMING_BUFFER_SIZE")
+            .unwrap_or_else(|_| "100MB".to_string());
+        if let Err(e) = connection.execute(
+            &format!("SET streaming_buffer_size = '{}';", streaming_buffer),
+            params![]
+        ) {
+            tracing::debug!("Could not set streaming_buffer_size: {}", e);
+        }
 
         // Enable auto-install for extensions (allows on-demand installation at query time)
         // Extensions not pre-installed will be downloaded from DuckDB's extension repository
@@ -665,7 +678,8 @@ impl DuckDbExecutor {
     }
 
     /// Get the next connection using round-robin
-    fn get_connection(&self) -> Arc<PooledConnection> {
+    /// Public for cursor manager to access connections
+    pub fn get_connection(&self) -> Arc<PooledConnection> {
         let idx = self
             .next_conn
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)

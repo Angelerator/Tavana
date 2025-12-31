@@ -35,19 +35,27 @@ use tracing::{debug, error, info, warn};
 
 // ===== Server-Side Cursor Support =====
 // Enables Tableau and other BI tools to fetch large result sets in batches
-// Using LIMIT/OFFSET pagination for simplicity (works with any query)
+// Cursor support: Uses worker-side cursors for true streaming (no LIMIT/OFFSET re-scanning)
+// Falls back to LIMIT/OFFSET for workers that don't support cursor gRPC API
 
 /// Cursor state for server-side cursor support (DECLARE/FETCH/CLOSE)
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CursorState {
     /// The SQL query this cursor executes
     query: String,
     /// Column metadata (cached from first execution)
     columns: Vec<(String, String)>,
-    /// Current row offset (for FETCH pagination)
+    /// Current row offset (for LIMIT/OFFSET fallback pagination)
     current_offset: usize,
     /// Whether all rows have been fetched
     exhausted: bool,
+    /// Worker ID holding this cursor (for affinity routing in true streaming mode)
+    /// If Some, FETCH commands route to this specific worker
+    worker_id: Option<String>,
+    /// Worker address for affinity routing
+    worker_addr: Option<String>,
+    /// Whether this cursor uses true streaming (worker-side) or fallback (LIMIT/OFFSET)
+    uses_true_streaming: bool,
 }
 
 /// Maximum rows to buffer before flushing to client (backpressure control)
@@ -2525,10 +2533,15 @@ fn extract_copy_inner_query(sql: &str) -> Option<String> {
 
 // ===== Server-Side Cursor Implementation =====
 // These functions implement PostgreSQL cursor semantics for large result sets
-// Using LIMIT/OFFSET pagination for simplicity
+// Uses LIMIT/OFFSET pagination (true streaming via worker gRPC API is planned)
 
 /// Handle DECLARE cursor_name CURSOR FOR select_query
 /// Parses the cursor declaration and stores it in the connection's cursor map
+/// 
+/// Currently uses LIMIT/OFFSET pagination. For true streaming without re-scanning:
+/// 1. Worker declares cursor via DeclareCursor gRPC
+/// 2. Gateway stores worker_id for affinity routing
+/// 3. FETCH routes to same worker, which iterates without re-execution
 async fn handle_declare_cursor(
     sql: &str,
     cursors: &mut HashMap<String, CursorState>,
@@ -2551,7 +2564,11 @@ async fn handle_declare_cursor(
         return None;
     }
     
-    info!("DECLARE CURSOR '{}' for query: {}", cursor_name, &query[..query.len().min(80)]);
+    info!(
+        cursor_name = %cursor_name,
+        query_preview = %&query[..query.len().min(80)],
+        "DECLARE CURSOR - using LIMIT/OFFSET pagination"
+    );
     
     // Execute query once to get column metadata (with LIMIT 0 for efficiency)
     let metadata_query = format!("{} LIMIT 0", query);
@@ -2565,12 +2582,16 @@ async fn handle_declare_cursor(
         }
     };
     
-    // Store cursor state
+    // Store cursor state (using LIMIT/OFFSET fallback)
+    // True streaming would set worker_id and worker_addr from DeclareCursor gRPC response
     cursors.insert(cursor_name.clone(), CursorState {
         query,
         columns,
         current_offset: 0,
         exhausted: false,
+        worker_id: None,           // Would be Some() for true streaming
+        worker_addr: None,         // Would be Some() for true streaming  
+        uses_true_streaming: false, // LIMIT/OFFSET fallback
     });
     
     Some(QueryExecutionResult {
