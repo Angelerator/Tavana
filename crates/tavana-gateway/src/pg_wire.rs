@@ -1145,14 +1145,19 @@ async fn run_query_loop(
                 if let Some(ref query) = prepared_query {
                     // If Describe sent NoData, we must not send DataRows
                     if !describe_sent_row_description {
-                        debug!("Extended Protocol (non-TLS) - Execute: Describe sent NoData, only sending CommandComplete");
                         // Read Execute message data
                         socket.read_exact(&mut buf).await?;
                         let len = u32::from_be_bytes(buf) as usize - 4;
                         let mut data = vec![0u8; len];
                         socket.read_exact(&mut data).await?;
-                        // Just send CommandComplete
-                        let cmd = b"SELECT 0";
+                        // Get the correct command tag for this SQL (BEGIN, SET, COMMIT, etc.)
+                        let cmd_tag = if let Some(result) = handle_pg_specific_command(query) {
+                            result.command_tag.unwrap_or_else(|| "SELECT 0".to_string())
+                        } else {
+                            "SELECT 0".to_string()
+                        };
+                        debug!("Extended Protocol (non-TLS) - Execute: Describe sent NoData, sending CommandComplete: {}", cmd_tag);
+                        let cmd = cmd_tag.as_bytes();
                         let cmd_len = (4 + cmd.len() + 1) as u32;
                         let mut msg = vec![b'C'];
                         msg.extend_from_slice(&cmd_len.to_be_bytes());
@@ -1466,9 +1471,14 @@ where
                     // CRITICAL: If Describe sent NoData, we MUST NOT send DataRows
                     // The JDBC client expects no data after NoData response
                     if !describe_sent_row_description {
-                        debug!("Extended Protocol - Execute: Describe sent NoData, only sending CommandComplete");
-                        // Just send CommandComplete with 0 rows
-                        let cmd = b"SELECT 0";
+                        // Get the correct command tag for this SQL (BEGIN, SET, COMMIT, etc.)
+                        let cmd_tag = if let Some(result) = handle_pg_specific_command(sql) {
+                            result.command_tag.unwrap_or_else(|| "SELECT 0".to_string())
+                        } else {
+                            "SELECT 0".to_string()
+                        };
+                        debug!("Extended Protocol - Execute: Describe sent NoData, sending CommandComplete: {}", cmd_tag);
+                        let cmd = cmd_tag.as_bytes();
                         let cmd_len = (4 + cmd.len() + 1) as u32;
                         let mut msg = vec![b'C'];
                         msg.extend_from_slice(&cmd_len.to_be_bytes());
@@ -1552,18 +1562,45 @@ async fn send_error_generic<S>(socket: &mut S, message: &str) -> anyhow::Result<
 where
     S: AsyncWrite + Unpin,
 {
+    // PostgreSQL Error Response format:
+    // 'E' - error message type
+    // int32 - length
+    // fields: each field is a single byte field identifier followed by null-terminated string
+    // Fields end with a zero byte
+    
+    // We need to send: S (severity), C (code), M (message), then null terminator
+    let severity = b"ERROR\0";
+    let code = b"42000\0"; // Syntax error or access rule violation
     let msg_bytes = message.as_bytes();
-    let total_len = 4 + 1 + msg_bytes.len() + 1 + 1;
+    
+    // Calculate length: 4 (len) + S + severity + C + code + M + message + null + final null
+    let total_len = 4 + 1 + severity.len() + 1 + code.len() + 1 + msg_bytes.len() + 1 + 1;
+    
     let mut error_msg = vec![b'E'];
     error_msg.extend_from_slice(&(total_len as u32).to_be_bytes());
+    
+    // Severity field
+    error_msg.push(b'S');
+    error_msg.extend_from_slice(severity);
+    
+    // SQL State code field
+    error_msg.push(b'C');
+    error_msg.extend_from_slice(code);
+    
+    // Message field
     error_msg.push(b'M');
     error_msg.extend_from_slice(msg_bytes);
     error_msg.push(0);
+    
+    // Terminator
     error_msg.push(0);
+    
     socket.write_all(&error_msg).await?;
-
-    let cmd_complete = [b'C', 0, 0, 0, 10, b'E', b'R', b'R', b'O', b'R', 0];
-    socket.write_all(&cmd_complete).await?;
+    socket.flush().await?;
+    
+    // Note: Do NOT send CommandComplete after ErrorResponse!
+    // The PostgreSQL protocol specifies that ErrorResponse terminates the command.
+    // The client should wait for ReadyForQuery after the error.
 
     Ok(())
 }
