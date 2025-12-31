@@ -69,7 +69,8 @@ tracing-opentelemetry = "0.27"
 opentelemetry = { version = "0.26", features = ["metrics", "trace"] }
 opentelemetry-otlp = { version = "0.26", features = ["tonic"] }
 opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
-prometheus = "0.13"
+# Disable protobuf feature to avoid CVE-2025-53605 vulnerability
+prometheus = { version = "0.13", default-features = false }
 
 # Web framework
 axum = { version = "0.7", features = ["macros", "tokio"] }

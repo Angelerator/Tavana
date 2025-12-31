@@ -39,6 +39,16 @@ struct PooledConnection {
     id: usize,
 }
 
+/// Azure token state for automatic refresh (shared between executor and background thread)
+struct AzureTokenState {
+    /// Time when the token expires
+    expires_at: std::time::Instant,
+    /// Account name for recreating secrets
+    account_name: String,
+    /// Flag to stop background refresh thread
+    stop_flag: std::sync::atomic::AtomicBool,
+}
+
 /// DuckDB query executor with connection pool
 ///
 /// Maintains multiple DuckDB connections for parallel query execution.
@@ -47,6 +57,10 @@ pub struct DuckDbExecutor {
     semaphore: Arc<Semaphore>,
     config: ExecutorConfig,
     next_conn: std::sync::atomic::AtomicUsize,
+    /// Azure token state for automatic refresh (shared with background thread)
+    azure_token_state: Arc<Mutex<Option<AzureTokenState>>>,
+    /// Handle to background refresh thread
+    _background_refresh_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl DuckDbExecutor {
@@ -75,22 +89,117 @@ impl DuckDbExecutor {
         }
 
         // Configure S3 for all connections
+        let azure_token_state = Arc::new(Mutex::new(None));
+        
         let executor = Self {
             connections,
             semaphore: Arc::new(Semaphore::new(pool_size)),
             config,
             next_conn: std::sync::atomic::AtomicUsize::new(0),
+            azure_token_state: azure_token_state.clone(),
+            _background_refresh_handle: None,
         };
 
         executor.configure_s3_all()?;
         executor.configure_azure_all()?;
+        
+        // Start background token refresh thread if Azure is configured
+        let background_handle = executor.start_background_token_refresh();
 
         info!(
             "DuckDB executor initialized with {} parallel connections",
             pool_size
         );
 
-        Ok(executor)
+        Ok(Self {
+            _background_refresh_handle: background_handle,
+            ..executor
+        })
+    }
+    
+    /// Start a background thread that proactively refreshes Azure tokens
+    /// This ensures queries never wait for token refresh
+    fn start_background_token_refresh(&self) -> Option<std::thread::JoinHandle<()>> {
+        // Only start if Azure is configured
+        let account_name = match std::env::var("AZURE_STORAGE_ACCOUNT_NAME") {
+            Ok(name) => name,
+            Err(_) => return None,
+        };
+        
+        // Check if workload identity is available
+        if std::env::var("AZURE_FEDERATED_TOKEN_FILE").is_err() {
+            return None;
+        }
+        
+        let token_state = Arc::clone(&self.azure_token_state);
+        let connections: Vec<Arc<PooledConnection>> = self.connections.iter().map(Arc::clone).collect();
+        
+        let handle = std::thread::spawn(move || {
+            info!("Background Azure token refresh thread started");
+            
+            // Refresh interval: 45 minutes (tokens typically last 1 hour)
+            let refresh_interval = std::time::Duration::from_secs(45 * 60);
+            
+            loop {
+                // Check if we should stop
+                {
+                    if let Ok(state) = token_state.lock() {
+                        if let Some(ref inner) = *state {
+                            if inner.stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                info!("Background token refresh thread stopping");
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // Sleep first (token was just acquired during init)
+                std::thread::sleep(refresh_interval);
+                
+                // Refresh the token
+                info!("Background: Refreshing Azure access token...");
+                
+                let (access_token, expires_in) = match Self::get_azure_access_token() {
+                    Some(t) => t,
+                    None => {
+                        tracing::warn!("Background: Failed to refresh Azure token, will retry");
+                        continue;
+                    }
+                };
+                
+                // Update secret in all connections
+                for pooled in &connections {
+                    if let Ok(conn) = pooled.connection.lock() {
+                        let _ = conn.execute("DROP SECRET IF EXISTS azure_storage", params![]);
+                        let secret_sql = format!(
+                            "CREATE SECRET azure_storage (
+                                TYPE azure,
+                                PROVIDER access_token,
+                                ACCESS_TOKEN '{}',
+                                ACCOUNT_NAME '{}'
+                            )",
+                            access_token, account_name
+                        );
+                        if let Err(e) = conn.execute(&secret_sql, params![]) {
+                            tracing::warn!("Background: Could not update Azure secret: {}", e);
+                        }
+                    }
+                }
+                
+                // Update token state
+                let expires_at = std::time::Instant::now() 
+                    + std::time::Duration::from_secs(expires_in.saturating_sub(60));
+                if let Ok(mut state) = token_state.lock() {
+                    if let Some(ref mut inner) = *state {
+                        inner.expires_at = expires_at;
+                    }
+                }
+                
+                info!("Background: Azure token refreshed, valid for {} seconds", expires_in);
+            }
+        });
+        
+        Some(handle)
     }
 
     /// Create a single DuckDB connection
@@ -194,7 +303,7 @@ impl DuckDbExecutor {
             // Try to get an access token for workload identity (needed for delta_scan)
             let access_token = Self::get_azure_access_token();
             
-            if let Some(token) = access_token {
+            if let Some((token, _expires_in)) = access_token {
                 // Use access_token provider for delta extension compatibility
                 let secret_sql = format!(
                     "CREATE SECRET IF NOT EXISTS azure_storage (
@@ -244,8 +353,9 @@ impl DuckDbExecutor {
     }
 
     /// Get Azure access token by exchanging federated token (for Kubernetes Workload Identity)
+    /// Returns (access_token, expires_in_seconds)
     /// This is needed because delta_scan uses object_store which doesn't support workload identity natively
-    fn get_azure_access_token() -> Option<String> {
+    fn get_azure_access_token() -> Option<(String, u64)> {
         // Check if we have workload identity environment variables
         let federated_token_file = std::env::var("AZURE_FEDERATED_TOKEN_FILE").ok()?;
         let client_id = std::env::var("AZURE_CLIENT_ID").ok()?;
@@ -253,7 +363,7 @@ impl DuckDbExecutor {
         
         tracing::info!("Attempting to get Azure access token via workload identity");
         
-        // Read the federated token
+        // Read the federated token (re-read each time as K8s may rotate it)
         let federated_token = match std::fs::read_to_string(&federated_token_file) {
             Ok(token) => token.trim().to_string(),
             Err(e) => {
@@ -276,7 +386,7 @@ impl DuckDbExecutor {
             ("scope", "https://storage.azure.com/.default"),
         ];
         
-        // Use blocking HTTP client since this runs during initialization
+        // Use blocking HTTP client
         let client = match reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build() 
@@ -304,7 +414,7 @@ impl DuckDbExecutor {
             return None;
         }
         
-        // Parse the JSON response to extract access_token
+        // Parse the JSON response to extract access_token and expires_in
         let json: serde_json::Value = match response.json() {
             Ok(j) => j,
             Err(e) => {
@@ -314,9 +424,77 @@ impl DuckDbExecutor {
         };
         
         let access_token = json.get("access_token")?.as_str()?.to_string();
-        tracing::info!("Successfully obtained Azure access token via workload identity");
+        // Default to 3600 seconds (1 hour) if expires_in is not present
+        let expires_in = json.get("expires_in")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3600);
         
-        Some(access_token)
+        tracing::info!("Successfully obtained Azure access token (expires in {} seconds)", expires_in);
+        
+        Some((access_token, expires_in))
+    }
+    
+    /// Emergency token refresh - only called if token is critically expired
+    /// Normal refresh is handled by background thread
+    fn check_azure_token_emergency_refresh(&self) {
+        // Fast path: check if we even have Azure configured
+        let account_name = match std::env::var("AZURE_STORAGE_ACCOUNT_NAME") {
+            Ok(name) => name,
+            Err(_) => return, // No Azure config
+        };
+        
+        // Check if token is critically expired (past expiration time)
+        let needs_emergency_refresh = {
+            match self.azure_token_state.lock() {
+                Ok(state) => match state.as_ref() {
+                    Some(s) => std::time::Instant::now() > s.expires_at,
+                    None => false, // No state yet, let background thread handle it
+                },
+                Err(_) => false,
+            }
+        };
+        
+        if !needs_emergency_refresh {
+            return; // Token is still valid, no action needed
+        }
+        
+        tracing::warn!("Emergency: Azure token expired, refreshing synchronously...");
+        
+        // Get new token
+        let (access_token, expires_in) = match Self::get_azure_access_token() {
+            Some(t) => t,
+            None => {
+                tracing::error!("Emergency: Could not refresh Azure token");
+                return;
+            }
+        };
+        
+        // Update the secret in all connections
+        for pooled in &self.connections {
+            if let Ok(conn) = pooled.connection.lock() {
+                let _ = conn.execute("DROP SECRET IF EXISTS azure_storage", params![]);
+                let secret_sql = format!(
+                    "CREATE SECRET azure_storage (
+                        TYPE azure,
+                        PROVIDER access_token,
+                        ACCESS_TOKEN '{}',
+                        ACCOUNT_NAME '{}'
+                    )",
+                    access_token, account_name
+                );
+                let _ = conn.execute(&secret_sql, params![]);
+            }
+        }
+        
+        // Update token state
+        let expires_at = std::time::Instant::now() + std::time::Duration::from_secs(expires_in.saturating_sub(60));
+        if let Ok(mut state) = self.azure_token_state.lock() {
+            if let Some(ref mut inner) = *state {
+                inner.expires_at = expires_at;
+            }
+        }
+        
+        tracing::info!("Emergency: Azure token refreshed");
     }
 
     /// Configure S3 for all connections from environment variables
@@ -417,21 +595,51 @@ impl DuckDbExecutor {
                     tracing::warn!("Could not set azure_sas_token: {}", e);
                 }
             } else if use_managed_identity {
-                // Use Azure credential_chain provider via secret (better for workload identity)
+                // For managed identity, we'll set up an initial token
+                // The token will be refreshed automatically by refresh_azure_token_if_needed()
                 if let Some(account) = &account_name {
-                    let secret_sql = format!(
-                        "CREATE SECRET IF NOT EXISTS azure_storage (
-                            TYPE azure,
-                            PROVIDER credential_chain,
-                            ACCOUNT_NAME '{}'
-                        )",
-                        account
-                    );
-                    if let Err(e) = conn.execute(&secret_sql, params![]) {
-                        tracing::warn!("Could not create Azure secret: {}, trying SET", e);
-                        // Fallback to SET-based configuration
-                        if let Err(e) = conn.execute("SET azure_credential_chain = 'default'", params![]) {
-                            tracing::warn!("Could not set azure_credential_chain: {}", e);
+                    // Try to get an access token for workload identity
+                    if let Some((token, expires_in)) = Self::get_azure_access_token() {
+                        let secret_sql = format!(
+                            "CREATE SECRET IF NOT EXISTS azure_storage (
+                                TYPE azure,
+                                PROVIDER access_token,
+                                ACCESS_TOKEN '{}',
+                                ACCOUNT_NAME '{}'
+                            )",
+                            token, account
+                        );
+                        if let Err(e) = conn.execute(&secret_sql, params![]) {
+                            tracing::warn!("Could not create Azure access_token secret: {}", e);
+                        } else {
+                            // Set initial token state (only for first connection to avoid duplicates)
+                            if pooled_conn.id == 0 {
+                                let expires_at = std::time::Instant::now() 
+                                    + std::time::Duration::from_secs(expires_in.saturating_sub(60));
+                                if let Ok(mut state) = self.azure_token_state.lock() {
+                                    *state = Some(AzureTokenState {
+                                        expires_at,
+                                        account_name: account.clone(),
+                                        stop_flag: std::sync::atomic::AtomicBool::new(false),
+                                    });
+                                }
+                            }
+                        }
+                    } else {
+                        // Fallback to credential_chain
+                        let secret_sql = format!(
+                            "CREATE SECRET IF NOT EXISTS azure_storage (
+                                TYPE azure,
+                                PROVIDER credential_chain,
+                                ACCOUNT_NAME '{}'
+                            )",
+                            account
+                        );
+                        if let Err(e) = conn.execute(&secret_sql, params![]) {
+                            tracing::warn!("Could not create Azure secret: {}, trying SET", e);
+                            if let Err(e) = conn.execute("SET azure_credential_chain = 'default'", params![]) {
+                                tracing::warn!("Could not set azure_credential_chain: {}", e);
+                            }
                         }
                     }
                 }
@@ -469,6 +677,10 @@ impl DuckDbExecutor {
     /// Uses connection pool for parallel execution
     #[instrument(skip(self))]
     pub fn execute_query(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        // Background thread handles token refresh proactively
+        // This is just a safety check for edge cases (e.g., if background thread failed)
+        self.check_azure_token_emergency_refresh();
+        
         let pooled_conn = self.get_connection();
         debug!("Using connection {} for query", pooled_conn.id);
 
