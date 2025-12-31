@@ -31,10 +31,10 @@ pub fn init(log_level: &str) -> Result<()> {
         subscriber.with(tracing_subscriber::fmt::layer()).init();
     }
 
-    // TODO: When OTLP endpoint is configured, add OpenTelemetry layer
-    // This requires additional setup for the OTLP exporter
+    // NOTE: OpenTelemetry OTLP integration is planned for v1.1
+    // Requires: opentelemetry, opentelemetry-otlp, and tracing-opentelemetry crates
     if let Some(endpoint) = otlp_endpoint {
-        tracing::info!(endpoint = %endpoint, "OpenTelemetry OTLP endpoint configured (full integration pending)");
+        tracing::info!(endpoint = %endpoint, "OpenTelemetry OTLP endpoint configured - full integration in v1.1");
     }
 
     Ok(())

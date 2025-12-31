@@ -159,7 +159,8 @@ impl DataSizer {
             s3_client,
             cache: DashMap::new(),
             cache_ttl: Duration::from_secs(300), // 5 minute cache
-            s3_path_regex: Regex::new(r"s3://([^/]+)/(.+)").unwrap(),
+            s3_path_regex: Regex::new(r"s3://([^/]+)/(.+)")
+                .expect("S3 path regex is a valid constant pattern"),
             endpoint_url,
         }
     }
@@ -296,7 +297,8 @@ impl DataSizer {
         let mut structure = QueryStructure::default();
 
         // Extract tables using regex
-        let table_regex = Regex::new(r"read_parquet\s*\(\s*'([^']+)'").unwrap();
+        let table_regex = Regex::new(r"read_parquet\s*\(\s*'([^']+)'")
+            .expect("read_parquet regex is a valid constant pattern");
         for cap in table_regex.captures_iter(sql) {
             if let Some(path) = cap.get(1) {
                 structure.tables.push(path.as_str().to_string());

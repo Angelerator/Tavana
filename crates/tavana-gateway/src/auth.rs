@@ -5,9 +5,9 @@ use std::sync::Arc;
 use tavana_common::{ApiKeyValidator, AuthToken, Result, TavanaError, UserIdentity};
 
 /// Authentication service that validates both API keys and JWTs
+/// NOTE: JWT/OIDC validation is planned for v1.1 - currently only API keys are supported
 pub struct AuthService {
     api_key_validator: Arc<RwLock<ApiKeyValidator>>,
-    // TODO: Add OIDC provider for JWT validation
 }
 
 impl AuthService {
@@ -25,9 +25,8 @@ impl AuthService {
             return self.api_key_validator.read().validate(token);
         }
 
-        // Try JWT
-        // TODO: Implement JWT validation
-        Err(TavanaError::InvalidToken("Unknown token format".into()))
+        // JWT validation is planned for v1.1 - for now, only API keys (tvn_*) are supported
+        Err(TavanaError::InvalidToken("JWT authentication not yet supported - use API keys (tvn_*)".into()))
     }
 
     /// Register an API key

@@ -373,6 +373,52 @@ impl WorkerClient {
 
         Ok(resp.success)
     }
+
+    /// Health check to verify worker is alive
+    /// Returns true if worker responds to health check, false otherwise
+    pub async fn health_check(&self) -> bool {
+        match self.get_client().await {
+            Ok(mut client) => {
+                let request = proto::HealthCheckRequest {};
+                match client.health_check(request).await {
+                    Ok(response) => {
+                        let resp = response.into_inner();
+                        // ServiceStatus::Healthy = 1
+                        resp.status == proto::ServiceStatus::Healthy as i32
+                    }
+                    Err(e) => {
+                        debug!("Worker health check failed: {}", e);
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Failed to connect to worker for health check: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Check if a specific cursor is still alive on the worker
+    /// Returns true if cursor exists, false if it doesn't or worker is unreachable
+    pub async fn cursor_exists(&self, cursor_id: &str) -> bool {
+        // Try a minimal fetch (0 rows) to check if cursor exists
+        match self.fetch_cursor(cursor_id, 0).await {
+            Ok(_) => true,
+            Err(e) => {
+                let err_msg = e.to_string();
+                // If the error is about cursor not found, it definitely doesn't exist
+                if err_msg.contains("CURSOR_NOT_FOUND") || err_msg.contains("not found") {
+                    debug!(cursor_id = %cursor_id, "Cursor no longer exists on worker");
+                    false
+                } else {
+                    // Other errors might be transient - assume cursor exists
+                    debug!(cursor_id = %cursor_id, error = %e, "Cursor check failed with error (assuming exists)");
+                    true
+                }
+            }
+        }
+    }
 }
 
 /// Result of declaring a cursor

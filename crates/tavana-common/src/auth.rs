@@ -143,7 +143,7 @@ impl ApiKeyValidator {
         // Use a simple random generation - in production use proper RNG
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock is before UNIX epoch - check system time configuration")
             .as_nanos();
         let hash = blake3::hash(&timestamp.to_le_bytes());
         bytes.copy_from_slice(hash.as_bytes());
