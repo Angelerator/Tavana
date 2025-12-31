@@ -22,6 +22,7 @@ use crate::smart_scaler::SmartScaler;
 use crate::tls_config::TlsConfig;
 use crate::worker_client::{StreamingBatch, WorkerClient};
 use crate::worker_pool::WorkerPoolManager;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -31,6 +32,23 @@ use tokio::net::TcpListener;
 use std::time::Duration;
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
+
+// ===== Server-Side Cursor Support =====
+// Enables Tableau and other BI tools to fetch large result sets in batches
+// Using LIMIT/OFFSET pagination for simplicity (works with any query)
+
+/// Cursor state for server-side cursor support (DECLARE/FETCH/CLOSE)
+#[derive(Debug)]
+struct CursorState {
+    /// The SQL query this cursor executes
+    query: String,
+    /// Column metadata (cached from first execution)
+    columns: Vec<(String, String)>,
+    /// Current row offset (for FETCH pagination)
+    current_offset: usize,
+    /// Whether all rows have been fetched
+    exhausted: bool,
+}
 
 /// Maximum rows to buffer before flushing to client (backpressure control)
 const STREAMING_BATCH_SIZE: usize = 1000;
@@ -796,7 +814,7 @@ async fn handle_connection(
                 }
             }
             b'B' => handle_bind(&mut socket, &mut buf).await?,
-            b'D' => handle_describe(&mut socket, &mut buf, prepared_query.as_deref(), &worker_client, &user_id).await?,
+            b'D' => { let _ = handle_describe(&mut socket, &mut buf, prepared_query.as_deref(), &worker_client, &user_id).await?; }
             b'E' => {
                 // Execute - run the prepared statement with SmartScaler + QueryQueue
                 if let Some(ref query) = prepared_query {
@@ -978,6 +996,10 @@ async fn run_query_loop(
     let mut buf = [0u8; 4];
     let ready = [b'Z', 0, 0, 0, 5, b'I'];
     let mut prepared_query: Option<String> = None;
+    // Track whether Describe sent RowDescription (true) or NoData (false)
+    let mut describe_sent_row_description = false;
+    // Server-side cursor storage for this connection
+    let mut cursors: HashMap<String, CursorState> = HashMap::new();
 
     loop {
         let mut msg_type = [0u8; 1];
@@ -1002,6 +1024,54 @@ async fn run_query_loop(
                     .to_string();
 
                 debug!("Received query: {}", &query[..query.len().min(100)]);
+
+                // Check for cursor commands first (require connection-level state)
+                let query_upper = query.to_uppercase();
+                let query_trimmed = query_upper.trim();
+                
+                // Handle DECLARE CURSOR
+                if query_trimmed.starts_with("DECLARE ") && query_trimmed.contains(" CURSOR ") {
+                    if let Some(result) = handle_declare_cursor(&query, &mut cursors, worker_client, user_id).await {
+                        send_query_result_immediate(socket, result).await?;
+                        socket.write_all(&ready).await?;
+                        socket.flush().await?;
+                        continue;
+                    }
+                }
+                
+                // Handle FETCH
+                if query_trimmed.starts_with("FETCH ") {
+                    if let Some(result) = handle_fetch_cursor(&query, &mut cursors, worker_client, user_id).await {
+                        send_query_result_immediate(socket, result).await?;
+                        socket.write_all(&ready).await?;
+                        socket.flush().await?;
+                        continue;
+                    }
+                }
+                
+                // Handle CLOSE cursor
+                if query_trimmed.starts_with("CLOSE ") {
+                    let cursor_name = extract_cursor_name_from_close(&query);
+                    if let Some(name) = cursor_name {
+                        if name == "__ALL__" {
+                            let count = cursors.len();
+                            cursors.clear();
+                            info!("Closed all {} cursors", count);
+                        } else {
+                            cursors.remove(&name);
+                            info!("Closed cursor: {}", name);
+                        }
+                    }
+                    send_query_result_immediate(socket, QueryExecutionResult {
+                        columns: vec![],
+                        rows: vec![],
+                        row_count: 0,
+                        command_tag: Some("CLOSE CURSOR".to_string()),
+                    }).await?;
+                    socket.write_all(&ready).await?;
+                    socket.flush().await?;
+                    continue;
+                }
 
                 let query_id = uuid::Uuid::new_v4().to_string();
                 let estimate = query_router.route(&query).await;
@@ -1068,24 +1138,46 @@ async fn run_query_loop(
                 }
             }
             b'B' => handle_bind(socket, &mut buf).await?,
-            b'D' => handle_describe(socket, &mut buf, prepared_query.as_deref(), worker_client, user_id).await?,
+            b'D' => {
+                describe_sent_row_description = handle_describe(socket, &mut buf, prepared_query.as_deref(), worker_client, user_id).await?;
+            }
             b'E' => {
                 if let Some(ref query) = prepared_query {
-                    handle_execute_extended(
-                        socket,
-                        &mut buf,
-                        worker_client,
-                        query_router,
-                        query,
-                        user_id,
-                        smart_scaler,
-                        query_queue,
-                    )
-                    .await?;
+                    // If Describe sent NoData, we must not send DataRows
+                    if !describe_sent_row_description {
+                        debug!("Extended Protocol (non-TLS) - Execute: Describe sent NoData, only sending CommandComplete");
+                        // Read Execute message data
+                        socket.read_exact(&mut buf).await?;
+                        let len = u32::from_be_bytes(buf) as usize - 4;
+                        let mut data = vec![0u8; len];
+                        socket.read_exact(&mut data).await?;
+                        // Just send CommandComplete
+                        let cmd = b"SELECT 0";
+                        let cmd_len = (4 + cmd.len() + 1) as u32;
+                        let mut msg = vec![b'C'];
+                        msg.extend_from_slice(&cmd_len.to_be_bytes());
+                        msg.extend_from_slice(cmd);
+                        msg.push(0);
+                        socket.write_all(&msg).await?;
+                        socket.flush().await?;
+                    } else {
+                        handle_execute_extended(
+                            socket,
+                            &mut buf,
+                            worker_client,
+                            query_router,
+                            query,
+                            user_id,
+                            smart_scaler,
+                            query_queue,
+                        )
+                        .await?;
+                    }
                 } else {
                     handle_execute_empty(socket, &mut buf).await?;
                 }
                 prepared_query = None;
+                describe_sent_row_description = false;
             }
             b'S' => {
                 // Sync message has length field (4 bytes with value 4)
@@ -1125,8 +1217,9 @@ where
     // Track whether Describe sent RowDescription (true) or NoData (false)
     // This ensures Execute phase is consistent with Describe phase
     let mut describe_sent_row_description = false;
-    // Cache column info from Describe to use in Execute
-    let mut cached_columns: Option<Vec<(String, String)>> = None;
+    // Server-side cursor storage for this connection
+    // Enables DECLARE CURSOR / FETCH / CLOSE for large result sets
+    let mut cursors: HashMap<String, CursorState> = HashMap::new();
 
     loop {
         let mut msg_type = [0u8; 1];
@@ -1151,6 +1244,52 @@ where
                     .to_string();
 
                 debug!("Received query (TLS): {}", &query[..query.len().min(100)]);
+
+                // Check for cursor commands first (require connection-level state)
+                let query_upper = query.to_uppercase();
+                let query_trimmed = query_upper.trim();
+                
+                // Handle DECLARE CURSOR
+                if query_trimmed.starts_with("DECLARE ") && query_trimmed.contains(" CURSOR ") {
+                    if let Some(result) = handle_declare_cursor(&query, &mut cursors, worker_client, user_id).await {
+                        send_simple_result_generic(socket, &[], &[], result.command_tag.as_deref()).await?;
+                        socket.write_all(&ready).await?;
+                        socket.flush().await?;
+                        continue;
+                    }
+                }
+                
+                // Handle FETCH
+                if query_trimmed.starts_with("FETCH ") {
+                    if let Some(result) = handle_fetch_cursor(&query, &mut cursors, worker_client, user_id).await {
+                        let cols: Vec<(&str, i32)> = result.columns.iter()
+                            .map(|(n, _)| (n.as_str(), 25i32))
+                            .collect();
+                        send_simple_result_generic(socket, &cols, &result.rows, result.command_tag.as_deref()).await?;
+                        socket.write_all(&ready).await?;
+                        socket.flush().await?;
+                        continue;
+                    }
+                }
+                
+                // Handle CLOSE cursor
+                if query_trimmed.starts_with("CLOSE ") {
+                    let cursor_name = extract_cursor_name_from_close(&query);
+                    if let Some(name) = cursor_name {
+                        if name == "__ALL__" {
+                            let count = cursors.len();
+                            cursors.clear();
+                            info!("Closed all {} cursors", count);
+                        } else {
+                            cursors.remove(&name);
+                            info!("Closed cursor: {}", name);
+                        }
+                    }
+                    send_simple_result_generic(socket, &[], &[], Some("CLOSE CURSOR")).await?;
+                    socket.write_all(&ready).await?;
+                    socket.flush().await?;
+                    continue;
+                }
 
                 // For TLS connections, execute queries directly using a simpler path
                 let query_id = uuid::Uuid::new_v4().to_string();
@@ -1266,7 +1405,6 @@ where
                 
                 // Reset state for this Describe
                 describe_sent_row_description = false;
-                cached_columns = None;
                 
                 // Send ParameterDescription (no parameters)
                 socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
@@ -1283,7 +1421,6 @@ where
                             info!("Extended Protocol - Describe: PG command returns {} columns", result.columns.len());
                             send_row_description_generic(socket, &result.columns).await?;
                             describe_sent_row_description = true;
-                            cached_columns = Some(result.columns.clone());
                         }
                     } else {
                         // Execute query to get column info
@@ -1302,7 +1439,6 @@ where
                                     );
                                     send_row_description_generic(socket, &columns).await?;
                                     describe_sent_row_description = true;
-                                    cached_columns = Some(columns);
                                 }
                             }
                             Err(e) => {
@@ -1374,7 +1510,6 @@ where
                 prepared_query = None;
                 // Reset state after Execute
                 describe_sent_row_description = false;
-                cached_columns = None;
             }
             b'S' => {
                 // Sync message has length field (4 bytes with value 4)
@@ -2325,6 +2460,178 @@ fn extract_copy_inner_query(sql: &str) -> Option<String> {
     }
 }
 
+// ===== Server-Side Cursor Implementation =====
+// These functions implement PostgreSQL cursor semantics for large result sets
+// Using LIMIT/OFFSET pagination for simplicity
+
+/// Handle DECLARE cursor_name CURSOR FOR select_query
+/// Parses the cursor declaration and stores it in the connection's cursor map
+async fn handle_declare_cursor(
+    sql: &str,
+    cursors: &mut HashMap<String, CursorState>,
+    worker_client: &WorkerClient,
+    user_id: &str,
+) -> Option<QueryExecutionResult> {
+    // Parse: DECLARE cursor_name CURSOR FOR SELECT ...
+    let sql_upper = sql.to_uppercase();
+    
+    // Find cursor name (between DECLARE and CURSOR)
+    let declare_pos = sql_upper.find("DECLARE")?;
+    let cursor_pos = sql_upper.find(" CURSOR ")?;
+    let cursor_name = sql[declare_pos + 7..cursor_pos].trim().to_string();
+    
+    // Find the SELECT query (after "FOR")
+    let for_pos = sql_upper.find(" FOR ")?;
+    let query = sql[for_pos + 5..].trim().to_string();
+    
+    if cursor_name.is_empty() || query.is_empty() {
+        return None;
+    }
+    
+    info!("DECLARE CURSOR '{}' for query: {}", cursor_name, &query[..query.len().min(80)]);
+    
+    // Execute query once to get column metadata (with LIMIT 0 for efficiency)
+    let metadata_query = format!("{} LIMIT 0", query);
+    let columns = match worker_client.execute_query(&metadata_query, user_id).await {
+        Ok(result) => result.columns.iter()
+            .map(|c| (c.name.clone(), c.type_name.clone()))
+            .collect(),
+        Err(e) => {
+            warn!("Failed to get cursor column metadata: {}", e);
+            Vec::new()
+        }
+    };
+    
+    // Store cursor state
+    cursors.insert(cursor_name.clone(), CursorState {
+        query,
+        columns,
+        current_offset: 0,
+        exhausted: false,
+    });
+    
+    Some(QueryExecutionResult {
+        columns: vec![],
+        rows: vec![],
+        row_count: 0,
+        command_tag: Some("DECLARE CURSOR".to_string()),
+    })
+}
+
+/// Handle FETCH count FROM cursor_name
+/// Fetches the next batch of rows using LIMIT/OFFSET
+async fn handle_fetch_cursor(
+    sql: &str,
+    cursors: &mut HashMap<String, CursorState>,
+    worker_client: &WorkerClient,
+    user_id: &str,
+) -> Option<QueryExecutionResult> {
+    // Parse: FETCH count FROM cursor_name
+    // or: FETCH FORWARD count FROM cursor_name
+    // or: FETCH ALL FROM cursor_name
+    let sql_upper = sql.to_uppercase();
+    let sql_trimmed = sql_upper.trim();
+    
+    // Find "FROM" position
+    let from_pos = sql_upper.find(" FROM ")?;
+    let cursor_name = sql[from_pos + 6..].trim().trim_end_matches(';').to_string();
+    
+    // Parse fetch count (between FETCH and FROM)
+    let fetch_part = sql_trimmed[5..].trim(); // After "FETCH"
+    let from_idx = fetch_part.find(" FROM ").unwrap_or(fetch_part.len());
+    let count_part = fetch_part[..from_idx].trim();
+    
+    let fetch_count: usize = if count_part.eq_ignore_ascii_case("ALL") {
+        usize::MAX // Fetch all remaining
+    } else if count_part.starts_with("FORWARD ") {
+        count_part[8..].trim().parse().unwrap_or(1)
+    } else {
+        count_part.parse().unwrap_or(1)
+    };
+    
+    // Get cursor state
+    let cursor = cursors.get_mut(&cursor_name)?;
+    
+    if cursor.exhausted {
+        // Cursor is exhausted, return empty result
+        return Some(QueryExecutionResult {
+            columns: cursor.columns.clone(),
+            rows: vec![],
+            row_count: 0,
+            command_tag: Some("FETCH 0".to_string()),
+        });
+    }
+    
+    // Build paginated query
+    let paginated_query = if fetch_count == usize::MAX {
+        format!("{} OFFSET {}", cursor.query, cursor.current_offset)
+    } else {
+        format!("{} LIMIT {} OFFSET {}", cursor.query, fetch_count, cursor.current_offset)
+    };
+    
+    debug!("FETCH {} FROM {}: executing {}", fetch_count, cursor_name, &paginated_query[..paginated_query.len().min(100)]);
+    
+    // Execute paginated query
+    match worker_client.execute_query(&paginated_query, user_id).await {
+        Ok(result) => {
+            let row_count = result.rows.len();
+            
+            // Update cursor position
+            cursor.current_offset += row_count;
+            
+            // Check if cursor is exhausted
+            if row_count == 0 || (fetch_count != usize::MAX && row_count < fetch_count) {
+                cursor.exhausted = true;
+            }
+            
+            info!("FETCH {} FROM {}: returned {} rows (offset now {})", 
+                fetch_count, cursor_name, row_count, cursor.current_offset);
+            
+            // Use cached column metadata if available
+            let columns = if cursor.columns.is_empty() {
+                result.columns.iter()
+                    .map(|c| (c.name.clone(), c.type_name.clone()))
+                    .collect()
+            } else {
+                cursor.columns.clone()
+            };
+            
+            Some(QueryExecutionResult {
+                columns,
+                rows: result.rows,
+                row_count,
+                command_tag: Some(format!("FETCH {}", row_count)),
+            })
+        }
+        Err(e) => {
+            warn!("FETCH error: {}", e);
+            Some(QueryExecutionResult {
+                columns: cursor.columns.clone(),
+                rows: vec![],
+                row_count: 0,
+                command_tag: Some("FETCH 0".to_string()),
+            })
+        }
+    }
+}
+
+/// Extract cursor name from CLOSE command
+fn extract_cursor_name_from_close(sql: &str) -> Option<String> {
+    let sql_upper = sql.to_uppercase();
+    let sql_trimmed = sql_upper.trim();
+    
+    if sql_trimmed.starts_with("CLOSE ") {
+        let name = sql[6..].trim().trim_end_matches(';').to_string();
+        if !name.is_empty() && name != "ALL" {
+            return Some(name);
+        } else if name == "ALL" {
+            // CLOSE ALL is handled by clearing all cursors
+            return Some("__ALL__".to_string());
+        }
+    }
+    None
+}
+
 fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
     let sql_upper = sql.to_uppercase();
     let sql_trimmed = sql_upper.trim();
@@ -2402,40 +2709,8 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
         });
     }
 
-    // Handle DECLARE CURSOR (stub - acknowledge but don't actually create cursor)
-    // Full cursor support would require connection-level state management
-    if sql_trimmed.starts_with("DECLARE ") && sql_trimmed.contains(" CURSOR ") {
-        debug!("DECLARE CURSOR stub: {}", &sql[..sql.len().min(80)]);
-        return Some(QueryExecutionResult {
-            columns: vec![],
-            rows: vec![],
-            row_count: 0,
-            command_tag: Some("DECLARE CURSOR".to_string()),
-        });
-    }
-
-    // Handle FETCH (stub - return empty result, should be enhanced with actual cursor support)
-    if sql_trimmed.starts_with("FETCH ") {
-        debug!("FETCH stub: {}", &sql[..sql.len().min(80)]);
-        // Return empty result - actual implementation would fetch from cursor
-        return Some(QueryExecutionResult {
-            columns: vec![],
-            rows: vec![],
-            row_count: 0,
-            command_tag: Some("FETCH 0".to_string()),
-        });
-    }
-
-    // Handle CLOSE (cursor)
-    if sql_trimmed.starts_with("CLOSE ") {
-        debug!("CLOSE cursor stub: {}", &sql[..sql.len().min(80)]);
-        return Some(QueryExecutionResult {
-            columns: vec![],
-            rows: vec![],
-            row_count: 0,
-            command_tag: Some("CLOSE CURSOR".to_string()),
-        });
-    }
+    // NOTE: DECLARE CURSOR, FETCH, and CLOSE are handled in run_query_loop_generic
+    // because they require access to per-connection cursor state
 
     if sql_upper.contains("PG_CATALOG") || sql_upper.contains("INFORMATION_SCHEMA") {
         return Some(QueryExecutionResult {
@@ -2586,7 +2861,8 @@ async fn send_query_result_immediate(
         }
     }
 
-    let tag = format!("SELECT {}", result.rows.len());
+    // Use custom command_tag if provided (e.g., "FETCH 100"), otherwise "SELECT n"
+    let tag = result.command_tag.unwrap_or_else(|| format!("SELECT {}", result.rows.len()));
     send_command_complete(socket, &tag).await?;
 
     Ok(result.rows.len())
@@ -2892,13 +3168,15 @@ async fn handle_bind(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4]) -> a
     Ok(())
 }
 
+/// Handle Describe message for extended query protocol
+/// Returns true if RowDescription was sent, false if NoData was sent
 async fn handle_describe(
     socket: &mut tokio::net::TcpStream,
     buf: &mut [u8; 4],
     prepared_query: Option<&str>,
     worker_client: &WorkerClient,
     user_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     socket.read_exact(buf).await?;
     let len = u32::from_be_bytes(*buf) as usize - 4;
@@ -2921,8 +3199,10 @@ async fn handle_describe(
             // Send RowDescription for the columns
             if result.columns.is_empty() {
                 socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                return Ok(false);
             } else {
                 send_row_description_for_describe(socket, &result.columns).await?;
+                return Ok(true);
             }
         } else {
             // Execute query to get column metadata
@@ -2938,25 +3218,31 @@ async fn handle_describe(
                     
                     if columns.is_empty() {
                         socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                        return Ok(false);
                     } else {
+                        info!("Extended Protocol (non-TLS) - Describe: {} columns: {:?}", 
+                            columns.len(), 
+                            columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+                        );
                         send_row_description_for_describe(socket, &columns).await?;
+                        return Ok(true);
                     }
                 }
                 Err(e) => {
-                    debug!("Failed to describe query: {}", e);
+                    warn!("Extended Protocol (non-TLS) - Describe failed: {}, sending NoData", e);
                     // Send ParameterDescription (no parameters) and NoData as fallback
                     socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
                     socket.write_all(&[b'n', 0, 0, 0, 4]).await?;
+                    return Ok(false);
                 }
             }
         }
     } else {
         // No prepared statement - send NoData
         socket.write_all(&[b'n', 0, 0, 0, 4]).await?;
+        socket.flush().await?;
+        return Ok(false);
     }
-    
-    socket.flush().await?;
-    Ok(())
 }
 
 /// Send RowDescription message for Describe response (columns with types)
