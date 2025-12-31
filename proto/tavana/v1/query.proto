@@ -18,6 +18,17 @@ service QueryService {
     
     // Health check
     rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+    
+    // ============= Cursor Operations for True Streaming =============
+    
+    // Declare a cursor - executes query and holds results for incremental fetch
+    rpc DeclareCursor(DeclareCursorRequest) returns (DeclareCursorResponse);
+    
+    // Fetch rows from a cursor (true streaming - no re-scanning)
+    rpc FetchCursor(FetchCursorRequest) returns (stream QueryResultBatch);
+    
+    // Close a cursor and release resources
+    rpc CloseCursor(CloseCursorRequest) returns (CloseCursorResponse);
 }
 
 message ExecuteQueryRequest {
@@ -106,6 +117,38 @@ message QueryProgress {
     uint64 rows_processed = 2;
     uint64 bytes_processed = 3;
     string current_stage = 4;
+}
+
+// ============= Cursor Messages for True Streaming =============
+
+message DeclareCursorRequest {
+    string cursor_id = 1;        // Unique cursor identifier
+    string sql = 2;              // The SQL query to execute
+    UserIdentity user = 3;       // User context
+    QueryOptions options = 4;    // Query options
+}
+
+message DeclareCursorResponse {
+    bool success = 1;
+    string cursor_id = 2;
+    repeated string columns = 3;       // Column names
+    repeated string column_types = 4;  // Column data types
+    string error_message = 5;          // Error if success=false
+    string worker_id = 6;              // Worker holding this cursor (for affinity)
+}
+
+message FetchCursorRequest {
+    string cursor_id = 1;        // Cursor to fetch from
+    uint64 max_rows = 2;         // Maximum rows to fetch (0 = use default)
+}
+
+message CloseCursorRequest {
+    string cursor_id = 1;        // Cursor to close
+}
+
+message CloseCursorResponse {
+    bool success = 1;
+    string message = 2;
 }
 
 // Query history logging
