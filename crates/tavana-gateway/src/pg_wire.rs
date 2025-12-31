@@ -286,7 +286,7 @@ impl PgWireServer {
                     if err_str.contains("early eof") || err_str.contains("connection reset") {
                         debug!("Client disconnected: {}", err_str);
                     } else {
-                        error!("Error handling PostgreSQL connection: {}", e);
+                    error!("Error handling PostgreSQL connection: {}", e);
                     }
                 }
             });
@@ -649,10 +649,10 @@ async fn handle_connection(
                     continue;
                 }
                 _ => {}
+                }
             }
+            break;
         }
-        break;
-    }
 
     // Extract user from startup message
     let user_id =
@@ -811,7 +811,7 @@ async fn handle_connection(
                         &query_queue,
                     )
                     .await?;
-                } else {
+            } else {
                     // No prepared statement, just acknowledge
                     handle_execute_empty(&mut socket, &mut buf).await?;
                 }
@@ -1039,8 +1039,8 @@ async fn run_query_loop(
                                     bytes: 0,
                                     duration_ms,
                                 }
-                            }
-                            Err(e) => {
+                    }
+                    Err(e) => {
                                 error!("Query {} error: {}", query_id, e);
                                 send_error(socket, &e.to_string()).await?;
                                 QueryOutcome::Failure {
@@ -1491,8 +1491,8 @@ where
     
     // Handle PostgreSQL-specific commands locally
     if let Some(result) = handle_pg_specific_command(sql) {
-        // For extended protocol, don't send RowDescription again
-        send_data_rows_only_generic(socket, &result.rows, result.rows.len()).await?;
+        // For extended protocol, don't send RowDescription again (it was sent during Describe or NoData was sent)
+        send_data_rows_only_generic(socket, &result.rows, result.rows.len(), result.command_tag.as_deref()).await?;
         return Ok(result.rows.len());
     }
     
@@ -1538,7 +1538,7 @@ where
     
     // For Extended Protocol, only send DataRows and CommandComplete
     // RowDescription was already sent during Describe phase
-    send_data_rows_only_generic(socket, &rows, row_count).await?;
+    send_data_rows_only_generic(socket, &rows, row_count, None).await?;
     
     debug!("Extended Protocol Execute completed: {} rows", row_count);
     
@@ -1623,48 +1623,57 @@ async fn send_simple_result_generic<S>(socket: &mut S, columns: &[(&str, i32)], 
 where
     S: AsyncWrite + Unpin,
 {
-    // Build RowDescription
-    let mut row_desc = vec![b'T'];
-    let num_fields = columns.len() as i16;
-    let mut fields_data = Vec::new();
-    fields_data.extend_from_slice(&num_fields.to_be_bytes());
+    // Only send RowDescription and DataRows if we have columns
+    // Commands like SET, BEGIN, RESET return no columns - only CommandComplete
+    if !columns.is_empty() {
+        // Build RowDescription
+        let mut row_desc = vec![b'T'];
+        let num_fields = columns.len() as i16;
+        let mut fields_data = Vec::new();
+        fields_data.extend_from_slice(&num_fields.to_be_bytes());
 
-    for (col_name, _type_oid) in columns {
-        fields_data.extend_from_slice(col_name.as_bytes());
-        fields_data.push(0);
-        fields_data.extend_from_slice(&0i32.to_be_bytes()); // table OID
-        fields_data.extend_from_slice(&0i16.to_be_bytes()); // column attr
-        fields_data.extend_from_slice(&25i32.to_be_bytes()); // type OID (text)
-        fields_data.extend_from_slice(&(-1i16).to_be_bytes()); // type size
-        fields_data.extend_from_slice(&(-1i32).to_be_bytes()); // type mod
-        fields_data.extend_from_slice(&0i16.to_be_bytes()); // format (text)
-    }
-
-    let row_desc_len = (4 + fields_data.len()) as u32;
-    row_desc.extend_from_slice(&row_desc_len.to_be_bytes());
-    row_desc.extend_from_slice(&fields_data);
-    socket.write_all(&row_desc).await?;
-
-    // Send DataRows
-    for row in rows {
-        let mut data_row = vec![b'D'];
-        let mut row_data = Vec::new();
-        row_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
-
-        for val in row {
-            let bytes = val.as_bytes();
-            row_data.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
-            row_data.extend_from_slice(bytes);
+        for (col_name, _type_oid) in columns {
+            fields_data.extend_from_slice(col_name.as_bytes());
+            fields_data.push(0);
+            fields_data.extend_from_slice(&0i32.to_be_bytes()); // table OID
+            fields_data.extend_from_slice(&0i16.to_be_bytes()); // column attr
+            fields_data.extend_from_slice(&25i32.to_be_bytes()); // type OID (text)
+            fields_data.extend_from_slice(&(-1i16).to_be_bytes()); // type size
+            fields_data.extend_from_slice(&(-1i32).to_be_bytes()); // type mod
+            fields_data.extend_from_slice(&0i16.to_be_bytes()); // format (text)
         }
 
-        let row_len = (4 + row_data.len()) as u32;
-        data_row.extend_from_slice(&row_len.to_be_bytes());
-        data_row.extend_from_slice(&row_data);
-        socket.write_all(&data_row).await?;
+        let row_desc_len = (4 + fields_data.len()) as u32;
+        row_desc.extend_from_slice(&row_desc_len.to_be_bytes());
+        row_desc.extend_from_slice(&fields_data);
+        socket.write_all(&row_desc).await?;
+
+        // Send DataRows
+        for row in rows {
+            let mut data_row = vec![b'D'];
+            let mut row_data = Vec::new();
+            row_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
+
+            for val in row {
+                let bytes = val.as_bytes();
+                row_data.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                row_data.extend_from_slice(bytes);
+            }
+
+            let row_len = (4 + row_data.len()) as u32;
+            data_row.extend_from_slice(&row_len.to_be_bytes());
+            data_row.extend_from_slice(&row_data);
+            socket.write_all(&data_row).await?;
+        }
     }
 
     // Send CommandComplete
-    let cmd = format!("SELECT {}", rows.len());
+    // Use appropriate command tag based on whether this is a query or command
+    let cmd = if columns.is_empty() {
+        "SET".to_string() // For commands like SET, BEGIN, RESET
+    } else {
+        format!("SELECT {}", rows.len())
+    };
     let cmd_bytes = cmd.as_bytes();
     let mut complete = vec![b'C'];
     complete.extend_from_slice(&((4 + cmd_bytes.len() + 1) as u32).to_be_bytes());
@@ -1678,7 +1687,7 @@ where
 
 /// Send only DataRows (no RowDescription) for Extended Query Protocol Execute phase
 /// In Extended Protocol, RowDescription is sent during Describe, not Execute
-async fn send_data_rows_only_generic<S>(socket: &mut S, rows: &[Vec<String>], row_count: usize) -> anyhow::Result<()>
+async fn send_data_rows_only_generic<S>(socket: &mut S, rows: &[Vec<String>], row_count: usize, command_tag: Option<&str>) -> anyhow::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
@@ -1700,8 +1709,11 @@ where
         socket.write_all(&data_row).await?;
     }
 
-    // Send CommandComplete
-    let cmd = format!("SELECT {}", row_count);
+    // Send CommandComplete with appropriate tag
+    let cmd = match command_tag {
+        Some(tag) => tag.to_string(),
+        None => format!("SELECT {}", row_count),
+    };
     let cmd_bytes = cmd.as_bytes();
     let mut complete = vec![b'C'];
     complete.extend_from_slice(&((4 + cmd_bytes.len() + 1) as u32).to_be_bytes());
@@ -2310,7 +2322,7 @@ async fn execute_local_fallback(sql: &str) -> anyhow::Result<QueryExecutionResul
     }
 
     Ok(QueryExecutionResult {
-        columns: vec![("result".to_string(), "text".to_string())],
+            columns: vec![("result".to_string(), "text".to_string())],
         rows: vec![],
         row_count: 0,
         command_tag: None,
@@ -2367,24 +2379,24 @@ async fn send_data_row(socket: &mut tokio::net::TcpStream, row: &[String]) -> an
     use tokio::io::AsyncWriteExt;
 
     let mut data_row = Vec::with_capacity(5 + row.len() * 20);
-    data_row.push(b'D');
+        data_row.push(b'D');
 
     let mut row_data = Vec::with_capacity(2 + row.len() * 20);
-    row_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
+        row_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
 
-    for value in row {
+        for value in row {
         if value.is_empty() || value == "null" || value == "NULL" {
-            row_data.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
-        } else {
-            row_data.extend_from_slice(&(value.len() as i32).to_be_bytes());
-            row_data.extend_from_slice(value.as_bytes());
+                row_data.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
+            } else {
+                row_data.extend_from_slice(&(value.len() as i32).to_be_bytes());
+                row_data.extend_from_slice(value.as_bytes());
+            }
         }
-    }
 
-    let len = (4 + row_data.len()) as u32;
-    data_row.extend_from_slice(&len.to_be_bytes());
-    data_row.extend_from_slice(&row_data);
-    socket.write_all(&data_row).await?;
+        let len = (4 + row_data.len()) as u32;
+        data_row.extend_from_slice(&len.to_be_bytes());
+        data_row.extend_from_slice(&row_data);
+        socket.write_all(&data_row).await?;
 
     Ok(())
 }
@@ -2648,7 +2660,7 @@ async fn handle_parse_extended(
     let len = u32::from_be_bytes(*buf) as usize - 4;
     let mut data = vec![0u8; len];
     socket.read_exact(&mut data).await?;
-
+    
     // Parse message format:
     // - Statement name (null-terminated string)
     // - Query string (null-terminated string)
@@ -2845,7 +2857,7 @@ async fn handle_execute_extended(
     let len = u32::from_be_bytes(*buf) as usize - 4;
     let mut data = vec![0u8; len];
     socket.read_exact(&mut data).await?;
-
+    
     debug!(
         "Extended query protocol - Execute: {}",
         &sql[..sql.len().min(100)]
