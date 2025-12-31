@@ -1407,9 +1407,9 @@ where
     
     // Handle PostgreSQL-specific commands locally
     if let Some(result) = handle_pg_specific_command(sql) {
-        // Send simple result for TLS stream
+        // Send simple result for TLS stream with correct command tag
         let columns: Vec<(&str, i32)> = result.columns.iter().map(|(n, _t)| (n.as_str(), 25i32)).collect();
-        send_simple_result_generic(socket, &columns, &result.rows).await?;
+        send_simple_result_generic(socket, &columns, &result.rows, result.command_tag.as_deref()).await?;
         return Ok(0);
     }
     
@@ -1465,7 +1465,7 @@ where
     } else {
         // Send regular RowDescription and DataRows for SELECT
         let col_refs: Vec<(&str, i32)> = columns.iter().map(|(n, _t)| (n.as_str(), 25i32)).collect();
-        send_simple_result_generic(socket, &col_refs, &rows).await?;
+        send_simple_result_generic(socket, &col_refs, &rows, None).await?;
     }
     
     debug!("Query completed: {} rows", row_count);
@@ -1619,7 +1619,8 @@ async fn execute_query_on_worker_buffered(
 }
 
 /// Send simple result for generic streams
-async fn send_simple_result_generic<S>(socket: &mut S, columns: &[(&str, i32)], rows: &[Vec<String>]) -> anyhow::Result<()>
+/// command_tag is used for commands like SET, BEGIN, COMMIT, RESET that return no data
+async fn send_simple_result_generic<S>(socket: &mut S, columns: &[(&str, i32)], rows: &[Vec<String>], command_tag: Option<&str>) -> anyhow::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
@@ -1667,12 +1668,11 @@ where
         }
     }
 
-    // Send CommandComplete
-    // Use appropriate command tag based on whether this is a query or command
-    let cmd = if columns.is_empty() {
-        "SET".to_string() // For commands like SET, BEGIN, RESET
-    } else {
-        format!("SELECT {}", rows.len())
+    // Send CommandComplete with appropriate tag
+    // Use provided command_tag for commands, or SELECT N for queries
+    let cmd = match command_tag {
+        Some(tag) => tag.to_string(),
+        None => format!("SELECT {}", rows.len()),
     };
     let cmd_bytes = cmd.as_bytes();
     let mut complete = vec![b'C'];
