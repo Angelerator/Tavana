@@ -1275,9 +1275,17 @@ where
                 let query_upper = query.to_uppercase();
                 let query_trimmed = query_upper.trim();
                 
+                // Log query at INFO level for debugging cursor issues
+                if query_trimmed.contains("CURSOR") || query_trimmed.starts_with("DECLARE") || query_trimmed.starts_with("FETCH") {
+                    info!(
+                        query_preview = %&query_trimmed[..query_trimmed.len().min(80)],
+                        "Processing potential cursor command"
+                    );
+                }
+                
                 // Handle DECLARE CURSOR
                 if query_trimmed.starts_with("DECLARE ") && query_trimmed.contains(" CURSOR ") {
-                    debug!(
+                    info!(
                         query_trimmed = %query_trimmed,
                         "Detected DECLARE CURSOR command, attempting to handle"
                     );
