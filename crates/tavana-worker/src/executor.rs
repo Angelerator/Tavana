@@ -51,6 +51,21 @@ struct AzureTokenState {
     stop_flag: std::sync::atomic::AtomicBool,
 }
 
+/// Connection pool statistics for monitoring
+#[derive(Debug, Clone)]
+pub struct PoolStats {
+    /// Total number of connections in the pool
+    pub total_connections: usize,
+    /// Number of currently available permits (unused connections)
+    pub available_permits: usize,
+    /// Total queries executed since startup
+    pub total_queries: u64,
+    /// Whether Azure storage is configured
+    pub azure_configured: bool,
+    /// Whether S3 storage is configured  
+    pub s3_configured: bool,
+}
+
 /// DuckDB query executor with connection pool
 ///
 /// Maintains multiple DuckDB connections for parallel query execution.
@@ -63,6 +78,8 @@ pub struct DuckDbExecutor {
     azure_token_state: Arc<Mutex<Option<AzureTokenState>>>,
     /// Handle to background refresh thread
     _background_refresh_handle: Option<std::thread::JoinHandle<()>>,
+    /// Total queries executed counter for metrics
+    query_count: std::sync::atomic::AtomicU64,
 }
 
 impl DuckDbExecutor {
@@ -100,6 +117,7 @@ impl DuckDbExecutor {
             next_conn: std::sync::atomic::AtomicUsize::new(0),
             azure_token_state: azure_token_state.clone(),
             _background_refresh_handle: None,
+            query_count: std::sync::atomic::AtomicU64::new(0),
         };
 
         executor.configure_s3_all()?;
@@ -659,11 +677,11 @@ impl DuckDbExecutor {
             }
         }
 
-        if account_name.is_some() {
+        if let Some(ref name) = account_name {
             info!(
                 "Azure storage configured for {} connections (account: {})",
                 self.connections.len(),
-                account_name.as_ref().unwrap()
+                name
             );
         }
         if connection_string.is_some() {
@@ -691,6 +709,9 @@ impl DuckDbExecutor {
     /// Uses connection pool for parallel execution
     #[instrument(skip(self))]
     pub fn execute_query(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        // Increment query counter for metrics
+        self.query_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        
         // Background thread handles token refresh proactively
         // This is just a safety check for edge cases (e.g., if background thread failed)
         self.check_azure_token_emergency_refresh();
@@ -715,6 +736,9 @@ impl DuckDbExecutor {
         sql: &str,
         params: P,
     ) -> Result<Vec<RecordBatch>> {
+        // Increment query counter for metrics
+        self.query_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        
         let pooled_conn = self.get_connection();
         let conn = pooled_conn
             .connection
@@ -729,6 +753,17 @@ impl DuckDbExecutor {
     /// Get pool size
     pub fn pool_size(&self) -> usize {
         self.connections.len()
+    }
+
+    /// Get connection pool statistics for monitoring
+    pub fn stats(&self) -> PoolStats {
+        PoolStats {
+            total_connections: self.connections.len(),
+            available_permits: self.semaphore.available_permits(),
+            total_queries: self.query_count.load(std::sync::atomic::Ordering::Relaxed),
+            azure_configured: std::env::var("AZURE_STORAGE_ACCOUNT_NAME").is_ok(),
+            s3_configured: std::env::var("AWS_ACCESS_KEY_ID").is_ok(),
+        }
     }
 
     /// Set S3 credentials for accessing cloud storage

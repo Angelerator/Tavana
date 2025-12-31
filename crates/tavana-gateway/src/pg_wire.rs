@@ -22,7 +22,6 @@ use crate::smart_scaler::SmartScaler;
 use crate::tls_config::TlsConfig;
 use crate::worker_client::{StreamingBatch, WorkerClient};
 use crate::worker_pool::WorkerPoolManager;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -34,32 +33,25 @@ use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
 // ===== Server-Side Cursor Support =====
-// Enables Tableau and other BI tools to fetch large result sets in batches
-// Cursor support: Uses worker-side cursors for true streaming (no LIMIT/OFFSET re-scanning)
-// Falls back to LIMIT/OFFSET for workers that don't support cursor gRPC API
-
-/// Cursor state for server-side cursor support (DECLARE/FETCH/CLOSE)
-#[derive(Debug, Clone)]
-struct CursorState {
-    /// The SQL query this cursor executes
-    query: String,
-    /// Column metadata (cached from first execution)
-    columns: Vec<(String, String)>,
-    /// Current row offset (for LIMIT/OFFSET fallback pagination)
-    current_offset: usize,
-    /// Whether all rows have been fetched
-    exhausted: bool,
-    /// Worker ID holding this cursor (for affinity routing in true streaming mode)
-    /// If Some, FETCH commands route to this specific worker
-    worker_id: Option<String>,
-    /// Worker address for affinity routing
-    worker_addr: Option<String>,
-    /// Whether this cursor uses true streaming (worker-side) or fallback (LIMIT/OFFSET)
-    uses_true_streaming: bool,
-}
+// Cursor management extracted to `cursors` module for cleaner organization
+// See: crates/tavana-gateway/src/cursors.rs
+use crate::cursors::{self, ConnectionCursors, CursorResult};
 
 /// Maximum rows to buffer before flushing to client (backpressure control)
 const STREAMING_BATCH_SIZE: usize = 1000;
+
+/// Default query timeout in seconds (5 minutes)
+/// Prevents runaway queries from blocking resources indefinitely
+const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 300;
+
+/// Result of streaming query execution (for metrics tracking)
+#[derive(Debug, Default)]
+struct StreamingResult {
+    /// Total rows streamed to client
+    rows: usize,
+    /// Total bytes streamed to client
+    bytes: usize,
+}
 
 /// PostgreSQL wire protocol server with SmartScaler (Formula 3) and Query Queue
 ///
@@ -80,6 +72,8 @@ pub struct PgWireServer {
     smart_scaler: Option<Arc<SmartScaler>>,
     query_queue: Arc<QueryQueue>,
     tls_config: Option<Arc<TlsConfig>>,
+    /// Query timeout duration (prevents runaway queries)
+    query_timeout: Duration,
 }
 
 impl PgWireServer {
@@ -89,7 +83,9 @@ impl PgWireServer {
         worker_client: Arc<WorkerClient>,
         query_router: Arc<QueryRouter>,
     ) -> Self {
-        let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
+        let addr: SocketAddr = format!("0.0.0.0:{}", port)
+            .parse()
+            .expect("Invalid port number for SocketAddr");
         Self {
             addr,
             auth_service,
@@ -100,7 +96,14 @@ impl PgWireServer {
             smart_scaler: None,
             query_queue: QueryQueue::new(),
             tls_config: None,
+            query_timeout: Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS),
         }
+    }
+
+    /// Set custom query timeout
+    pub fn with_query_timeout(mut self, timeout_secs: u64) -> Self {
+        self.query_timeout = Duration::from_secs(timeout_secs);
+        self
     }
 
     /// Set TLS configuration for SSL connections
@@ -117,7 +120,9 @@ impl PgWireServer {
         query_router: Arc<QueryRouter>,
         pool_manager: Option<Arc<WorkerPoolManager>>,
     ) -> Self {
-        let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
+        let addr: SocketAddr = format!("0.0.0.0:{}", port)
+            .parse()
+            .expect("Invalid port number for SocketAddr");
 
         // Initialize Redis queue if available
         let redis_queue = match RedisQueue::new(RedisQueueConfig::from_env()).await {
@@ -141,6 +146,7 @@ impl PgWireServer {
             smart_scaler: None,
             query_queue: QueryQueue::new(),
             tls_config: None,
+            query_timeout: Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS),
         }
     }
 
@@ -178,7 +184,9 @@ impl PgWireServer {
         smart_scaler: Option<Arc<SmartScaler>>,
         query_queue: Arc<QueryQueue>,
     ) -> Self {
-        let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
+        let addr: SocketAddr = format!("0.0.0.0:{}", port)
+            .parse()
+            .expect("Invalid port number for SocketAddr");
 
         // Redis queue disabled - QueryQueue handles queuing
         let redis_queue: Option<Arc<RedisQueue>> = None;
@@ -202,6 +210,7 @@ impl PgWireServer {
             smart_scaler,
             query_queue,
             tls_config: None,
+            query_timeout: Duration::from_secs(DEFAULT_QUERY_TIMEOUT_SECS),
         }
     }
 
@@ -714,7 +723,7 @@ async fn handle_connection(
     let mut prepared_query: Option<String> = None;
     
     // Server-side cursor storage for this connection (non-TLS path)
-    let mut cursors: HashMap<String, CursorState> = HashMap::new();
+    let mut cursors = ConnectionCursors::new();
 
     // Main query loop
     loop {
@@ -754,7 +763,7 @@ async fn handle_connection(
                         query_trimmed = %query_trimmed,
                         "Detected DECLARE CURSOR command (non-TLS), attempting to handle"
                     );
-                    if let Some(result) = handle_declare_cursor(&query, &mut cursors, &worker_client, &user_id).await {
+                    if let Some(result) = cursors::handle_declare_cursor(&query, &mut cursors, &worker_client, &user_id).await {
                         info!(
                             cursor_count = cursors.len(),
                             "DECLARE CURSOR handled successfully (non-TLS)"
@@ -773,7 +782,7 @@ async fn handle_connection(
                 
                 // Handle FETCH
                 if query_trimmed.starts_with("FETCH ") {
-                    match handle_fetch_cursor(&query, &mut cursors, &worker_client, &user_id).await {
+                    match cursors::handle_fetch_cursor(&query, &mut cursors, &worker_client, &user_id).await {
                         Some(result) => {
                             let cols: Vec<(&str, i32)> = result.columns.iter()
                                 .map(|(n, _)| (n.as_str(), 25i32))
@@ -795,7 +804,7 @@ async fn handle_connection(
                 
                 // Handle CLOSE CURSOR
                 if query_trimmed.starts_with("CLOSE ") {
-                    let cursor_name = extract_cursor_name_from_close(&query);
+                    let cursor_name = cursors::parse_close_cursor(&query);
                     if let Some(name) = cursor_name {
                         if cursors.remove(&name).is_some() {
                             info!(cursor_name = %name, "Cursor closed (non-TLS)");
@@ -809,9 +818,7 @@ async fn handle_connection(
                 
                 // Handle CLOSE ALL
                 if query_trimmed == "CLOSE ALL" {
-                    let count = cursors.len();
-                    cursors.clear();
-                    info!(cursor_count = count, "All cursors closed (non-TLS)");
+                    cursors.close_all();
                     send_simple_result_generic(&mut socket, &[], &[], Some("CLOSE ALL")).await?;
                     socket.write_all(&ready).await?;
                     socket.flush().await?;
@@ -860,7 +867,7 @@ async fn handle_connection(
                                 );
                                 QueryOutcome::Success {
                                     rows: *row_count as u64,
-                                    bytes: 0, // TODO: track actual bytes
+                                    bytes: 0, // Note: StreamingResult type defined for future bytes tracking
                                     duration_ms,
                                 }
                             }
@@ -1087,7 +1094,7 @@ async fn run_query_loop(
     // Cache the column count from Describe to ensure Execute sends matching data
     let mut describe_column_count: usize = 0;
     // Server-side cursor storage for this connection
-    let mut cursors: HashMap<String, CursorState> = HashMap::new();
+    let mut cursors = ConnectionCursors::new();
 
     loop {
         let mut msg_type = [0u8; 1];
@@ -1123,9 +1130,9 @@ async fn run_query_loop(
                         query_trimmed = %query_trimmed,
                         "Detected DECLARE CURSOR command (non-TLS)"
                     );
-                    if let Some(result) = handle_declare_cursor(&query, &mut cursors, worker_client, user_id).await {
+                    if let Some(result) = cursors::handle_declare_cursor(&query, &mut cursors, worker_client, user_id).await {
                         info!(cursor_count = cursors.len(), "DECLARE CURSOR handled successfully (non-TLS)");
-                        send_query_result_immediate(socket, result).await?;
+                        send_query_result_immediate(socket, result.into()).await?;
                         socket.write_all(&ready).await?;
                         socket.flush().await?;
                         continue;
@@ -1136,9 +1143,9 @@ async fn run_query_loop(
                 
                 // Handle FETCH
                 if query_trimmed.starts_with("FETCH ") {
-                    match handle_fetch_cursor(&query, &mut cursors, worker_client, user_id).await {
+                    match cursors::handle_fetch_cursor(&query, &mut cursors, worker_client, user_id).await {
                         Some(result) => {
-                            send_query_result_immediate(socket, result).await?;
+                            send_query_result_immediate(socket, result.into()).await?;
                             socket.write_all(&ready).await?;
                             socket.flush().await?;
                             continue;
@@ -1155,12 +1162,10 @@ async fn run_query_loop(
                 
                 // Handle CLOSE cursor
                 if query_trimmed.starts_with("CLOSE ") {
-                    let cursor_name = extract_cursor_name_from_close(&query);
+                    let cursor_name = cursors::parse_close_cursor(&query);
                     if let Some(name) = cursor_name {
                         if name == "__ALL__" {
-                            let count = cursors.len();
-                            cursors.clear();
-                            info!("Closed all {} cursors", count);
+                            cursors.close_all();
                         } else {
                             cursors.remove(&name);
                             info!("Closed cursor: {}", name);
@@ -1332,7 +1337,7 @@ where
     let mut describe_column_count: usize = 0;
     // Server-side cursor storage for this connection
     // Enables DECLARE CURSOR / FETCH / CLOSE for large result sets
-    let mut cursors: HashMap<String, CursorState> = HashMap::new();
+    let mut cursors = ConnectionCursors::new();
 
     loop {
         let mut msg_type = [0u8; 1];
@@ -1377,7 +1382,7 @@ where
                         query_trimmed = %query_trimmed,
                         "Detected DECLARE CURSOR command, attempting to handle"
                     );
-                    if let Some(result) = handle_declare_cursor(&query, &mut cursors, worker_client, user_id).await {
+                    if let Some(result) = cursors::handle_declare_cursor(&query, &mut cursors, worker_client, user_id).await {
                         info!(
                             cursor_count = cursors.len(),
                             "DECLARE CURSOR handled successfully"
@@ -1396,7 +1401,7 @@ where
                 
                 // Handle FETCH
                 if query_trimmed.starts_with("FETCH ") {
-                    match handle_fetch_cursor(&query, &mut cursors, worker_client, user_id).await {
+                    match cursors::handle_fetch_cursor(&query, &mut cursors, worker_client, user_id).await {
                         Some(result) => {
                             let cols: Vec<(&str, i32)> = result.columns.iter()
                                 .map(|(n, _)| (n.as_str(), 25i32))
@@ -1418,12 +1423,10 @@ where
                 
                 // Handle CLOSE cursor
                 if query_trimmed.starts_with("CLOSE ") {
-                    let cursor_name = extract_cursor_name_from_close(&query);
+                    let cursor_name = cursors::parse_close_cursor(&query);
                     if let Some(name) = cursor_name {
                         if name == "__ALL__" {
-                            let count = cursors.len();
-                            cursors.clear();
-                            info!("Closed all {} cursors", count);
+                            cursors.close_all();
                         } else {
                             cursors.remove(&name);
                             info!("Closed cursor: {}", name);
@@ -2656,204 +2659,6 @@ fn extract_copy_inner_query(sql: &str) -> Option<String> {
     }
 }
 
-// ===== Server-Side Cursor Implementation =====
-// These functions implement PostgreSQL cursor semantics for large result sets
-// Uses LIMIT/OFFSET pagination (true streaming via worker gRPC API is planned)
-
-/// Handle DECLARE cursor_name CURSOR FOR select_query
-/// Parses the cursor declaration and stores it in the connection's cursor map
-/// 
-/// Currently uses LIMIT/OFFSET pagination. For true streaming without re-scanning:
-/// 1. Worker declares cursor via DeclareCursor gRPC
-/// 2. Gateway stores worker_id for affinity routing
-/// 3. FETCH routes to same worker, which iterates without re-execution
-async fn handle_declare_cursor(
-    sql: &str,
-    cursors: &mut HashMap<String, CursorState>,
-    worker_client: &WorkerClient,
-    user_id: &str,
-) -> Option<QueryExecutionResult> {
-    // Parse: DECLARE cursor_name CURSOR FOR SELECT ...
-    let sql_upper = sql.to_uppercase();
-    debug!(sql_upper = %sql_upper, "Parsing DECLARE CURSOR");
-    
-    // Find cursor name (between DECLARE and CURSOR)
-    let declare_pos = sql_upper.find("DECLARE");
-    let cursor_pos = sql_upper.find(" CURSOR ");
-    
-    debug!(declare_pos = ?declare_pos, cursor_pos = ?cursor_pos, "Found positions");
-    
-    let declare_pos = declare_pos?;
-    let cursor_pos = cursor_pos?;
-    let cursor_name = sql[declare_pos + 7..cursor_pos].trim().to_string();
-    
-    // Find the SELECT query (after "FOR")
-    let for_pos = sql_upper.find(" FOR ");
-    debug!(for_pos = ?for_pos, cursor_name = %cursor_name, "Parsing FOR position");
-    
-    let for_pos = for_pos?;
-    // Strip trailing semicolon from the inner query
-    let query = sql[for_pos + 5..].trim().trim_end_matches(';').trim().to_string();
-    
-    if cursor_name.is_empty() || query.is_empty() {
-        debug!(cursor_name = %cursor_name, query = %query, "Empty cursor name or query");
-        return None;
-    }
-    
-    info!(
-        cursor_name = %cursor_name,
-        query_preview = %&query[..query.len().min(80)],
-        "DECLARE CURSOR - using LIMIT/OFFSET pagination"
-    );
-    
-    // Execute query once to get column metadata (with LIMIT 0 for efficiency)
-    // Strip trailing semicolon if present to construct valid SQL
-    let query_clean = query.trim().trim_end_matches(';');
-    let metadata_query = format!("{} LIMIT 0", query_clean);
-    let columns = match worker_client.execute_query(&metadata_query, user_id).await {
-        Ok(result) => result.columns.iter()
-            .map(|c| (c.name.clone(), c.type_name.clone()))
-            .collect(),
-        Err(e) => {
-            warn!("Failed to get cursor column metadata: {}", e);
-            Vec::new()
-        }
-    };
-    
-    // Store cursor state (using LIMIT/OFFSET fallback)
-    // True streaming would set worker_id and worker_addr from DeclareCursor gRPC response
-    cursors.insert(cursor_name.clone(), CursorState {
-        query,
-        columns,
-        current_offset: 0,
-        exhausted: false,
-        worker_id: None,           // Would be Some() for true streaming
-        worker_addr: None,         // Would be Some() for true streaming  
-        uses_true_streaming: false, // LIMIT/OFFSET fallback
-    });
-    
-    Some(QueryExecutionResult {
-        columns: vec![],
-        rows: vec![],
-        row_count: 0,
-        command_tag: Some("DECLARE CURSOR".to_string()),
-    })
-}
-
-/// Handle FETCH count FROM cursor_name
-/// Fetches the next batch of rows using LIMIT/OFFSET
-async fn handle_fetch_cursor(
-    sql: &str,
-    cursors: &mut HashMap<String, CursorState>,
-    worker_client: &WorkerClient,
-    user_id: &str,
-) -> Option<QueryExecutionResult> {
-    // Parse: FETCH count FROM cursor_name
-    // or: FETCH FORWARD count FROM cursor_name
-    // or: FETCH ALL FROM cursor_name
-    let sql_upper = sql.to_uppercase();
-    let sql_trimmed = sql_upper.trim();
-    
-    // Find "FROM" position
-    let from_pos = sql_upper.find(" FROM ")?;
-    let cursor_name = sql[from_pos + 6..].trim().trim_end_matches(';').to_string();
-    
-    // Parse fetch count (between FETCH and FROM)
-    let fetch_part = sql_trimmed[5..].trim(); // After "FETCH"
-    let from_idx = fetch_part.find(" FROM ").unwrap_or(fetch_part.len());
-    let count_part = fetch_part[..from_idx].trim();
-    
-    let fetch_count: usize = if count_part.eq_ignore_ascii_case("ALL") {
-        usize::MAX // Fetch all remaining
-    } else if count_part.starts_with("FORWARD ") {
-        count_part[8..].trim().parse().unwrap_or(1)
-    } else {
-        count_part.parse().unwrap_or(1)
-    };
-    
-    // Get cursor state
-    let cursor = cursors.get_mut(&cursor_name)?;
-    
-    if cursor.exhausted {
-        // Cursor is exhausted, return empty result
-        return Some(QueryExecutionResult {
-            columns: cursor.columns.clone(),
-            rows: vec![],
-            row_count: 0,
-            command_tag: Some("FETCH 0".to_string()),
-        });
-    }
-    
-    // Build paginated query
-    let paginated_query = if fetch_count == usize::MAX {
-        format!("{} OFFSET {}", cursor.query, cursor.current_offset)
-    } else {
-        format!("{} LIMIT {} OFFSET {}", cursor.query, fetch_count, cursor.current_offset)
-    };
-    
-    debug!("FETCH {} FROM {}: executing {}", fetch_count, cursor_name, &paginated_query[..paginated_query.len().min(100)]);
-    
-    // Execute paginated query
-    match worker_client.execute_query(&paginated_query, user_id).await {
-        Ok(result) => {
-            let row_count = result.rows.len();
-            
-            // Update cursor position
-            cursor.current_offset += row_count;
-            
-            // Check if cursor is exhausted
-            if row_count == 0 || (fetch_count != usize::MAX && row_count < fetch_count) {
-                cursor.exhausted = true;
-            }
-            
-            info!("FETCH {} FROM {}: returned {} rows (offset now {})", 
-                fetch_count, cursor_name, row_count, cursor.current_offset);
-            
-            // Use cached column metadata if available
-            let columns = if cursor.columns.is_empty() {
-                result.columns.iter()
-                    .map(|c| (c.name.clone(), c.type_name.clone()))
-                    .collect()
-            } else {
-                cursor.columns.clone()
-            };
-            
-            Some(QueryExecutionResult {
-                columns,
-                rows: result.rows,
-                row_count,
-                command_tag: Some(format!("FETCH {}", row_count)),
-            })
-        }
-        Err(e) => {
-            warn!("FETCH error: {}", e);
-            Some(QueryExecutionResult {
-                columns: cursor.columns.clone(),
-                rows: vec![],
-                row_count: 0,
-                command_tag: Some("FETCH 0".to_string()),
-            })
-        }
-    }
-}
-
-/// Extract cursor name from CLOSE command
-fn extract_cursor_name_from_close(sql: &str) -> Option<String> {
-    let sql_upper = sql.to_uppercase();
-    let sql_trimmed = sql_upper.trim();
-    
-    if sql_trimmed.starts_with("CLOSE ") {
-        let name = sql[6..].trim().trim_end_matches(';').to_string();
-        if !name.is_empty() && name != "ALL" {
-            return Some(name);
-        } else if name == "ALL" {
-            // CLOSE ALL is handled by clearing all cursors
-            return Some("__ALL__".to_string());
-        }
-    }
-    None
-}
-
 fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
     let sql_upper = sql.to_uppercase();
     let sql_trimmed = sql_upper.trim();
@@ -2986,6 +2791,17 @@ struct QueryExecutionResult {
     rows: Vec<Vec<String>>,
     row_count: usize,
     command_tag: Option<String>,
+}
+
+impl From<CursorResult> for QueryExecutionResult {
+    fn from(r: CursorResult) -> Self {
+        Self {
+            columns: r.columns,
+            rows: r.rows,
+            row_count: r.row_count,
+            command_tag: r.command_tag,
+        }
+    }
 }
 
 /// Send RowDescription message
