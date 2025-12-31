@@ -1793,6 +1793,9 @@ async fn execute_query_streaming(
 }
 
 /// Execute query with SmartScaler (Formula 3) lifecycle management
+/// 
+/// `extended_protocol`: If true, we're in Extended Query Protocol and RowDescription
+/// was already sent during Describe phase. We should NOT send it again in Execute.
 async fn execute_query_streaming_with_scaler(
     socket: &mut tokio::net::TcpStream,
     worker_client: &WorkerClient,
@@ -1801,9 +1804,39 @@ async fn execute_query_streaming_with_scaler(
     user_id: &str,
     smart_scaler: Option<&SmartScaler>,
 ) -> anyhow::Result<usize> {
+    execute_query_streaming_impl(socket, worker_client, query_router, sql, user_id, smart_scaler, false).await
+}
+
+/// Execute query for Extended Query Protocol (Describe already sent RowDescription)
+async fn execute_query_streaming_extended(
+    socket: &mut tokio::net::TcpStream,
+    worker_client: &WorkerClient,
+    query_router: &QueryRouter,
+    sql: &str,
+    user_id: &str,
+    smart_scaler: Option<&SmartScaler>,
+) -> anyhow::Result<usize> {
+    execute_query_streaming_impl(socket, worker_client, query_router, sql, user_id, smart_scaler, true).await
+}
+
+/// Internal implementation with skip_row_description flag
+async fn execute_query_streaming_impl(
+    socket: &mut tokio::net::TcpStream,
+    worker_client: &WorkerClient,
+    query_router: &QueryRouter,
+    sql: &str,
+    user_id: &str,
+    smart_scaler: Option<&SmartScaler>,
+    skip_row_description: bool,
+) -> anyhow::Result<usize> {
     // Handle PostgreSQL-specific commands locally
     if let Some(result) = handle_pg_specific_command(sql) {
-        send_query_result_immediate(socket, result).await?;
+        if skip_row_description {
+            // Extended protocol: only send DataRows and CommandComplete
+            send_query_result_data_only(socket, result).await?;
+        } else {
+            send_query_result_immediate(socket, result).await?;
+        }
         return Ok(0);
     }
 
@@ -1816,12 +1849,13 @@ async fn execute_query_streaming_with_scaler(
     info!(
         data_mb = estimate.data_size_mb,
         target = ?estimate.target,
+        skip_row_desc = skip_row_description,
         "Query routed for streaming execution"
     );
 
     // If SmartScaler is available, use it for worker selection and pre-sizing
     if let Some(scaler) = smart_scaler {
-        return execute_with_smart_scaler(
+        return execute_with_smart_scaler_impl(
             socket,
             worker_client,
             query_router,
@@ -1829,6 +1863,7 @@ async fn execute_query_streaming_with_scaler(
             sql,
             user_id,
             &estimate,
+            skip_row_description,
         )
         .await;
     }
@@ -1841,7 +1876,7 @@ async fn execute_query_streaming_with_scaler(
         } => {
             info!("Using pre-sized worker {} at {}", worker_name, address);
             metrics::update_worker_active_queries(&worker_name, 1);
-            let result = execute_query_streaming_to_worker(socket, &address, sql, user_id).await;
+            let result = execute_query_streaming_to_worker_impl(socket, &address, sql, user_id, skip_row_description).await;
             metrics::update_worker_active_queries(&worker_name, 0);
             (result, Some(worker_name))
         }
@@ -1851,11 +1886,11 @@ async fn execute_query_streaming_with_scaler(
         } => {
             info!("Using tenant pool {} at {}", tenant_id, service_addr);
             let result =
-                execute_query_streaming_to_worker(socket, &service_addr, sql, user_id).await;
+                execute_query_streaming_to_worker_impl(socket, &service_addr, sql, user_id, skip_row_description).await;
             (result, None)
         }
         QueryTarget::WorkerPool => {
-            let result = execute_query_streaming_default(socket, worker_client, sql, user_id).await;
+            let result = execute_query_streaming_default_impl(socket, worker_client, sql, user_id, skip_row_description).await;
             (result, None)
         }
     };
@@ -1880,6 +1915,20 @@ async fn execute_with_smart_scaler(
     sql: &str,
     user_id: &str,
     estimate: &crate::query_router::QueryEstimate,
+) -> anyhow::Result<usize> {
+    execute_with_smart_scaler_impl(socket, worker_client, query_router, scaler, sql, user_id, estimate, false).await
+}
+
+/// Execute query with SmartScaler - internal implementation with skip_row_description flag
+async fn execute_with_smart_scaler_impl(
+    socket: &mut tokio::net::TcpStream,
+    worker_client: &WorkerClient,
+    query_router: &QueryRouter,
+    scaler: &SmartScaler,
+    sql: &str,
+    user_id: &str,
+    estimate: &crate::query_router::QueryEstimate,
+    skip_row_description: bool,
 ) -> anyhow::Result<usize> {
     let query_id = uuid::Uuid::new_v4().to_string();
 
@@ -1909,7 +1958,7 @@ async fn execute_with_smart_scaler(
             // If still no worker, fall back to worker pool
             warn!("No SmartScaler worker available after waiting, falling back to pool");
             metrics::query_ended();
-            return execute_query_streaming_default(socket, worker_client, sql, user_id).await;
+            return execute_query_streaming_default_impl(socket, worker_client, sql, user_id, skip_row_description).await;
         }
     };
 
@@ -1949,7 +1998,7 @@ async fn execute_with_smart_scaler(
 
     // Step 5: Execute query
     let result =
-        execute_query_streaming_to_worker(socket, &selection.worker_address, sql, user_id).await;
+        execute_query_streaming_to_worker_impl(socket, &selection.worker_address, sql, user_id, skip_row_description).await;
 
     // Step 6: Clean up - abort elastic monitoring
     elastic_handle.abort();
@@ -1979,6 +2028,17 @@ async fn execute_query_streaming_to_worker(
     worker_addr: &str,
     sql: &str,
     user_id: &str,
+) -> anyhow::Result<usize> {
+    execute_query_streaming_to_worker_impl(socket, worker_addr, sql, user_id, false).await
+}
+
+/// Stream query results - internal implementation with skip_row_description flag
+async fn execute_query_streaming_to_worker_impl(
+    socket: &mut tokio::net::TcpStream,
+    worker_addr: &str,
+    sql: &str,
+    user_id: &str,
+    skip_row_description: bool,
 ) -> anyhow::Result<usize> {
     use tokio::io::AsyncWriteExt;
 
@@ -2029,11 +2089,11 @@ async fn execute_query_streaming_to_worker(
     while let Some(batch) = stream.message().await? {
         match batch.result {
             Some(proto::query_result_batch::Result::Metadata(meta)) => {
-                // Send RowDescription once
-                if !columns_sent {
+                // Send RowDescription once (unless in Extended Protocol where Describe already sent it)
+                if !columns_sent && !skip_row_description {
                     send_row_description(socket, &meta.columns, &meta.column_types).await?;
-                    columns_sent = true;
                 }
+                columns_sent = true;
             }
             Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
                 if !batch.data.is_empty() {
@@ -2064,8 +2124,8 @@ async fn execute_query_streaming_to_worker(
         }
     }
 
-    // If no columns were sent (empty result), send empty row description
-    if !columns_sent {
+    // If no columns were sent (empty result) and not in extended protocol, send empty row description
+    if !columns_sent && !skip_row_description {
         send_row_description(socket, &[], &[]).await?;
     }
 
@@ -2083,6 +2143,17 @@ async fn execute_query_streaming_default(
     sql: &str,
     user_id: &str,
 ) -> anyhow::Result<usize> {
+    execute_query_streaming_default_impl(socket, worker_client, sql, user_id, false).await
+}
+
+/// Stream query results using the default worker client - internal implementation
+async fn execute_query_streaming_default_impl(
+    socket: &mut tokio::net::TcpStream,
+    worker_client: &WorkerClient,
+    sql: &str,
+    user_id: &str,
+    skip_row_description: bool,
+) -> anyhow::Result<usize> {
     use tokio::io::AsyncWriteExt;
 
     // For the default path, we still need to use the existing client
@@ -2099,10 +2170,11 @@ async fn execute_query_streaming_default(
                         columns,
                         column_types,
                     } => {
-                        if !columns_sent {
+                        // Send RowDescription once (unless in Extended Protocol where Describe already sent it)
+                        if !columns_sent && !skip_row_description {
                             send_row_description(socket, &columns, &column_types).await?;
-                            columns_sent = true;
                         }
+                        columns_sent = true;
                     }
                     StreamingBatch::Rows(rows) => {
                         for row in rows {
@@ -2122,7 +2194,8 @@ async fn execute_query_streaming_default(
                 }
             }
 
-            if !columns_sent {
+            // If no columns were sent and not in extended protocol, send empty row description
+            if !columns_sent && !skip_row_description {
                 send_row_description(socket, &[], &[]).await?;
             }
 
@@ -2135,7 +2208,11 @@ async fn execute_query_streaming_default(
             // Fallback to non-streaming for compatibility
             warn!("Streaming not available, falling back to buffered: {}", e);
             let result = execute_query_buffered(worker_client, sql, user_id).await?;
-            send_query_result_immediate(socket, result).await
+            if skip_row_description {
+                send_query_result_data_only(socket, result).await
+            } else {
+                send_query_result_immediate(socket, result).await
+            }
         }
     }
 }
@@ -2422,6 +2499,41 @@ async fn send_query_result_immediate(
     send_row_description(socket, &columns, &types).await?;
 
     // Send data rows
+    let mut count = 0;
+    for row in &result.rows {
+        send_data_row(socket, row).await?;
+        count += 1;
+
+        // Flush periodically
+        if count % STREAMING_BATCH_SIZE == 0 {
+            socket.flush().await?;
+        }
+    }
+
+    let tag = format!("SELECT {}", result.rows.len());
+    send_command_complete(socket, &tag).await?;
+
+    Ok(result.rows.len())
+}
+
+/// Send query result without RowDescription (for Extended Query Protocol where Describe already sent it)
+async fn send_query_result_data_only(
+    socket: &mut tokio::net::TcpStream,
+    result: QueryExecutionResult,
+) -> anyhow::Result<usize> {
+    use tokio::io::AsyncWriteExt;
+
+    if result.columns.is_empty() {
+        let tag = result
+            .command_tag
+            .unwrap_or_else(|| format!("OK {}", result.row_count));
+        send_command_complete(socket, &tag).await?;
+        return Ok(0);
+    }
+
+    // DO NOT send row description - Describe already sent it in Extended Protocol
+    
+    // Send data rows only
     let mut count = 0;
     for row in &result.rows {
         send_data_row(socket, row).await?;
@@ -2878,7 +2990,9 @@ async fn handle_execute_extended(
         Ok(query_token) => {
             let start = std::time::Instant::now();
 
-            let result = execute_query_streaming_with_scaler(
+            // Use extended protocol version that skips RowDescription
+            // (Describe already sent it)
+            let result = execute_query_streaming_extended(
                 socket,
                 worker_client,
                 query_router,
@@ -2896,7 +3010,7 @@ async fn handle_execute_extended(
                         rows = row_count,
                         wait_ms = query_token.queue_wait_ms(),
                         exec_ms = duration_ms,
-                        "Extended query completed (streaming)"
+                        "Extended query completed (streaming, no RowDesc)"
                     );
                     QueryOutcome::Success {
                         rows: *row_count as u64,
