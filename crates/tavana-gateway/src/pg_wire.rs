@@ -2665,7 +2665,8 @@ async fn handle_declare_cursor(
     debug!(for_pos = ?for_pos, cursor_name = %cursor_name, "Parsing FOR position");
     
     let for_pos = for_pos?;
-    let query = sql[for_pos + 5..].trim().to_string();
+    // Strip trailing semicolon from the inner query
+    let query = sql[for_pos + 5..].trim().trim_end_matches(';').trim().to_string();
     
     if cursor_name.is_empty() || query.is_empty() {
         debug!(cursor_name = %cursor_name, query = %query, "Empty cursor name or query");
@@ -2679,7 +2680,9 @@ async fn handle_declare_cursor(
     );
     
     // Execute query once to get column metadata (with LIMIT 0 for efficiency)
-    let metadata_query = format!("{} LIMIT 0", query);
+    // Strip trailing semicolon if present to construct valid SQL
+    let query_clean = query.trim().trim_end_matches(';');
+    let metadata_query = format!("{} LIMIT 0", query_clean);
     let columns = match worker_client.execute_query(&metadata_query, user_id).await {
         Ok(result) => result.columns.iter()
             .map(|c| (c.name.clone(), c.type_name.clone()))
