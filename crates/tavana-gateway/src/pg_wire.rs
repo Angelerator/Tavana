@@ -1296,15 +1296,18 @@ where
                 socket.flush().await?;
             }
             b'E' => {
-                // Execute
+                // Execute - for Extended Query Protocol
+                // RowDescription was already sent during Describe phase
+                // We only send DataRows and CommandComplete here
                 socket.read_exact(&mut buf).await?;
                 let len = u32::from_be_bytes(buf) as usize - 4;
                 let mut data = vec![0u8; len];
                 socket.read_exact(&mut data).await?;
                 
                 if let Some(ref sql) = prepared_query {
-                    // Execute the prepared query
-                    let result = execute_query_tls(
+                    // Execute the prepared query - use extended protocol version
+                    // that doesn't send RowDescription again
+                    let result = execute_query_extended_protocol(
                         socket,
                         worker_client,
                         query_router,
@@ -1316,17 +1319,18 @@ where
                     if let Err(e) = result {
                         send_error_generic(socket, &e.to_string()).await?;
                     }
+                    // CommandComplete is sent by execute_query_extended_protocol
+                } else {
+                    // No prepared statement - send empty CommandComplete
+                    let cmd = b"SELECT 0";
+                    let cmd_len = (4 + cmd.len() + 1) as u32;
+                    let mut msg = vec![b'C'];
+                    msg.extend_from_slice(&cmd_len.to_be_bytes());
+                    msg.extend_from_slice(cmd);
+                    msg.push(0);
+                    socket.write_all(&msg).await?;
+                    socket.flush().await?;
                 }
-                
-                // Send CommandComplete
-                let cmd = b"SELECT 0";
-                let cmd_len = (4 + cmd.len() + 1) as u32;
-                let mut msg = vec![b'C'];
-                msg.extend_from_slice(&cmd_len.to_be_bytes());
-                msg.extend_from_slice(cmd);
-                msg.push(0);
-                socket.write_all(&msg).await?;
-                socket.flush().await?;
                 
                 prepared_query = None;
             }
@@ -1469,6 +1473,78 @@ where
     Ok(row_count)
 }
 
+/// Execute query for Extended Query Protocol (Parse/Bind/Describe/Execute)
+/// Unlike execute_query_tls, this does NOT send RowDescription because
+/// it was already sent during the Describe phase
+async fn execute_query_extended_protocol<S>(
+    socket: &mut S,
+    worker_client: &WorkerClient,
+    query_router: &QueryRouter,
+    sql: &str,
+    user_id: &str,
+    _smart_scaler: Option<&SmartScaler>,
+) -> anyhow::Result<usize>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use crate::query_router::QueryTarget;
+    
+    // Handle PostgreSQL-specific commands locally
+    if let Some(result) = handle_pg_specific_command(sql) {
+        // For extended protocol, don't send RowDescription again
+        send_data_rows_only_generic(socket, &result.rows, result.rows.len()).await?;
+        return Ok(result.rows.len());
+    }
+    
+    // Handle COPY commands by extracting inner query
+    let actual_sql = if let Some(inner) = extract_copy_inner_query(sql) {
+        debug!("Extended Protocol Execute - Converted COPY to SELECT");
+        inner
+    } else {
+        sql.to_string()
+    };
+    let sql = &actual_sql;
+
+    metrics::query_started();
+
+    let estimate = query_router.route(sql).await;
+    debug!(
+        data_mb = estimate.data_size_mb,
+        target = ?estimate.target,
+        "Extended Protocol - Query routed"
+    );
+
+    // Execute query on the routed target worker
+    let (_columns, rows) = match &estimate.target {
+        QueryTarget::PreSizedWorker { address, worker_name } => {
+            debug!("Extended Protocol - Executing on pre-sized worker: {}", worker_name);
+            execute_query_on_worker_buffered(address, sql, user_id).await?
+        }
+        QueryTarget::TenantPool { service_addr, tenant_id } => {
+            debug!("Extended Protocol - Executing on tenant pool: {}", tenant_id);
+            execute_query_on_worker_buffered(service_addr, sql, user_id).await?
+        }
+        QueryTarget::WorkerPool => {
+            // Fallback to default worker client
+            let result = worker_client.execute_query(sql, user_id).await?;
+            let cols: Vec<(String, String)> = result.columns.iter()
+                .map(|c| (c.name.clone(), c.type_name.clone()))
+                .collect();
+            (cols, result.rows)
+        }
+    };
+    
+    let row_count = rows.len();
+    
+    // For Extended Protocol, only send DataRows and CommandComplete
+    // RowDescription was already sent during Describe phase
+    send_data_rows_only_generic(socket, &rows, row_count).await?;
+    
+    debug!("Extended Protocol Execute completed: {} rows", row_count);
+    
+    Ok(row_count)
+}
+
 /// Execute query on a specific worker address and return buffered results
 async fn execute_query_on_worker_buffered(
     worker_addr: &str,
@@ -1589,6 +1665,43 @@ where
 
     // Send CommandComplete
     let cmd = format!("SELECT {}", rows.len());
+    let cmd_bytes = cmd.as_bytes();
+    let mut complete = vec![b'C'];
+    complete.extend_from_slice(&((4 + cmd_bytes.len() + 1) as u32).to_be_bytes());
+    complete.extend_from_slice(cmd_bytes);
+    complete.push(0);
+    socket.write_all(&complete).await?;
+    socket.flush().await?;
+
+    Ok(())
+}
+
+/// Send only DataRows (no RowDescription) for Extended Query Protocol Execute phase
+/// In Extended Protocol, RowDescription is sent during Describe, not Execute
+async fn send_data_rows_only_generic<S>(socket: &mut S, rows: &[Vec<String>], row_count: usize) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    // Send DataRows only - RowDescription was already sent during Describe
+    for row in rows {
+        let mut data_row = vec![b'D'];
+        let mut row_data = Vec::new();
+        row_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
+
+        for val in row {
+            let bytes = val.as_bytes();
+            row_data.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+            row_data.extend_from_slice(bytes);
+        }
+
+        let row_len = (4 + row_data.len()) as u32;
+        data_row.extend_from_slice(&row_len.to_be_bytes());
+        data_row.extend_from_slice(&row_data);
+        socket.write_all(&data_row).await?;
+    }
+
+    // Send CommandComplete
+    let cmd = format!("SELECT {}", row_count);
     let cmd_bytes = cmd.as_bytes();
     let mut complete = vec![b'C'];
     complete.extend_from_slice(&((4 + cmd_bytes.len() + 1) as u32).to_be_bytes());
