@@ -168,6 +168,37 @@ impl ConnectionCursors {
     pub fn iter(&self) -> impl Iterator<Item = (&String, &CursorState)> {
         self.cursors.iter()
     }
+
+    /// Validate true-streaming cursors with their workers and remove orphaned ones
+    /// Returns the number of cursors removed due to worker unreachability
+    pub async fn validate_worker_cursors(&mut self, worker_client: &crate::worker_client::WorkerClient) -> usize {
+        let mut orphaned = Vec::new();
+
+        for (name, cursor) in self.cursors.iter() {
+            if cursor.uses_true_streaming {
+                // Check if the cursor still exists on the worker
+                if !worker_client.cursor_exists(name).await {
+                    orphaned.push(name.clone());
+                }
+            }
+        }
+
+        for name in &orphaned {
+            info!(cursor = %name, "Removing orphaned cursor (worker no longer has it)");
+            self.cursors.remove(name);
+        }
+
+        orphaned.len()
+    }
+
+    /// Get list of cursors using true streaming (for health monitoring)
+    pub fn true_streaming_cursors(&self) -> Vec<String> {
+        self.cursors
+            .iter()
+            .filter(|(_, c)| c.uses_true_streaming)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
 }
 
 impl Default for ConnectionCursors {

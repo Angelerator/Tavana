@@ -606,10 +606,14 @@ impl SmartScaler {
             self.namespace
         );
 
-        match self
-            .client
-            .request_text(http::Request::get(&url).body(Default::default()).unwrap())
-            .await
+        let request = match http::Request::get(&url).body(Default::default()) {
+            Ok(req) => req,
+            Err(e) => {
+                warn!("Failed to build metrics request: {}", e);
+                return HashMap::new();
+            }
+        };
+        match self.client.request_text(request).await
         {
             Ok(response) => {
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&response) {
@@ -902,8 +906,7 @@ impl SmartScaler {
             .filter(|w| w.is_truly_idle() || w.is_too_old())
             .collect();
 
-        if !removable.is_empty() {
-            let first = removable.first().unwrap();
+        if let Some(first) = removable.first() {
             let reason = if first.is_too_old() {
                 format!(
                     "Force recycle: {} age={}h (max={}h)",
@@ -1030,7 +1033,10 @@ impl SmartScaler {
         let to_remove = (removable_workers.len() as i32).min(can_remove).min(1); // Max 1 at a time
 
         if to_remove > 0 {
-            let first_removable = removable_workers.first().unwrap();
+            // Safe: to_remove > 0 guarantees removable_workers is non-empty
+            let first_removable = removable_workers
+                .first()
+                .expect("to_remove > 0 guarantees at least one removable worker");
             let reason = if first_removable.is_too_old() {
                 format!(
                     "Force recycle: worker {} age={}h (max={}h)",
