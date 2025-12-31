@@ -6,8 +6,11 @@
 //! 1. gRPC service mode (default): Long-running service for query execution
 //! 2. One-shot mode: Execute a single query from QUERY_SQL env var and exit
 
+mod cursor_manager;
 mod executor;
 mod grpc;
+
+pub use cursor_manager::{CursorManager, CursorManagerConfig};
 
 use crate::executor::{DuckDbExecutor, ExecutorConfig};
 use crate::grpc::QueryServiceImpl;
