@@ -1041,11 +1041,18 @@ async fn run_query_loop(
                 
                 // Handle DECLARE CURSOR
                 if query_trimmed.starts_with("DECLARE ") && query_trimmed.contains(" CURSOR ") {
+                    debug!(
+                        query_trimmed = %query_trimmed,
+                        "Detected DECLARE CURSOR command (non-TLS)"
+                    );
                     if let Some(result) = handle_declare_cursor(&query, &mut cursors, worker_client, user_id).await {
+                        info!(cursor_count = cursors.len(), "DECLARE CURSOR handled successfully (non-TLS)");
                         send_query_result_immediate(socket, result).await?;
                         socket.write_all(&ready).await?;
                         socket.flush().await?;
                         continue;
+                    } else {
+                        warn!(query = %query, "DECLARE CURSOR parsing failed (non-TLS)");
                     }
                 }
                 
@@ -1270,11 +1277,24 @@ where
                 
                 // Handle DECLARE CURSOR
                 if query_trimmed.starts_with("DECLARE ") && query_trimmed.contains(" CURSOR ") {
+                    debug!(
+                        query_trimmed = %query_trimmed,
+                        "Detected DECLARE CURSOR command, attempting to handle"
+                    );
                     if let Some(result) = handle_declare_cursor(&query, &mut cursors, worker_client, user_id).await {
+                        info!(
+                            cursor_count = cursors.len(),
+                            "DECLARE CURSOR handled successfully"
+                        );
                         send_simple_result_generic(socket, &[], &[], result.command_tag.as_deref()).await?;
                         socket.write_all(&ready).await?;
                         socket.flush().await?;
                         continue;
+                    } else {
+                        warn!(
+                            query = %query,
+                            "DECLARE CURSOR parsing failed, forwarding to worker"
+                        );
                     }
                 }
                 
@@ -2550,17 +2570,27 @@ async fn handle_declare_cursor(
 ) -> Option<QueryExecutionResult> {
     // Parse: DECLARE cursor_name CURSOR FOR SELECT ...
     let sql_upper = sql.to_uppercase();
+    debug!(sql_upper = %sql_upper, "Parsing DECLARE CURSOR");
     
     // Find cursor name (between DECLARE and CURSOR)
-    let declare_pos = sql_upper.find("DECLARE")?;
-    let cursor_pos = sql_upper.find(" CURSOR ")?;
+    let declare_pos = sql_upper.find("DECLARE");
+    let cursor_pos = sql_upper.find(" CURSOR ");
+    
+    debug!(declare_pos = ?declare_pos, cursor_pos = ?cursor_pos, "Found positions");
+    
+    let declare_pos = declare_pos?;
+    let cursor_pos = cursor_pos?;
     let cursor_name = sql[declare_pos + 7..cursor_pos].trim().to_string();
     
     // Find the SELECT query (after "FOR")
-    let for_pos = sql_upper.find(" FOR ")?;
+    let for_pos = sql_upper.find(" FOR ");
+    debug!(for_pos = ?for_pos, cursor_name = %cursor_name, "Parsing FOR position");
+    
+    let for_pos = for_pos?;
     let query = sql[for_pos + 5..].trim().to_string();
     
     if cursor_name.is_empty() || query.is_empty() {
+        debug!(cursor_name = %cursor_name, query = %query, "Empty cursor name or query");
         return None;
     }
     
