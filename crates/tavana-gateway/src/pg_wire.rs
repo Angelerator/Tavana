@@ -712,6 +712,9 @@ async fn handle_connection(
 
     // State for extended query protocol
     let mut prepared_query: Option<String> = None;
+    
+    // Server-side cursor storage for this connection (non-TLS path)
+    let mut cursors: HashMap<String, CursorState> = HashMap::new();
 
     // Main query loop
     loop {
@@ -728,6 +731,7 @@ async fn handle_connection(
             }
             b'Q' => {
                 // Simple Query protocol - this is where DBeaver sends queries
+                info!("Simple Query message received (non-TLS path)"); // DEBUG: identify which path
                 socket.read_exact(&mut buf).await?;
                 let len = u32::from_be_bytes(buf) as usize - 4;
                 let mut query_bytes = vec![0u8; len];
@@ -738,7 +742,72 @@ async fn handle_connection(
                     .trim_end_matches('\0')
                     .to_string();
 
-                debug!("Received query: {}", &query[..query.len().min(100)]);
+                info!("Received query (non-TLS): {}", &query[..query.len().min(100)]); // DEBUG
+
+                // Check for cursor commands first (require connection-level state)
+                let query_upper = query.to_uppercase();
+                let query_trimmed = query_upper.trim();
+                
+                // Handle DECLARE CURSOR
+                if query_trimmed.starts_with("DECLARE ") && query_trimmed.contains(" CURSOR ") {
+                    info!(
+                        query_trimmed = %query_trimmed,
+                        "Detected DECLARE CURSOR command (non-TLS), attempting to handle"
+                    );
+                    if let Some(result) = handle_declare_cursor(&query, &mut cursors, &worker_client, &user_id).await {
+                        info!(
+                            cursor_count = cursors.len(),
+                            "DECLARE CURSOR handled successfully (non-TLS)"
+                        );
+                        send_simple_result_generic(&mut socket, &[], &[], result.command_tag.as_deref()).await?;
+                        socket.write_all(&ready).await?;
+                        socket.flush().await?;
+                        continue;
+                    } else {
+                        warn!(
+                            query = %query,
+                            "DECLARE CURSOR parsing failed (non-TLS), forwarding to worker"
+                        );
+                    }
+                }
+                
+                // Handle FETCH
+                if query_trimmed.starts_with("FETCH ") {
+                    if let Some(result) = handle_fetch_cursor(&query, &mut cursors, &worker_client, &user_id).await {
+                        let cols: Vec<(&str, i32)> = result.columns.iter()
+                            .map(|(n, _)| (n.as_str(), 25i32))
+                            .collect();
+                        send_simple_result_generic(&mut socket, &cols, &result.rows, result.command_tag.as_deref()).await?;
+                        socket.write_all(&ready).await?;
+                        socket.flush().await?;
+                        continue;
+                    }
+                }
+                
+                // Handle CLOSE CURSOR
+                if query_trimmed.starts_with("CLOSE ") {
+                    let cursor_name = extract_cursor_name_from_close(&query);
+                    if let Some(name) = cursor_name {
+                        if cursors.remove(&name).is_some() {
+                            info!(cursor_name = %name, "Cursor closed (non-TLS)");
+                        }
+                        send_simple_result_generic(&mut socket, &[], &[], Some("CLOSE CURSOR")).await?;
+                        socket.write_all(&ready).await?;
+                        socket.flush().await?;
+                        continue;
+                    }
+                }
+                
+                // Handle CLOSE ALL
+                if query_trimmed == "CLOSE ALL" {
+                    let count = cursors.len();
+                    cursors.clear();
+                    info!(cursor_count = count, "All cursors closed (non-TLS)");
+                    send_simple_result_generic(&mut socket, &[], &[], Some("CLOSE ALL")).await?;
+                    socket.write_all(&ready).await?;
+                    socket.flush().await?;
+                    continue;
+                }
 
                 let query_id = uuid::Uuid::new_v4().to_string();
 
