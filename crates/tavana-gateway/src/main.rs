@@ -12,6 +12,7 @@
 //! - Streaming results for unlimited data size
 
 mod auth;
+mod cursors;
 mod data_sizer;
 mod metrics;
 mod pg_wire;
