@@ -1122,6 +1122,11 @@ where
     let mut buf = [0u8; 4];
     let ready = [b'Z', 0, 0, 0, 5, b'I'];
     let mut prepared_query: Option<String> = None;
+    // Track whether Describe sent RowDescription (true) or NoData (false)
+    // This ensures Execute phase is consistent with Describe phase
+    let mut describe_sent_row_description = false;
+    // Cache column info from Describe to use in Execute
+    let mut cached_columns: Option<Vec<(String, String)>> = None;
 
     loop {
         let mut msg_type = [0u8; 1];
@@ -1259,6 +1264,10 @@ where
                 
                 debug!("Extended Protocol - Describe");
                 
+                // Reset state for this Describe
+                describe_sent_row_description = false;
+                cached_columns = None;
+                
                 // Send ParameterDescription (no parameters)
                 socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
                 
@@ -1268,9 +1277,13 @@ where
                     // Check for PG-specific commands first
                     if let Some(result) = handle_pg_specific_command(sql) {
                         if result.columns.is_empty() {
+                            debug!("Extended Protocol - Describe: PG command returns no data");
                             socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
                         } else {
+                            info!("Extended Protocol - Describe: PG command returns {} columns", result.columns.len());
                             send_row_description_generic(socket, &result.columns).await?;
+                            describe_sent_row_description = true;
+                            cached_columns = Some(result.columns.clone());
                         }
                     } else {
                         // Execute query to get column info
@@ -1280,17 +1293,26 @@ where
                                     .map(|c| (c.name.clone(), c.type_name.clone()))
                                     .collect();
                                 if columns.is_empty() {
+                                    debug!("Extended Protocol - Describe: query returns no columns");
                                     socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
                                 } else {
+                                    info!("Extended Protocol - Describe: query returns {} columns: {:?}", 
+                                        columns.len(), 
+                                        columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+                                    );
                                     send_row_description_generic(socket, &columns).await?;
+                                    describe_sent_row_description = true;
+                                    cached_columns = Some(columns);
                                 }
                             }
-                            Err(_) => {
+                            Err(e) => {
+                                warn!("Extended Protocol - Describe: query failed: {}, sending NoData", e);
                                 socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
                             }
                         }
                     }
                 } else {
+                    debug!("Extended Protocol - Describe: no prepared query");
                     socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
                 }
                 socket.flush().await?;
@@ -1305,23 +1327,40 @@ where
                 socket.read_exact(&mut data).await?;
                 
                 if let Some(ref sql) = prepared_query {
-                    // Execute the prepared query - use extended protocol version
-                    // that doesn't send RowDescription again
-                    let result = execute_query_extended_protocol(
-                        socket,
-                        worker_client,
-                        query_router,
-                        sql,
-                        user_id,
-                        smart_scaler,
-                    ).await;
-                    
-                    if let Err(e) = result {
-                        send_error_generic(socket, &e.to_string()).await?;
+                    // CRITICAL: If Describe sent NoData, we MUST NOT send DataRows
+                    // The JDBC client expects no data after NoData response
+                    if !describe_sent_row_description {
+                        debug!("Extended Protocol - Execute: Describe sent NoData, only sending CommandComplete");
+                        // Just send CommandComplete with 0 rows
+                        let cmd = b"SELECT 0";
+                        let cmd_len = (4 + cmd.len() + 1) as u32;
+                        let mut msg = vec![b'C'];
+                        msg.extend_from_slice(&cmd_len.to_be_bytes());
+                        msg.extend_from_slice(cmd);
+                        msg.push(0);
+                        socket.write_all(&msg).await?;
+                        socket.flush().await?;
+                    } else {
+                        // Describe sent RowDescription, so we can send DataRows
+                        info!("Extended Protocol - Execute: Describe sent RowDescription, executing query");
+                        let result = execute_query_extended_protocol(
+                            socket,
+                            worker_client,
+                            query_router,
+                            sql,
+                            user_id,
+                            smart_scaler,
+                        ).await;
+                        
+                        if let Err(e) = result {
+                            error!("Extended Protocol - Execute: query failed: {}", e);
+                            send_error_generic(socket, &e.to_string()).await?;
+                        }
+                        // CommandComplete is sent by execute_query_extended_protocol
                     }
-                    // CommandComplete is sent by execute_query_extended_protocol
                 } else {
                     // No prepared statement - send empty CommandComplete
+                    debug!("Extended Protocol - Execute: no prepared query");
                     let cmd = b"SELECT 0";
                     let cmd_len = (4 + cmd.len() + 1) as u32;
                     let mut msg = vec![b'C'];
@@ -1333,6 +1372,9 @@ where
                 }
                 
                 prepared_query = None;
+                // Reset state after Execute
+                describe_sent_row_description = false;
+                cached_columns = None;
             }
             b'S' => {
                 // Sync message has length field (4 bytes with value 4)
@@ -2351,13 +2393,47 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
 
     if sql_trimmed.starts_with("DISCARD ")
         || sql_trimmed.starts_with("DEALLOCATE ")
-        || sql_trimmed.starts_with("CLOSE ")
     {
         return Some(QueryExecutionResult {
             columns: vec![],
             rows: vec![],
             row_count: 0,
             command_tag: Some("OK".to_string()),
+        });
+    }
+
+    // Handle DECLARE CURSOR (stub - acknowledge but don't actually create cursor)
+    // Full cursor support would require connection-level state management
+    if sql_trimmed.starts_with("DECLARE ") && sql_trimmed.contains(" CURSOR ") {
+        debug!("DECLARE CURSOR stub: {}", &sql[..sql.len().min(80)]);
+        return Some(QueryExecutionResult {
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
+            command_tag: Some("DECLARE CURSOR".to_string()),
+        });
+    }
+
+    // Handle FETCH (stub - return empty result, should be enhanced with actual cursor support)
+    if sql_trimmed.starts_with("FETCH ") {
+        debug!("FETCH stub: {}", &sql[..sql.len().min(80)]);
+        // Return empty result - actual implementation would fetch from cursor
+        return Some(QueryExecutionResult {
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
+            command_tag: Some("FETCH 0".to_string()),
+        });
+    }
+
+    // Handle CLOSE (cursor)
+    if sql_trimmed.starts_with("CLOSE ") {
+        debug!("CLOSE cursor stub: {}", &sql[..sql.len().min(80)]);
+        return Some(QueryExecutionResult {
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
+            command_tag: Some("CLOSE CURSOR".to_string()),
         });
     }
 
