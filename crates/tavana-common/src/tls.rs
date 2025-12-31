@@ -20,8 +20,9 @@ pub struct TlsConfig {
 impl TlsConfig {
     /// Get the private key
     pub fn private_key(&self) -> PrivateKeyDer<'static> {
-        // Parse from stored bytes
-        PrivateKeyDer::try_from(self.private_key_bytes.clone()).unwrap()
+        // Parse from stored bytes - this should always succeed as we validated on construction
+        PrivateKeyDer::try_from(self.private_key_bytes.clone())
+            .expect("private key bytes were validated at TlsConfig construction")
     }
 }
 

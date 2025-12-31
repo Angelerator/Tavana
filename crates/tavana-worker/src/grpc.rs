@@ -230,10 +230,12 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
         let req = request.into_inner();
         info!(query_id = %req.query_id, "Cancelling query");
 
-        // TODO: Implement query cancellation
+        // NOTE: Query cancellation requires tracking active query handles per query_id
+        // This is a v1.1+ feature - for now we return success but don't actually cancel
+        warn!(query_id = %req.query_id, "Query cancellation not yet implemented - returning success");
         Ok(Response::new(proto::CancelQueryResponse {
-            success: true,
-            message: "Query cancelled".to_string(),
+            success: false,
+            message: "Query cancellation not implemented in this version".to_string(),
         }))
     }
 
@@ -243,10 +245,12 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
     ) -> Result<Response<proto::QueryStatusResponse>, Status> {
         let req = request.into_inner();
 
-        // TODO: Implement status tracking
+        // NOTE: Query status tracking requires a query state store (e.g., HashMap<query_id, State>)
+        // This is a v1.1+ feature - for now we return Unknown state
+        debug!(query_id = %req.query_id, "Query status tracking not yet implemented");
         Ok(Response::new(proto::QueryStatusResponse {
             query_id: req.query_id,
-            state: proto::QueryState::Running.into(),
+            state: proto::QueryState::Unspecified.into(),
             progress: None,
             error: None,
             started_at: None,
@@ -367,7 +371,8 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
             return Ok(Response::new(ReceiverStream::new(rx)));
         }
 
-        let cursor = cursor.unwrap();
+        // Safe to expect here: we already returned early if cursor.is_none()
+        let cursor = cursor.expect("cursor existence verified above");
         let columns: Vec<String> = cursor.columns.iter().map(|c| c.name.clone()).collect();
         let column_types: Vec<String> = cursor.columns.iter().map(|c| c.type_name.clone()).collect();
 

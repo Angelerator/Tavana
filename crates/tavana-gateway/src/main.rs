@@ -232,8 +232,14 @@ async fn main() -> anyhow::Result<()> {
         let encoder = prometheus::TextEncoder::new();
         let metric_families = prometheus::gather();
         let mut buffer = Vec::new();
-        encoder.encode(&metric_families, &mut buffer).unwrap();
-        String::from_utf8(buffer).unwrap()
+        if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+            tracing::error!("Failed to encode prometheus metrics: {}", e);
+            return "# Error encoding metrics".to_string();
+        }
+        String::from_utf8(buffer).unwrap_or_else(|e| {
+            tracing::error!("Failed to convert metrics to UTF-8: {}", e);
+            "# Error converting metrics to string".to_string()
+        })
     }
 
     // CORS layer
@@ -257,8 +263,16 @@ async fn main() -> anyhow::Result<()> {
     info!("  /metrics - Prometheus metrics");
 
     let http_handle = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind(&http_addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        match tokio::net::TcpListener::bind(&http_addr).await {
+            Ok(listener) => {
+                if let Err(e) = axum::serve(listener, app).await {
+                    tracing::error!("HTTP server error: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to bind HTTP server to {}: {}", http_addr, e);
+            }
+        }
     });
 
     info!("Tavana Gateway started successfully");
