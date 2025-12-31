@@ -35,7 +35,9 @@ Traditional data lake query engines face a classic dilemma:
 - ✅ **SSL/TLS Support** - Optional encrypted connections with self-signed or custom certificates
 - ✅ **DuckDB Engine** - 10-100x faster than traditional engines for analytical queries
 - ✅ **S3-Compatible Storage** - Query Parquet/CSV/JSON files from S3, ADLS Gen2, GCS, MinIO
+- ✅ **Delta Lake Support** - Native `delta_scan()` for Delta Lake tables with Azure Workload Identity
 - ✅ **Streaming Results** - Memory-efficient row-by-row streaming for large result sets
+- ✅ **True Streaming Cursors** - Server-side cursors with O(n) performance (no re-scanning on FETCH)
 
 ### Auto-Scaling
 - ✅ **Horizontal Pod Autoscaler (HPA)** - Scales worker count from 1-20 based on queue depth and wait times
@@ -141,9 +143,11 @@ The Gateway is the query entry point and orchestration layer.
 
 **Key Modules:**
 - `pg_wire.rs`: PostgreSQL wire protocol implementation
+- `cursors.rs`: Server-side cursor management (DECLARE/FETCH/CLOSE)
 - `query_queue.rs`: Smart FIFO queue with capacity awareness
 - `smart_scaler.rs`: HPA + VPA scaling logic
 - `worker_pool.rs`: Worker discovery and load balancing
+- `worker_client.rs`: gRPC client for worker communication (including cursor APIs)
 - `data_sizer.rs`: Query cost estimation (S3 HEAD requests)
 
 **Technology:**
@@ -166,6 +170,7 @@ Workers execute DuckDB queries and stream results back to clients.
 **Key Features:**
 - **In-Memory DuckDB**: Each worker runs an in-memory DuckDB instance
 - **Extension Pre-Installation**: DuckDB extensions are pre-downloaded at build time
+- **True Streaming Cursors**: Holds DuckDB Arrow iterators for server-side cursor support
 - **Memory Safety**: Uses Rust's ownership model to prevent memory leaks
 - **Graceful Shutdown**: Completes running queries before termination
 
@@ -174,6 +179,7 @@ Workers execute DuckDB queries and stream results back to clients.
 - **Database**: DuckDB (in-memory, columnar, OLAP-optimized)
 - **Storage**: Reads from S3 via DuckDB's httpfs extension
 - **gRPC Server**: Receives query requests from Gateway
+- **Cursor Manager**: Manages server-side cursors with idle cleanup
 
 #### 3. **QueryQueue** (Inside Gateway)
 
@@ -419,6 +425,95 @@ Query completes:
 
 ---
 
+## 🔄 True Streaming Cursors
+
+Tavana supports PostgreSQL-compatible server-side cursors with **true streaming** - meaning data is scanned only once, and each FETCH operation advances an iterator rather than re-executing the query.
+
+### Why True Streaming Matters
+
+| Approach | FETCH 1 | FETCH 2 | FETCH 3 | FETCH N | Complexity |
+|----------|---------|---------|---------|---------|------------|
+| **LIMIT/OFFSET** | Scan 1000 rows | Scan 2000 rows | Scan 3000 rows | Scan N×1000 rows | **O(n²)** |
+| **True Streaming** | Scan 1000 rows | Advance iterator | Advance iterator | Just advance | **O(n)** |
+
+### How It Works
+
+```
+┌──────────────┐              ┌──────────────┐              ┌──────────────┐
+│   Client     │   DECLARE    │   Gateway    │  DeclareCursor│   Worker     │
+│  (Tableau)   │─────────────►│  (pg_wire)   │──────────────►│  (DuckDB)    │
+└──────────────┘              └──────────────┘              └──────────────┘
+                                    │                              │
+                                    │                              ▼
+                                    │                       ┌──────────────┐
+                                    │                       │ Execute SQL  │
+                                    │                       │ Buffer Arrow │
+                                    │                       │ RecordBatches│
+                                    │                       └──────────────┘
+                                    │                              │
+                              Store CursorState:                   │
+                              - worker_id (affinity)               │
+                              - uses_true_streaming=true           │
+                                    │◄─────────────────────────────┘
+                                    │
+┌──────────────┐              ┌──────────────┐              ┌──────────────┐
+│   Client     │   FETCH N    │   Gateway    │  FetchCursor │   Worker     │
+│  (Tableau)   │─────────────►│  (pg_wire)   │──────────────►│  (DuckDB)    │
+└──────────────┘              └──────────────┘              └──────────────┘
+                                    │                              │
+                                    │                              ▼
+                                    │                       ┌──────────────┐
+                                    │                       │ Advance      │
+                                    │                       │ iterator     │◄─── NO RE-SCAN!
+                                    │                       │ Return N rows│
+                                    │                       └──────────────┘
+                                    │                              │
+                              Stream rows to client               │
+                                    │◄─────────────────────────────┘
+```
+
+### Usage Example
+
+```sql
+-- Efficient scrolling through 1 million rows
+BEGIN;
+
+-- Declare cursor (executes query ONCE, buffers results on worker)
+DECLARE sales_cursor CURSOR FOR 
+    SELECT * FROM delta_scan('az://bucket/sales/');
+
+-- Fetch first batch (reads from buffer)
+FETCH 2000 FROM sales_cursor;
+
+-- Fetch next batch (advances iterator - no re-scan!)
+FETCH 2000 FROM sales_cursor;
+
+-- Continue scrolling...
+FETCH 2000 FROM sales_cursor;
+
+-- Done
+CLOSE sales_cursor;
+COMMIT;
+```
+
+### Cursor Configuration
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `MAX_CURSORS` | Max concurrent cursors per worker | `100` |
+| `CURSOR_IDLE_TIMEOUT_SECS` | Auto-close idle cursors after | `300` (5 min) |
+| `CURSOR_CLEANUP_INTERVAL_SECS` | Cleanup check interval | `60` (1 min) |
+
+### Cursor Metrics
+
+```
+tavana_active_cursors           # Currently open cursors across all workers
+tavana_cursor_fetch_count       # Total FETCH operations
+tavana_cursor_rows_fetched      # Total rows fetched via cursors
+```
+
+---
+
 ## 🚀 Quick Start
 
 ### One-Command Deployment (Azure)
@@ -499,6 +594,28 @@ SELECT * FROM read_parquet('s3://my-bucket/sales/*.parquet');
 
 -- Query with partitioning
 SELECT * FROM read_parquet('s3://my-bucket/sales/year=*/month=*/*.parquet');
+```
+
+### Delta Lake Queries (Azure ADLS Gen2)
+
+```sql
+-- Query Delta Lake table from Azure
+SELECT * FROM delta_scan('az://container/path/to/delta_table/') LIMIT 100;
+
+-- Delta Lake with Azure blob storage URL
+SELECT * FROM delta_scan('abfss://container@account.dfs.core.windows.net/table/');
+
+-- Time travel (query historical version)
+SELECT * FROM delta_scan('az://container/table/', version := 5);
+
+-- Efficient scrolling with cursors
+BEGIN;
+DECLARE data_cursor CURSOR FOR 
+    SELECT * FROM delta_scan('az://container/large_table/');
+FETCH 5000 FROM data_cursor;  -- First batch
+FETCH 5000 FROM data_cursor;  -- Next batch (no re-scan!)
+CLOSE data_cursor;
+COMMIT;
 ```
 
 ### Aggregations
@@ -1367,6 +1484,12 @@ fn can_admit_query(query_cost_mb: u64) -> AdmissionDecision {
 
 ## 🗺️ Roadmap
 
+### v1.0.x (Current)
+- [x] True streaming server-side cursors (O(n) FETCH performance)
+- [x] Delta Lake support with Azure Workload Identity
+- [x] Automatic Azure token refresh for long-running sessions
+- [x] Tableau Desktop compatibility
+
 ### v1.1 (Q1 2025)
 - [ ] AWS EKS Terraform module
 - [ ] Query result caching (Redis)
@@ -1399,6 +1522,8 @@ tavana/
 │   │   ├── src/
 │   │   │   ├── main.rs            # Entry point
 │   │   │   ├── pg_wire.rs         # PostgreSQL wire protocol
+│   │   │   ├── cursors.rs         # Server-side cursor support (DECLARE/FETCH/CLOSE)
+│   │   │   ├── worker_client.rs   # gRPC client for workers (query + cursor APIs)
 │   │   │   ├── query_queue.rs     # FIFO queue with capacity awareness
 │   │   │   ├── smart_scaler.rs    # HPA + VPA logic
 │   │   │   ├── worker_pool.rs     # Worker discovery & load balancing
@@ -1409,7 +1534,9 @@ tavana/
 │   ├── tavana-worker/      # Worker service (Rust)
 │   │   ├── src/
 │   │   │   ├── main.rs            # Entry point
-│   │   │   ├── query_executor.rs  # DuckDB query execution
+│   │   │   ├── executor.rs        # DuckDB query execution
+│   │   │   ├── cursor_manager.rs  # Server-side cursor state (Arrow iterators)
+│   │   │   ├── grpc.rs            # gRPC service (ExecuteQuery, DeclareCursor, etc.)
 │   │   │   └── streaming.rs       # Result streaming
 │   │   └── Cargo.toml
 │   │
