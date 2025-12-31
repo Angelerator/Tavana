@@ -773,14 +773,23 @@ async fn handle_connection(
                 
                 // Handle FETCH
                 if query_trimmed.starts_with("FETCH ") {
-                    if let Some(result) = handle_fetch_cursor(&query, &mut cursors, &worker_client, &user_id).await {
-                        let cols: Vec<(&str, i32)> = result.columns.iter()
-                            .map(|(n, _)| (n.as_str(), 25i32))
-                            .collect();
-                        send_simple_result_generic(&mut socket, &cols, &result.rows, result.command_tag.as_deref()).await?;
-                        socket.write_all(&ready).await?;
-                        socket.flush().await?;
-                        continue;
+                    match handle_fetch_cursor(&query, &mut cursors, &worker_client, &user_id).await {
+                        Some(result) => {
+                            let cols: Vec<(&str, i32)> = result.columns.iter()
+                                .map(|(n, _)| (n.as_str(), 25i32))
+                                .collect();
+                            send_simple_result_generic(&mut socket, &cols, &result.rows, result.command_tag.as_deref()).await?;
+                            socket.write_all(&ready).await?;
+                            socket.flush().await?;
+                            continue;
+                        }
+                        None => {
+                            // Cursor not found - send error instead of forwarding to worker
+                            send_error(&mut socket, "cursor does not exist").await?;
+                            socket.write_all(&ready).await?;
+                            socket.flush().await?;
+                            continue;
+                        }
                     }
                 }
                 
@@ -1127,11 +1136,20 @@ async fn run_query_loop(
                 
                 // Handle FETCH
                 if query_trimmed.starts_with("FETCH ") {
-                    if let Some(result) = handle_fetch_cursor(&query, &mut cursors, worker_client, user_id).await {
-                        send_query_result_immediate(socket, result).await?;
-                        socket.write_all(&ready).await?;
-                        socket.flush().await?;
-                        continue;
+                    match handle_fetch_cursor(&query, &mut cursors, worker_client, user_id).await {
+                        Some(result) => {
+                            send_query_result_immediate(socket, result).await?;
+                            socket.write_all(&ready).await?;
+                            socket.flush().await?;
+                            continue;
+                        }
+                        None => {
+                            // Cursor not found - send error
+                            send_error(socket, "cursor does not exist").await?;
+                            socket.write_all(&ready).await?;
+                            socket.flush().await?;
+                            continue;
+                        }
                     }
                 }
                 
@@ -1378,14 +1396,23 @@ where
                 
                 // Handle FETCH
                 if query_trimmed.starts_with("FETCH ") {
-                    if let Some(result) = handle_fetch_cursor(&query, &mut cursors, worker_client, user_id).await {
-                        let cols: Vec<(&str, i32)> = result.columns.iter()
-                            .map(|(n, _)| (n.as_str(), 25i32))
-                            .collect();
-                        send_simple_result_generic(socket, &cols, &result.rows, result.command_tag.as_deref()).await?;
-                        socket.write_all(&ready).await?;
-                        socket.flush().await?;
-                        continue;
+                    match handle_fetch_cursor(&query, &mut cursors, worker_client, user_id).await {
+                        Some(result) => {
+                            let cols: Vec<(&str, i32)> = result.columns.iter()
+                                .map(|(n, _)| (n.as_str(), 25i32))
+                                .collect();
+                            send_simple_result_generic(socket, &cols, &result.rows, result.command_tag.as_deref()).await?;
+                            socket.write_all(&ready).await?;
+                            socket.flush().await?;
+                            continue;
+                        }
+                        None => {
+                            // Cursor not found - send error
+                            send_error_generic(socket, "cursor does not exist").await?;
+                            socket.write_all(&ready).await?;
+                            socket.flush().await?;
+                            continue;
+                        }
                     }
                 }
                 
