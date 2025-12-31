@@ -238,6 +238,157 @@ impl WorkerClient {
 
         Ok(StreamingResult { receiver: rx })
     }
+
+    // ============= Cursor Operations for True Streaming =============
+
+    /// Declare a cursor on the worker - query is executed and iterator is held
+    /// Returns cursor_id, worker_id (for affinity), and column metadata
+    pub async fn declare_cursor(
+        &self,
+        cursor_id: &str,
+        sql: &str,
+        user_id: &str,
+    ) -> Result<DeclareCursorResult, anyhow::Error> {
+        let mut client = self.get_client().await?;
+
+        info!(cursor_id = %cursor_id, sql = %&sql[..sql.len().min(80)], "Declaring cursor on worker");
+
+        let request = proto::DeclareCursorRequest {
+            cursor_id: cursor_id.to_string(),
+            sql: sql.to_string(),
+            user: Some(proto::UserIdentity {
+                user_id: user_id.to_string(),
+                tenant_id: "default".to_string(),
+                scopes: vec!["query:execute".to_string()],
+                claims: Default::default(),
+            }),
+            options: Some(proto::QueryOptions {
+                timeout_seconds: 600, // 10 minutes
+                max_rows: 0,          // Unlimited for cursors
+                max_bytes: 0,
+                enable_profiling: false,
+                session_params: Default::default(),
+            }),
+        };
+
+        let response = client.declare_cursor(request).await?;
+        let resp = response.into_inner();
+
+        if !resp.success {
+            return Err(anyhow::anyhow!("Failed to declare cursor: {}", resp.error_message));
+        }
+
+        let columns: Vec<ColumnInfo> = resp.columns.iter()
+            .zip(resp.column_types.iter())
+            .map(|(name, type_name)| ColumnInfo {
+                name: name.clone(),
+                type_name: type_name.clone(),
+            })
+            .collect();
+
+        info!(
+            cursor_id = %resp.cursor_id,
+            worker_id = %resp.worker_id,
+            columns = columns.len(),
+            "Cursor declared successfully"
+        );
+
+        Ok(DeclareCursorResult {
+            cursor_id: resp.cursor_id,
+            worker_id: resp.worker_id,
+            columns,
+        })
+    }
+
+    /// Fetch rows from a cursor on the worker (true streaming - no re-scanning)
+    pub async fn fetch_cursor(
+        &self,
+        cursor_id: &str,
+        max_rows: usize,
+    ) -> Result<FetchCursorResult, anyhow::Error> {
+        let mut client = self.get_client().await?;
+
+        debug!(cursor_id = %cursor_id, max_rows = max_rows, "Fetching from cursor");
+
+        let request = proto::FetchCursorRequest {
+            cursor_id: cursor_id.to_string(),
+            max_rows: max_rows as u64,
+        };
+
+        let response = client.fetch_cursor(request).await?;
+        let mut stream = response.into_inner();
+
+        let mut columns: Vec<ColumnInfo> = Vec::new();
+        let mut rows: Vec<Vec<String>> = Vec::new();
+
+        while let Some(batch) = stream.message().await? {
+            match batch.result {
+                Some(proto::query_result_batch::Result::Metadata(meta)) => {
+                    columns = meta.columns.iter()
+                        .zip(meta.column_types.iter())
+                        .map(|(name, type_name)| ColumnInfo {
+                            name: name.clone(),
+                            type_name: type_name.clone(),
+                        })
+                        .collect();
+                }
+                Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
+                    if !batch.data.is_empty() {
+                        if let Ok(batch_rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                            rows.extend(batch_rows);
+                        }
+                    }
+                }
+                Some(proto::query_result_batch::Result::Error(err)) => {
+                    return Err(anyhow::anyhow!("{}: {}", err.code, err.message));
+                }
+                _ => {}
+            }
+        }
+
+        let row_count = rows.len();
+        debug!(cursor_id = %cursor_id, rows_fetched = row_count, "Fetch complete");
+
+        Ok(FetchCursorResult {
+            columns,
+            rows,
+            row_count,
+        })
+    }
+
+    /// Close a cursor on the worker and release resources
+    pub async fn close_cursor(&self, cursor_id: &str) -> Result<bool, anyhow::Error> {
+        let mut client = self.get_client().await?;
+
+        debug!(cursor_id = %cursor_id, "Closing cursor");
+
+        let request = proto::CloseCursorRequest {
+            cursor_id: cursor_id.to_string(),
+        };
+
+        let response = client.close_cursor(request).await?;
+        let resp = response.into_inner();
+
+        info!(cursor_id = %cursor_id, success = resp.success, "Cursor closed");
+
+        Ok(resp.success)
+    }
+}
+
+/// Result of declaring a cursor
+#[derive(Debug)]
+pub struct DeclareCursorResult {
+    pub cursor_id: String,
+    pub worker_id: String,
+    pub columns: Vec<ColumnInfo>,
+}
+
+/// Result of fetching from a cursor
+#[derive(Debug)]
+pub struct FetchCursorResult {
+    pub columns: Vec<ColumnInfo>,
+    pub rows: Vec<Vec<String>>,
+    pub row_count: usize,
 }
 
 #[derive(Debug, Clone)]

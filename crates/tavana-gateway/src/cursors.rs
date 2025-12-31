@@ -158,6 +158,16 @@ impl ConnectionCursors {
     pub fn contains(&self, name: &str) -> bool {
         self.cursors.contains_key(name)
     }
+
+    /// Get immutable reference to a cursor
+    pub fn get(&self, name: &str) -> Option<&CursorState> {
+        self.cursors.get(name)
+    }
+
+    /// Iterate over all cursors
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &CursorState)> {
+        self.cursors.iter()
+    }
 }
 
 impl Default for ConnectionCursors {
@@ -245,7 +255,7 @@ pub fn parse_close_cursor(sql: &str) -> Option<String> {
 }
 
 /// Handle DECLARE cursor_name CURSOR FOR select_query
-/// Parses the cursor declaration and stores it in the connection's cursor map
+/// Uses TRUE STREAMING via worker's DeclareCursor gRPC - no re-scanning on FETCH!
 pub async fn handle_declare_cursor(
     sql: &str,
     cursors: &mut ConnectionCursors,
@@ -257,37 +267,70 @@ pub async fn handle_declare_cursor(
     info!(
         cursor_name = %cursor_name,
         query_preview = %&query[..query.len().min(80)],
-        "DECLARE CURSOR - using LIMIT/OFFSET pagination"
+        "DECLARE CURSOR - using TRUE STREAMING (worker-side cursor)"
     );
 
-    // Execute query once to get column metadata (with LIMIT 0 for efficiency)
-    let query_clean = query.trim().trim_end_matches(';');
-    let metadata_query = format!("{} LIMIT 0", query_clean);
-    let columns = match worker_client.execute_query(&metadata_query, user_id).await {
-        Ok(result) => result
-            .columns
-            .iter()
-            .map(|c| (c.name.clone(), c.type_name.clone()))
-            .collect(),
-        Err(e) => {
-            warn!("Failed to get cursor column metadata: {}", e);
-            Vec::new()
+    // Call worker's DeclareCursor gRPC - query is executed and iterator is held on worker
+    match worker_client.declare_cursor(&cursor_name, &query, user_id).await {
+        Ok(result) => {
+            let columns: Vec<(String, String)> = result.columns.iter()
+                .map(|c| (c.name.clone(), c.type_name.clone()))
+                .collect();
+
+            // Store cursor state with worker affinity info
+            let mut cursor_state = CursorState::new(query, columns);
+            cursor_state.worker_id = Some(result.worker_id.clone());
+            cursor_state.uses_true_streaming = true;
+            
+            cursors.insert(cursor_name.clone(), cursor_state);
+
+            info!(
+                cursor_name = %cursor_name,
+                worker_id = %result.worker_id,
+                columns = result.columns.len(),
+                "Cursor declared on worker (true streaming enabled)"
+            );
+
+            Some(CursorResult {
+                columns: vec![],
+                rows: vec![],
+                row_count: 0,
+                command_tag: Some("DECLARE CURSOR".to_string()),
+            })
         }
-    };
+        Err(e) => {
+            warn!(cursor_name = %cursor_name, error = %e, "Failed to declare cursor on worker, falling back to LIMIT/OFFSET");
+            
+            // Fallback to LIMIT/OFFSET mode
+            let query_clean = query.trim().trim_end_matches(';');
+            let metadata_query = format!("{} LIMIT 0", query_clean);
+            let columns = match worker_client.execute_query(&metadata_query, user_id).await {
+                Ok(result) => result
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), c.type_name.clone()))
+                    .collect(),
+                Err(e) => {
+                    warn!("Failed to get cursor column metadata: {}", e);
+                    Vec::new()
+                }
+            };
 
-    // Store cursor state
-    cursors.insert(cursor_name.clone(), CursorState::new(query, columns));
+            cursors.insert(cursor_name.clone(), CursorState::new(query, columns));
 
-    Some(CursorResult {
-        columns: vec![],
-        rows: vec![],
-        row_count: 0,
-        command_tag: Some("DECLARE CURSOR".to_string()),
-    })
+            Some(CursorResult {
+                columns: vec![],
+                rows: vec![],
+                row_count: 0,
+                command_tag: Some("DECLARE CURSOR".to_string()),
+            })
+        }
+    }
 }
 
 /// Handle FETCH count FROM cursor_name
-/// Fetches the next batch of rows using LIMIT/OFFSET
+/// Uses TRUE STREAMING via worker's FetchCursor gRPC when available (no re-scanning!)
+/// Falls back to LIMIT/OFFSET for cursors not using true streaming
 pub async fn handle_fetch_cursor(
     sql: &str,
     cursors: &mut ConnectionCursors,
@@ -319,7 +362,60 @@ pub async fn handle_fetch_cursor(
         });
     }
 
-    // Build paginated query
+    // ============= TRUE STREAMING PATH =============
+    // If cursor was declared with true streaming, use worker's FetchCursor gRPC
+    if cursor.uses_true_streaming {
+        let max_rows = if fetch_count == usize::MAX { 10000 } else { fetch_count };
+        
+        debug!(
+            "FETCH {} FROM {} (TRUE STREAMING - no re-scan)",
+            max_rows, cursor_name
+        );
+
+        match worker_client.fetch_cursor(&cursor_name, max_rows).await {
+            Ok(result) => {
+                let row_count = result.row_count;
+
+                // Check if cursor is exhausted (got fewer rows than requested)
+                if row_count == 0 || (fetch_count != usize::MAX && row_count < fetch_count) {
+                    cursor.exhausted = true;
+                }
+
+                info!(
+                    "FETCH {} FROM {} (TRUE STREAMING): returned {} rows",
+                    fetch_count, cursor_name, row_count
+                );
+
+                // Use column metadata from result or cached
+                let columns = if !result.columns.is_empty() {
+                    result.columns.iter()
+                        .map(|c| (c.name.clone(), c.type_name.clone()))
+                        .collect()
+                } else {
+                    cursor.columns.clone()
+                };
+
+                return Some(CursorResult {
+                    columns,
+                    rows: result.rows,
+                    row_count,
+                    command_tag: Some(format!("FETCH {}", row_count)),
+                });
+            }
+            Err(e) => {
+                warn!("TRUE STREAMING FETCH error: {}", e);
+                return Some(CursorResult {
+                    columns: cursor.columns.clone(),
+                    rows: vec![],
+                    row_count: 0,
+                    command_tag: Some("FETCH 0".to_string()),
+                });
+            }
+        }
+    }
+
+    // ============= FALLBACK: LIMIT/OFFSET PATH =============
+    // For cursors that don't use true streaming (e.g., when worker gRPC failed)
     let paginated_query = if fetch_count == usize::MAX {
         format!("{} OFFSET {}", cursor.query, cursor.current_offset)
     } else {
@@ -330,7 +426,7 @@ pub async fn handle_fetch_cursor(
     };
 
     debug!(
-        "FETCH {} FROM {}: executing {}",
+        "FETCH {} FROM {} (LIMIT/OFFSET fallback): executing {}",
         fetch_count,
         cursor_name,
         &paginated_query[..paginated_query.len().min(100)]
@@ -350,7 +446,7 @@ pub async fn handle_fetch_cursor(
             }
 
             info!(
-                "FETCH {} FROM {}: returned {} rows (offset now {})",
+                "FETCH {} FROM {} (LIMIT/OFFSET): returned {} rows (offset now {})",
                 fetch_count, cursor_name, row_count, cursor.current_offset
             );
 
@@ -385,10 +481,27 @@ pub async fn handle_fetch_cursor(
 }
 
 /// Handle CLOSE cursor_name or CLOSE ALL
-pub fn handle_close_cursor(sql: &str, cursors: &mut ConnectionCursors) -> Option<CursorResult> {
+/// Also closes cursor on worker if using true streaming
+pub async fn handle_close_cursor(
+    sql: &str,
+    cursors: &mut ConnectionCursors,
+    worker_client: &WorkerClient,
+) -> Option<CursorResult> {
     let cursor_name = parse_close_cursor(sql)?;
 
     if cursor_name == "__ALL__" {
+        // Close all cursors on workers that use true streaming
+        let streaming_cursors: Vec<String> = cursors.iter()
+            .filter(|(_, c)| c.uses_true_streaming)
+            .map(|(name, _)| name.clone())
+            .collect();
+        
+        for name in streaming_cursors {
+            if let Err(e) = worker_client.close_cursor(&name).await {
+                warn!("Failed to close cursor '{}' on worker: {}", name, e);
+            }
+        }
+        
         let count = cursors.len();
         cursors.close_all();
         info!("CLOSE ALL - closed {} cursors", count);
@@ -398,6 +511,15 @@ pub fn handle_close_cursor(sql: &str, cursors: &mut ConnectionCursors) -> Option
             row_count: 0,
             command_tag: Some("CLOSE CURSOR".to_string()),
         });
+    }
+
+    // Check if cursor uses true streaming and close on worker
+    if let Some(cursor) = cursors.get(&cursor_name) {
+        if cursor.uses_true_streaming {
+            if let Err(e) = worker_client.close_cursor(&cursor_name).await {
+                warn!("Failed to close cursor '{}' on worker: {}", cursor_name, e);
+            }
+        }
     }
 
     if cursors.remove(&cursor_name).is_some() {

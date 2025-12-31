@@ -802,27 +802,15 @@ async fn handle_connection(
                     }
                 }
                 
-                // Handle CLOSE CURSOR
+                // Handle CLOSE CURSOR (also closes on worker for true streaming)
                 if query_trimmed.starts_with("CLOSE ") {
-                    let cursor_name = cursors::parse_close_cursor(&query);
-                    if let Some(name) = cursor_name {
-                        if cursors.remove(&name).is_some() {
-                            info!(cursor_name = %name, "Cursor closed (non-TLS)");
-                        }
-                        send_simple_result_generic(&mut socket, &[], &[], Some("CLOSE CURSOR")).await?;
+                    if let Some(result) = cursors::handle_close_cursor(&query, &mut cursors, &worker_client).await {
+                        info!(command_tag = ?result.command_tag, "CLOSE CURSOR handled (non-TLS)");
+                        send_simple_result_generic(&mut socket, &[], &[], result.command_tag.as_deref()).await?;
                         socket.write_all(&ready).await?;
                         socket.flush().await?;
                         continue;
                     }
-                }
-                
-                // Handle CLOSE ALL
-                if query_trimmed == "CLOSE ALL" {
-                    cursors.close_all();
-                    send_simple_result_generic(&mut socket, &[], &[], Some("CLOSE ALL")).await?;
-                    socket.write_all(&ready).await?;
-                    socket.flush().await?;
-                    continue;
                 }
 
                 let query_id = uuid::Uuid::new_v4().to_string();
@@ -1160,26 +1148,20 @@ async fn run_query_loop(
                     }
                 }
                 
-                // Handle CLOSE cursor
+                // Handle CLOSE cursor (also closes on worker for true streaming)
                 if query_trimmed.starts_with("CLOSE ") {
-                    let cursor_name = cursors::parse_close_cursor(&query);
-                    if let Some(name) = cursor_name {
-                        if name == "__ALL__" {
-                            cursors.close_all();
-                        } else {
-                            cursors.remove(&name);
-                            info!("Closed cursor: {}", name);
-                        }
+                    if let Some(result) = cursors::handle_close_cursor(&query, &mut cursors, worker_client).await {
+                        info!(command_tag = ?result.command_tag, "CLOSE CURSOR handled (TLS simple query)");
+                        send_query_result_immediate(socket, QueryExecutionResult {
+                            columns: vec![],
+                            rows: vec![],
+                            row_count: 0,
+                            command_tag: result.command_tag,
+                        }).await?;
+                        socket.write_all(&ready).await?;
+                        socket.flush().await?;
+                        continue;
                     }
-                    send_query_result_immediate(socket, QueryExecutionResult {
-                        columns: vec![],
-                        rows: vec![],
-                        row_count: 0,
-                        command_tag: Some("CLOSE CURSOR".to_string()),
-                    }).await?;
-                    socket.write_all(&ready).await?;
-                    socket.flush().await?;
-                    continue;
                 }
 
                 let query_id = uuid::Uuid::new_v4().to_string();
@@ -1421,21 +1403,15 @@ where
                     }
                 }
                 
-                // Handle CLOSE cursor
+                // Handle CLOSE cursor (also closes on worker for true streaming)
                 if query_trimmed.starts_with("CLOSE ") {
-                    let cursor_name = cursors::parse_close_cursor(&query);
-                    if let Some(name) = cursor_name {
-                        if name == "__ALL__" {
-                            cursors.close_all();
-                        } else {
-                            cursors.remove(&name);
-                            info!("Closed cursor: {}", name);
-                        }
+                    if let Some(result) = cursors::handle_close_cursor(&query, &mut cursors, worker_client).await {
+                        info!(command_tag = ?result.command_tag, "CLOSE CURSOR handled (TLS extended query)");
+                        send_simple_result_generic(socket, &[], &[], result.command_tag.as_deref()).await?;
+                        socket.write_all(&ready).await?;
+                        socket.flush().await?;
+                        continue;
                     }
-                    send_simple_result_generic(socket, &[], &[], Some("CLOSE CURSOR")).await?;
-                    socket.write_all(&ready).await?;
-                    socket.flush().await?;
-                    continue;
                 }
 
                 // For TLS connections, execute queries directly using a simpler path
