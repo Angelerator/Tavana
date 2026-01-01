@@ -13,7 +13,7 @@
 //! - Self-signed certificates for development
 //! - Custom certificates for production
 
-use crate::auth::AuthService;
+use crate::auth::{AuthService, AuthGateway, AuthContext, AuthenticatedPrincipal};
 use crate::metrics;
 use crate::query_queue::{QueryOutcome, QueryQueue};
 use crate::query_router::{QueryRouter, QueryTarget};
@@ -56,7 +56,7 @@ struct StreamingResult {
 /// PostgreSQL wire protocol server with SmartScaler (Formula 3) and Query Queue
 ///
 /// Architecture:
-/// 1. Connection arrives → authenticate
+/// 1. Connection arrives → authenticate via AuthGateway
 /// 2. Query arrives → QueryQueue.enqueue() (blocks until capacity available)
 /// 3. Queue depth signals HPA to scale up if needed
 /// 4. When dispatched → SmartScaler selects worker + VPA pre-size
@@ -65,6 +65,7 @@ struct StreamingResult {
 pub struct PgWireServer {
     addr: SocketAddr,
     auth_service: Arc<AuthService>,
+    auth_gateway: Option<Arc<AuthGateway>>,
     worker_client: Arc<WorkerClient>,
     query_router: Arc<QueryRouter>,
     pool_manager: Option<Arc<WorkerPoolManager>>,
@@ -86,9 +87,14 @@ impl PgWireServer {
         let addr: SocketAddr = format!("0.0.0.0:{}", port)
             .parse()
             .expect("Invalid port number for SocketAddr");
+        
+        // Extract auth gateway from auth service if available
+        let auth_gateway = auth_service.gateway().cloned();
+        
         Self {
             addr,
             auth_service,
+            auth_gateway,
             worker_client,
             query_router,
             pool_manager: None,
@@ -136,9 +142,13 @@ impl PgWireServer {
             }
         };
 
+        // Extract auth gateway from auth service if available
+        let auth_gateway = auth_service.gateway().cloned();
+
         Self {
             addr,
             auth_service,
+            auth_gateway,
             worker_client,
             query_router,
             pool_manager,
@@ -200,9 +210,13 @@ impl PgWireServer {
             }
         );
 
+        // Extract auth gateway from auth service if available
+        let auth_gateway = auth_service.gateway().cloned();
+
         Self {
             addr,
             auth_service,
+            auth_gateway,
             worker_client,
             query_router,
             pool_manager,
@@ -217,6 +231,11 @@ impl PgWireServer {
     /// Set TLS configuration (can be called after any constructor)
     pub fn set_tls(&mut self, tls_config: Option<TlsConfig>) {
         self.tls_config = tls_config.map(Arc::new);
+    }
+
+    /// Get auth gateway reference
+    pub fn auth_gateway(&self) -> Option<&Arc<AuthGateway>> {
+        self.auth_gateway.as_ref()
     }
 
     /// Start the PostgreSQL wire protocol server
@@ -2934,14 +2953,22 @@ async fn send_command_complete(
 }
 
 async fn send_error(socket: &mut tokio::net::TcpStream, message: &str) -> anyhow::Result<()> {
+    send_error_response(socket, "42000", message).await
+}
+
+/// Send error response with specific SQLSTATE code
+async fn send_error_response(socket: &mut tokio::net::TcpStream, code: &str, message: &str) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
+    
+    let code_bytes = format!("{}\0", code);
+    
     let mut msg = Vec::new();
     msg.push(b'E');
     let mut fields = Vec::new();
     fields.push(b'S');
     fields.extend_from_slice(b"ERROR\0");
     fields.push(b'C');
-    fields.extend_from_slice(b"42000\0");
+    fields.extend_from_slice(code_bytes.as_bytes());
     fields.push(b'M');
     fields.extend_from_slice(message.as_bytes());
     fields.push(0);
@@ -2950,6 +2977,7 @@ async fn send_error(socket: &mut tokio::net::TcpStream, message: &str) -> anyhow
     msg.extend_from_slice(&(len as u32).to_be_bytes());
     msg.extend_from_slice(&fields);
     socket.write_all(&msg).await?;
+    socket.flush().await?;
     Ok(())
 }
 
@@ -3035,71 +3063,41 @@ fn pg_type_len(type_name: &str) -> i16 {
     }
 }
 
-// ===== MD5 Password Authentication =====
+// ===== Password Authentication =====
+// Supports both MD5 (legacy) and Cleartext (for JWT/token auth)
 // Required for Tableau Desktop, DBeaver, and other PostgreSQL clients
-// that expect proper password authentication handshake
 
-/// Perform MD5 password authentication for TcpStream
-/// This is required for Tableau and DBeaver which expect a proper auth handshake
+/// Perform cleartext password authentication for TcpStream
+/// Uses cleartext to allow JWTs, API keys, or other tokens in the password field
 async fn perform_md5_auth(socket: &mut tokio::net::TcpStream, user: &str) -> anyhow::Result<()> {
-    // Generate random salt
-    let salt: [u8; 4] = rand::random();
-    
-    // Send AuthenticationMD5Password (R with auth type 5)
-    // Format: 'R' + length(12) + auth_type(5) + salt(4 bytes)
-    let mut auth_req = vec![b'R'];
-    auth_req.extend_from_slice(&12u32.to_be_bytes()); // length
-    auth_req.extend_from_slice(&5u32.to_be_bytes());  // auth type 5 = MD5
-    auth_req.extend_from_slice(&salt);
-    socket.write_all(&auth_req).await?;
-    socket.flush().await?;
-    
-    debug!("Sent MD5 auth request to client for user: {}", user);
-    
-    // Read password response
-    let mut msg_type = [0u8; 1];
-    socket.read_exact(&mut msg_type).await?;
-    
-    if msg_type[0] != b'p' {
-        return Err(anyhow::anyhow!("Expected password message, got: {:?}", msg_type[0]));
-    }
-    
-    let mut len_buf = [0u8; 4];
-    socket.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize - 4;
-    
-    let mut password_data = vec![0u8; len];
-    socket.read_exact(&mut password_data).await?;
-    
-    // Password format: "md5" + md5(md5(password + user) + salt) + null
-    // We accept any password since this is primarily for protocol compatibility
-    debug!("Received password response, accepting (trust mode with MD5 handshake)");
-    
-    // Send AuthenticationOk (R with auth type 0)
-    socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
-    socket.flush().await?;
-    
-    info!("MD5 authentication completed for user: {}", user);
+    // For backwards compatibility, use cleartext passthrough mode
+    let _ = perform_cleartext_auth_internal(socket, user, None).await?;
     Ok(())
 }
 
-/// Perform MD5 password authentication for generic async streams (TLS connections)
-async fn perform_md5_auth_generic<S>(socket: &mut S, user: &str) -> anyhow::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    // Generate random salt
-    let salt: [u8; 4] = rand::random();
-    
-    // Send AuthenticationMD5Password (R with auth type 5)
-    let mut auth_req = vec![b'R'];
-    auth_req.extend_from_slice(&12u32.to_be_bytes()); // length
-    auth_req.extend_from_slice(&5u32.to_be_bytes());  // auth type 5 = MD5
-    auth_req.extend_from_slice(&salt);
+/// Perform cleartext password authentication with optional gateway validation
+async fn perform_cleartext_auth_with_gateway(
+    socket: &mut tokio::net::TcpStream,
+    user: &str,
+    auth_gateway: Option<&Arc<AuthGateway>>,
+    client_ip: Option<String>,
+) -> anyhow::Result<Option<AuthenticatedPrincipal>> {
+    perform_cleartext_auth_internal(socket, user, Some((auth_gateway, client_ip))).await
+}
+
+/// Internal implementation of cleartext password authentication
+async fn perform_cleartext_auth_internal(
+    socket: &mut tokio::net::TcpStream,
+    user: &str,
+    auth_info: Option<(Option<&Arc<AuthGateway>>, Option<String>)>,
+) -> anyhow::Result<Option<AuthenticatedPrincipal>> {
+    // Send AuthenticationCleartextPassword (R with auth type 3)
+    // This allows clients to send JWTs/tokens directly without MD5 hashing
+    let auth_req = [b'R', 0, 0, 0, 8, 0, 0, 0, 3]; // auth type 3 = Cleartext
     socket.write_all(&auth_req).await?;
     socket.flush().await?;
     
-    debug!("Sent MD5 auth request to client for user: {} (TLS)", user);
+    debug!("Sent cleartext auth request to client for user: {}", user);
     
     // Read password response
     let mut msg_type = [0u8; 1];
@@ -3116,14 +3114,182 @@ where
     let mut password_data = vec![0u8; len];
     socket.read_exact(&mut password_data).await?;
     
-    debug!("Received password response, accepting (trust mode with MD5 handshake)");
+    // Extract password (null-terminated string)
+    let password = String::from_utf8_lossy(&password_data)
+        .trim_end_matches('\0')
+        .to_string();
+    
+    // Validate with auth gateway if available
+    if let Some((gateway_opt, client_ip)) = auth_info {
+        if let Some(gateway) = gateway_opt {
+            // Check if gateway is in passthrough mode
+            if !gateway.is_passthrough() {
+                let context = AuthContext {
+                    client_ip,
+                    application_name: None,
+                    client_id: None,
+                };
+                
+                match gateway.authenticate(user, &password, context).await {
+                    crate::auth::identity::AuthResult::Success(principal) => {
+                        // Send AuthenticationOk
+                        socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
+                        socket.flush().await?;
+                        info!(
+                            user_id = %principal.id,
+                            principal_type = %principal.principal_type,
+                            "Authentication successful for user: {}",
+                            user
+                        );
+                        return Ok(Some(principal));
+                    }
+                    crate::auth::identity::AuthResult::InvalidCredentials(reason) => {
+                        warn!("Authentication failed for user {}: {}", user, reason);
+                        send_error_response(socket, "28P01", "password authentication failed").await?;
+                        return Err(anyhow::anyhow!("Authentication failed: {}", reason));
+                    }
+                    crate::auth::identity::AuthResult::Expired => {
+                        warn!("Authentication expired for user {}", user);
+                        send_error_response(socket, "28P01", "authentication token expired").await?;
+                        return Err(anyhow::anyhow!("Token expired"));
+                    }
+                    crate::auth::identity::AuthResult::ProviderError(msg) => {
+                        error!("Auth provider error for user {}: {}", user, msg);
+                        send_error_response(socket, "XX000", "authentication service error").await?;
+                        return Err(anyhow::anyhow!("Provider error: {}", msg));
+                    }
+                    crate::auth::identity::AuthResult::NotAuthenticated => {
+                        // Fall through to passthrough mode
+                    }
+                }
+            }
+        }
+    }
+    
+    // Passthrough mode - accept any password
+    debug!("Received password response, accepting (passthrough mode)");
     
     // Send AuthenticationOk
     socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
     socket.flush().await?;
     
-    info!("MD5 authentication completed for user: {} (TLS)", user);
+    info!("Authentication completed for user: {} (passthrough)", user);
+    Ok(None)
+}
+
+/// Perform cleartext password authentication for generic async streams (TLS connections)
+async fn perform_md5_auth_generic<S>(socket: &mut S, user: &str) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Send AuthenticationCleartextPassword (R with auth type 3)
+    let auth_req = [b'R', 0, 0, 0, 8, 0, 0, 0, 3]; // auth type 3 = Cleartext
+    socket.write_all(&auth_req).await?;
+    socket.flush().await?;
+    
+    debug!("Sent cleartext auth request to client for user: {} (TLS)", user);
+    
+    // Read password response
+    let mut msg_type = [0u8; 1];
+    socket.read_exact(&mut msg_type).await?;
+    
+    if msg_type[0] != b'p' {
+        return Err(anyhow::anyhow!("Expected password message, got: {:?}", msg_type[0]));
+    }
+    
+    let mut len_buf = [0u8; 4];
+    socket.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize - 4;
+    
+    let mut password_data = vec![0u8; len];
+    socket.read_exact(&mut password_data).await?;
+    
+    debug!("Received password response, accepting (passthrough mode TLS)");
+    
+    // Send AuthenticationOk
+    socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
+    socket.flush().await?;
+    
+    info!("Authentication completed for user: {} (TLS passthrough)", user);
     Ok(())
+}
+
+/// Perform cleartext password authentication for TLS with optional gateway
+#[allow(dead_code)]
+async fn perform_cleartext_auth_generic_with_gateway<S>(
+    socket: &mut S,
+    user: &str,
+    auth_gateway: Option<&Arc<AuthGateway>>,
+    client_ip: Option<String>,
+) -> anyhow::Result<Option<AuthenticatedPrincipal>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Send AuthenticationCleartextPassword (R with auth type 3)
+    let auth_req = [b'R', 0, 0, 0, 8, 0, 0, 0, 3];
+    socket.write_all(&auth_req).await?;
+    socket.flush().await?;
+    
+    debug!("Sent cleartext auth request to client for user: {} (TLS)", user);
+    
+    // Read password response
+    let mut msg_type = [0u8; 1];
+    socket.read_exact(&mut msg_type).await?;
+    
+    if msg_type[0] != b'p' {
+        return Err(anyhow::anyhow!("Expected password message, got: {:?}", msg_type[0]));
+    }
+    
+    let mut len_buf = [0u8; 4];
+    socket.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize - 4;
+    
+    let mut password_data = vec![0u8; len];
+    socket.read_exact(&mut password_data).await?;
+    
+    // Extract password
+    let password = String::from_utf8_lossy(&password_data)
+        .trim_end_matches('\0')
+        .to_string();
+    
+    // Validate with auth gateway if available and not passthrough
+    if let Some(gateway) = auth_gateway {
+        if !gateway.is_passthrough() {
+            let context = AuthContext {
+                client_ip,
+                application_name: None,
+                client_id: None,
+            };
+            
+            match gateway.authenticate(user, &password, context).await {
+                crate::auth::identity::AuthResult::Success(principal) => {
+                    socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
+                    socket.flush().await?;
+                    info!(
+                        user_id = %principal.id,
+                        "Authentication successful for user: {} (TLS)",
+                        user
+                    );
+                    return Ok(Some(principal));
+                }
+                crate::auth::identity::AuthResult::InvalidCredentials(reason) => {
+                    warn!("Authentication failed for user {} (TLS): {}", user, reason);
+                    // Note: send_error_response is for TcpStream, need generic version
+                    return Err(anyhow::anyhow!("Authentication failed: {}", reason));
+                }
+                _ => {
+                    // Fall through to passthrough
+                }
+            }
+        }
+    }
+    
+    // Passthrough mode
+    socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
+    socket.flush().await?;
+    
+    info!("Authentication completed for user: {} (TLS passthrough)", user);
+    Ok(None)
 }
 
 // ===== Extended Query Protocol Handlers =====
