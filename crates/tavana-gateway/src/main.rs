@@ -62,6 +62,10 @@ struct Args {
     /// Log level
     #[arg(long, env = "LOG_LEVEL", default_value = "info")]
     log_level: String,
+
+    /// Authentication mode: passthrough, required, or optional
+    #[arg(long, env = "TAVANA_AUTH_MODE", default_value = "passthrough")]
+    auth_mode: String,
 }
 
 #[tokio::main]
@@ -84,12 +88,29 @@ async fn main() -> anyhow::Result<()> {
     info!("  HTTP port: {}", args.http_port);
     info!("  TLS enabled: {}", args.tls_enabled);
     info!("  Worker address: {}", args.worker_addr);
+    info!("  Auth mode: {}", args.auth_mode);
 
     // Initialize Prometheus metrics
     metrics::init_metrics();
 
-    // Initialize shared auth service
-    let auth_service = Arc::new(AuthService::new());
+    // Initialize auth gateway based on configuration
+    let auth_config = auth::AuthConfig::from_env();
+    let auth_gateway = match auth::AuthGateway::new(auth_config).await {
+        Ok(gateway) => {
+            info!(
+                "Auth gateway initialized (mode: {:?})",
+                gateway.mode()
+            );
+            Arc::new(gateway)
+        }
+        Err(e) => {
+            warn!("Failed to initialize auth gateway: {} - using passthrough", e);
+            Arc::new(auth::AuthGateway::passthrough())
+        }
+    };
+
+    // Initialize shared auth service (with gateway for new auth)
+    let auth_service = Arc::new(AuthService::with_gateway(auth_gateway.clone()));
 
     // Initialize DataSizer for data estimation
     let data_sizer = Arc::new(DataSizer::new().await);
