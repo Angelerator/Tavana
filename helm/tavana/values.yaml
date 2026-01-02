@@ -23,6 +23,13 @@ gateway:
     repository: "tavana-gateway"
     tag: ""  # Defaults to global.imageTag
   
+  # K8s 1.35+: In-place resource updates (VPA can resize without pod restart)
+  # Enable this after upgrading to K8s 1.35+
+  resizePolicy:
+    enabled: false      # Set to true on K8s 1.35+
+    cpu: "NotRequired"  # CPU can resize without restart
+    memory: "RestartContainer"  # Memory resize requires container restart
+  
   service:
     type: ClusterIP
     pgPort: 5432       # PostgreSQL wire protocol
@@ -80,6 +87,27 @@ worker:
     repository: "tavana-worker"
     tag: ""  # Defaults to global.imageTag
   
+  # K8s 1.35+: In-place resource updates (VPA can resize without pod restart)
+  # Enable this after upgrading to K8s 1.35+
+  resizePolicy:
+    enabled: false      # Set to true on K8s 1.35+
+    cpu: "NotRequired"  # CPU can resize without restart
+    memory: "RestartContainer"  # Memory resize may require container restart
+  
+  # K8s 1.35+: Fine-grained restart rules for specific exit codes
+  # Enable this after upgrading to K8s 1.35+
+  restartPolicy:
+    # Uncomment to enable on K8s 1.35+:
+    # rules:
+    #   - exitCodes: [137]     # OOMKilled
+    #     action: Restart
+    #   - exitCodes: [143]     # SIGTERM
+    #     action: Restart
+    #   - exitCodes: [1]       # General error
+    #     action: Restart
+    #     maxRestarts: 3
+    rules: []
+  
   resources:
     requests:
       memory: "4Gi"
@@ -115,12 +143,19 @@ hpa:
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 60
+      # K8s 1.35+: Custom tolerance for more responsive scaling
+      # Default is 0.1 (10%). Set to 0.05 for 5% sensitivity.
+      # Uncomment after upgrading to K8s 1.35+:
+      # tolerance: 0.05
       policies:
         - type: Pods
           value: 2
           periodSeconds: 60
     scaleDown:
       stabilizationWindowSeconds: 300
+      # K8s 1.35+: Custom tolerance for scale-down decisions
+      # Uncomment after upgrading to K8s 1.35+:
+      # tolerance: 0.1
       policies:
         - type: Pods
           value: 1

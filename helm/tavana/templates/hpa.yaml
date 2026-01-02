@@ -29,10 +29,18 @@ spec:
   behavior:
     scaleUp:
       stabilizationWindowSeconds: {{ .Values.hpa.behavior.scaleUp.stabilizationWindowSeconds | default 60 }}
+      {{- if .Values.hpa.behavior.scaleUp.tolerance }}
+      # K8s 1.35+: Custom tolerance for more responsive scaling (default is 0.1 = 10%)
+      tolerance: {{ .Values.hpa.behavior.scaleUp.tolerance }}
+      {{- end }}
       policies:
         {{- toYaml (.Values.hpa.behavior.scaleUp.policies | default (list (dict "type" "Pods" "value" 2 "periodSeconds" 60))) | nindent 8 }}
     scaleDown:
       stabilizationWindowSeconds: {{ .Values.hpa.behavior.scaleDown.stabilizationWindowSeconds | default 300 }}
+      {{- if .Values.hpa.behavior.scaleDown.tolerance }}
+      # K8s 1.35+: Custom tolerance for scale-down decisions
+      tolerance: {{ .Values.hpa.behavior.scaleDown.tolerance }}
+      {{- end }}
       policies:
         {{- toYaml (.Values.hpa.behavior.scaleDown.policies | default (list (dict "type" "Pods" "value" 1 "periodSeconds" 120))) | nindent 8 }}
 {{- end }}
