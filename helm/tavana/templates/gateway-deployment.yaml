@@ -37,6 +37,14 @@ spec:
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          {{- if .Values.gateway.resizePolicy.enabled }}
+          # K8s 1.35+: In-place resource updates without pod restart
+          resizePolicy:
+            - resourceName: cpu
+              restartPolicy: {{ .Values.gateway.resizePolicy.cpu | default "NotRequired" }}
+            - resourceName: memory
+              restartPolicy: {{ .Values.gateway.resizePolicy.memory | default "RestartContainer" }}
+          {{- end }}
           ports:
             - name: pg
               containerPort: {{ .Values.gateway.service.pgPort }}

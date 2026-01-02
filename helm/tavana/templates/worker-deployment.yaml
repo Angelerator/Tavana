@@ -44,6 +44,19 @@ spec:
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          {{- if .Values.worker.resizePolicy.enabled }}
+          # K8s 1.35+: In-place resource updates without pod restart
+          resizePolicy:
+            - resourceName: cpu
+              restartPolicy: {{ .Values.worker.resizePolicy.cpu | default "NotRequired" }}
+            - resourceName: memory
+              restartPolicy: {{ .Values.worker.resizePolicy.memory | default "RestartContainer" }}
+          {{- end }}
+          {{- if .Values.worker.restartPolicy.rules }}
+          # K8s 1.35+: Fine-grained restart rules for specific exit codes
+          restartPolicyRules:
+            {{- toYaml .Values.worker.restartPolicy.rules | nindent 12 }}
+          {{- end }}
           ports:
             - name: grpc
               containerPort: 50053
