@@ -724,15 +724,21 @@ impl DuckDbExecutor {
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
 
-        // Clear any stale transaction state from previous failed queries.
-        // This ensures each query starts with a clean connection, preventing
-        // "Current transaction is aborted (please ROLLBACK)" errors.
-        // DuckDB silently ignores ROLLBACK if no transaction is active.
-        let _ = conn.execute("ROLLBACK", params![]);
+        // Execute the query
+        let result = (|| {
+            let mut stmt = conn.prepare(sql)?;
+            let batches: Vec<RecordBatch> = stmt.query_arrow(params![])?.collect();
+            Ok(batches)
+        })();
 
-        let mut stmt = conn.prepare(sql)?;
-        let batches = stmt.query_arrow(params![])?.collect();
-        Ok(batches)
+        // If query failed, rollback to clear any aborted transaction state
+        // This ensures the next query on this connection will succeed
+        if result.is_err() {
+            debug!("Query failed, rolling back to clear transaction state");
+            let _ = conn.execute("ROLLBACK", params![]);
+        }
+
+        result
     }
 
     /// Execute a query with parameters
@@ -754,12 +760,20 @@ impl DuckDbExecutor {
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
 
-        // Clear any stale transaction state from previous failed queries
-        let _ = conn.execute("ROLLBACK", params![]);
+        // Execute the query
+        let result = (|| {
+            let mut stmt = conn.prepare(sql)?;
+            let batches: Vec<RecordBatch> = stmt.query_arrow(params)?.collect();
+            Ok(batches)
+        })();
 
-        let mut stmt = conn.prepare(sql)?;
-        let batches = stmt.query_arrow(params)?.collect();
-        Ok(batches)
+        // If query failed, rollback to clear any aborted transaction state
+        if result.is_err() {
+            debug!("Query with params failed, rolling back to clear transaction state");
+            let _ = conn.execute("ROLLBACK", params![]);
+        }
+
+        result
     }
 
     /// Get pool size
