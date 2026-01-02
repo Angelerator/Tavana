@@ -1092,6 +1092,16 @@ async fn run_query_loop(
                     continue;
                 }
 
+                // Handle empty queries (sent by Metabase and other clients during connection test)
+                if query_trimmed.is_empty() {
+                    debug!("Empty query received (non-TLS), returning EmptyQueryResponse");
+                    // PostgreSQL protocol: send EmptyQueryResponse ('I') for empty queries
+                    socket.write_all(&[b'I', 0, 0, 0, 4]).await?; // EmptyQueryResponse
+                    socket.write_all(&ready).await?;
+                    socket.flush().await?;
+                    continue;
+                }
+
                 let query_id = uuid::Uuid::new_v4().to_string();
                 let estimate = query_router.route(&query).await;
                 let estimated_data_mb = estimate.data_size_mb;
@@ -1409,6 +1419,16 @@ where
                     let _ = worker_client.execute_query("ROLLBACK", user_id).await;
                     // Return success regardless of result (ROLLBACK always succeeds, even if no transaction)
                     send_simple_result_generic(socket, &[], &[], Some("ROLLBACK")).await?;
+                    socket.write_all(&ready).await?;
+                    socket.flush().await?;
+                    continue;
+                }
+
+                // Handle empty queries (sent by Metabase and other clients during connection test)
+                if query_trimmed.is_empty() {
+                    debug!("Empty query received (TLS), returning EmptyQueryResponse");
+                    // PostgreSQL protocol: send EmptyQueryResponse ('I') for empty queries
+                    socket.write_all(&[b'I', 0, 0, 0, 4]).await?; // EmptyQueryResponse
                     socket.write_all(&ready).await?;
                     socket.flush().await?;
                     continue;
