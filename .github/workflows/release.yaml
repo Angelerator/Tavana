@@ -88,6 +88,51 @@ jobs:
           cosign sign --yes docker.io/angelerator/tavana-${{ matrix.image }}@${{ steps.build.outputs.digest }}
           cosign sign --yes ghcr.io/${REPO_OWNER_LOWER}/tavana-${{ matrix.image }}@${{ steps.build.outputs.digest }}
 
+  # Push to Azure Container Registry for AKS deployment
+  push-to-acr:
+    name: Push to Azure Container Registry
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: ${{ vars.AZURE_ACR_NAME != '' }}  # Only run if ACR is configured
+    
+    strategy:
+      matrix:
+        image: [gateway, worker]
+    
+    steps:
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+      
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Login to ACR
+        run: |
+          az acr login --name ${{ vars.AZURE_ACR_NAME }}
+      
+      - name: Pull from Docker Hub
+        run: |
+          docker pull --platform linux/amd64 angelerator/tavana-${{ matrix.image }}:${{ steps.version.outputs.VERSION }}
+      
+      - name: Tag for ACR
+        run: |
+          docker tag angelerator/tavana-${{ matrix.image }}:${{ steps.version.outputs.VERSION }} \
+            ${{ vars.AZURE_ACR_NAME }}.azurecr.io/tavana-${{ matrix.image }}:${{ steps.version.outputs.VERSION }}
+          docker tag angelerator/tavana-${{ matrix.image }}:${{ steps.version.outputs.VERSION }} \
+            ${{ vars.AZURE_ACR_NAME }}.azurecr.io/tavana-${{ matrix.image }}:latest
+      
+      - name: Push to ACR
+        run: |
+          docker push ${{ vars.AZURE_ACR_NAME }}.azurecr.io/tavana-${{ matrix.image }}:${{ steps.version.outputs.VERSION }}
+          docker push ${{ vars.AZURE_ACR_NAME }}.azurecr.io/tavana-${{ matrix.image }}:latest
+      
+      - name: Logout from Azure
+        run: az logout
+        if: always()
+
   helm-release:
     name: Package & Publish Helm Chart
     runs-on: ubuntu-latest
@@ -132,6 +177,7 @@ jobs:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: [build-and-push, helm-release]
+    # Note: push-to-acr is optional, don't wait for it
     permissions:
       contents: write
     
