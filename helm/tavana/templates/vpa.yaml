@@ -1,0 +1,57 @@
+{{- if .Values.vpa.enabled }}
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: {{ include "tavana.fullname" . }}-gateway-vpa
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tavana.labels" . | nindent 4 }}
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: gateway
+  updatePolicy:
+    updateMode: {{ .Values.vpa.gateway.updateMode | default "Auto" }}
+  resourcePolicy:
+    containerPolicies:
+    - containerName: gateway
+      minAllowed:
+        cpu: {{ .Values.vpa.gateway.minCpu | default "100m" }}
+        memory: {{ .Values.vpa.gateway.minMemory | default "512Mi" }}
+      maxAllowed:
+        cpu: {{ .Values.vpa.gateway.maxCpu | default "4" }}
+        memory: {{ .Values.vpa.gateway.maxMemory | default "8Gi" }}
+      controlledResources:
+        - cpu
+        - memory
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: {{ include "tavana.fullname" . }}-worker-vpa
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tavana.labels" . | nindent 4 }}
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+  updatePolicy:
+    updateMode: {{ .Values.vpa.worker.updateMode | default "Auto" }}
+  resourcePolicy:
+    containerPolicies:
+    - containerName: worker
+      minAllowed:
+        cpu: {{ .Values.vpa.worker.minCpu | default "250m" }}
+        memory: {{ .Values.vpa.worker.minMemory | default "2Gi" }}
+      maxAllowed:
+        cpu: {{ .Values.vpa.worker.maxCpu | default "8" }}
+        memory: {{ .Values.vpa.worker.maxMemory | default "32Gi" }}
+      controlledResources:
+        - cpu
+        - memory
+{{- end }}
+
