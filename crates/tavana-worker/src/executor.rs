@@ -1133,6 +1133,7 @@ pub struct QueryStats {
 }
 
 /// Execution stats for billing
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ExecutionStats {
     pub execution_time_ms: u64,

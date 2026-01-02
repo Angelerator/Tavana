@@ -17,7 +17,7 @@ RUN cargo build --release -p tavana-worker
 # Runtime image
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/* && \
+RUN apt-get update && apt-get install -y ca-certificates curl unzip && rm -rf /var/lib/apt/lists/* && \
     # Create additional CA bundle paths that some SSL libraries look for
     ln -sf /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-bundle.crt && \
     mkdir -p /etc/pki/tls/certs && \
