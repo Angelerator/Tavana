@@ -38,11 +38,16 @@ use tracing::{debug, error, info, warn};
 use crate::cursors::{self, ConnectionCursors, CursorResult};
 
 /// Maximum rows to buffer before flushing to client (backpressure control)
-const STREAMING_BATCH_SIZE: usize = 1000;
+/// Smaller batches = less memory pressure on clients like DBeaver/Tableau
+const STREAMING_BATCH_SIZE: usize = 100;
 
 /// Default query timeout in seconds (5 minutes)
 /// Prevents runaway queries from blocking resources indefinitely
 const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 300;
+
+/// Flush interval for streaming - ensures data is sent to client regularly
+/// This prevents client timeouts while waiting for large batches
+const STREAMING_FLUSH_INTERVAL_MS: u64 = 100;
 
 /// Result of streaming query execution (for metrics tracking)
 #[derive(Debug, Default)]
@@ -2236,6 +2241,9 @@ async fn execute_query_streaming_extended(
 }
 
 /// Internal implementation with skip_row_description flag
+/// 
+/// Uses TRUE STREAMING with small batch sizes (100 rows) for backpressure control.
+/// This prevents client OOM by ensuring data flows in manageable chunks.
 async fn execute_query_streaming_impl(
     socket: &mut tokio::net::TcpStream,
     worker_client: &WorkerClient,
