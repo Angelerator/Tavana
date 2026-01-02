@@ -93,6 +93,31 @@ RUN curl -fsSL "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERS
 USER tavana
 WORKDIR /home/tavana
 
+# Create .duckdbrc with default settings applied to every connection
+# This eliminates SET commands at runtime for static configuration
+RUN cat > /home/tavana/.duckdbrc << 'EOF'
+-- Tavana DuckDB Default Configuration
+-- Applied automatically to every new connection
+
+-- Performance: disable progress bar (reduces overhead)
+SET enable_progress_bar = false;
+
+-- Performance: enable external file caching (speeds up repeated reads)
+SET enable_external_file_cache = true;
+
+-- Extensions: use pre-downloaded extensions only
+SET autoinstall_known_extensions = false;
+SET autoload_known_extensions = true;
+SET allow_community_extensions = true;
+
+-- I/O: optimize for cloud storage workloads
+SET preserve_insertion_order = false;
+
+-- Memory: configure for streaming (will be overridden at runtime if needed)
+-- Default streaming buffer for large result sets
+SET streaming_buffer_size = '100MB';
+EOF
+
 # Pre-load extensions at build time as the tavana user
 # This ensures extension cache and metadata are in the correct location
 # Benefits:
@@ -121,11 +146,17 @@ RUN set -eux && \
     " && \
     echo "✓ Extensions pre-loaded and verified"
 
+# Pre-create temp directory structure (avoid mkdir at runtime)
+RUN mkdir -p /tmp/duckdb/swap /tmp/duckdb/cache && \
+    chmod 755 /tmp/duckdb /tmp/duckdb/swap /tmp/duckdb/cache
+
 ENV HOME=/home/tavana
 ENV TEMP_DIR=/tmp/duckdb
 # Tell DuckDB to use pre-downloaded extensions (no network fetch at runtime)
 ENV DUCKDB_EXTENSION_AUTOINSTALL=false
 ENV DUCKDB_EXTENSION_AUTOLOAD=true
+# DuckDB will read .duckdbrc from HOME on every connection
+ENV DUCKDB_INIT_FILE=/home/tavana/.duckdbrc
 
 EXPOSE 50053
 
