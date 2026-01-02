@@ -26,6 +26,11 @@ gateway:
     pgPort: 5432       # PostgreSQL wire protocol
     httpPort: 8080     # Health + Metrics
   
+  # Arrow Flight SQL configuration (high-performance binary protocol)
+  flightSql:
+    enabled: true
+    port: 8815         # Arrow Flight gRPC port
+  
   # TLS configuration for PostgreSQL wire protocol
   tls:
     # Enable TLS/SSL support (accepts both SSL and non-SSL connections)

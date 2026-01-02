@@ -1,15 +1,14 @@
 //! Worker gRPC client for forwarding queries to DuckDB workers
-//! Supports both buffered and streaming execution modes
+//! 
+//! Supports TRUE STREAMING for memory-efficient large result sets.
+//! Data is streamed as JSON (Arrow IPC planned when DuckDB/Arrow versions align).
 
 use std::sync::Arc;
 use tavana_common::proto;
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 use uuid::Uuid;
-use arrow_ipc::reader::StreamReader;
-use arrow_ipc::reader::FileReader;
-use std::io::Cursor;
 
 /// Streaming batch types for true row-by-row streaming
 pub enum StreamingBatch {
@@ -17,6 +16,7 @@ pub enum StreamingBatch {
         columns: Vec<String>,
         column_types: Vec<String>,
     },
+    /// Rows as string values for PG wire protocol
     Rows(Vec<Vec<String>>),
     Error(String),
 }
@@ -141,7 +141,7 @@ impl WorkerClient {
                 }
                 Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
                     debug!("Received batch with {} rows", batch.row_count);
-                    // Decode JSON data
+                    // Decode JSON data (Arrow IPC planned when versions align)
                     if !batch.data.is_empty() {
                         if let Ok(batch_rows) =
                             serde_json::from_slice::<Vec<Vec<String>>>(&batch.data)
@@ -212,6 +212,7 @@ impl WorkerClient {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
 
         // Spawn a task to read from gRPC stream and forward to channel
+        // TRUE STREAMING: data flows directly without buffering
         tokio::spawn(async move {
             while let Ok(Some(batch)) = stream.message().await {
                 let result = match batch.result {
@@ -223,17 +224,10 @@ impl WorkerClient {
                     }
                     Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
                         if !batch.data.is_empty() {
-                            // Deserialize Arrow IPC format (binary, zero-copy)
-                            match deserialize_arrow_ipc_to_rows(&batch.data, &batch.schema) {
+                            // Decode JSON data (Arrow IPC planned when versions align)
+                            match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
                                 Ok(rows) => Ok(StreamingBatch::Rows(rows)),
-                                Err(e) => {
-                                    warn!("Failed to decode Arrow IPC batch, falling back to JSON: {}", e);
-                                    // Fallback to JSON for backward compatibility
-                                    match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
-                                        Ok(rows) => Ok(StreamingBatch::Rows(rows)),
-                                        Err(e2) => Err(anyhow::anyhow!("Failed to decode batch (Arrow IPC and JSON both failed): Arrow={}, JSON={}", e, e2)),
-                                    }
-                                }
+                                Err(e) => Err(anyhow::anyhow!("Failed to decode batch: {}", e)),
                             }
                         } else {
                             continue;
@@ -464,54 +458,4 @@ pub struct QueryResult {
     pub columns: Vec<ColumnInfo>,
     pub rows: Vec<Vec<String>>,
     pub total_rows: u64,
-}
-
-/// Deserialize Arrow IPC format to row vectors (for PostgreSQL wire protocol)
-/// This converts Arrow's columnar format to row-oriented format
-pub fn deserialize_arrow_ipc_to_rows(
-    data: &[u8],
-    schema_bytes: &[u8],
-) -> Result<Vec<Vec<String>>, anyhow::Error> {
-    use arrow::util::display::ArrayFormatter;
-    use arrow::util::display::FormatOptions;
-    
-    // Arrow IPC streaming format: data contains record batches
-    // In Arrow IPC streaming format, schema is embedded in the stream
-    // If schema_bytes is provided separately, we can use it, but StreamReader reads from data
-    let mut cursor = Cursor::new(data);
-    
-    // Arrow IPC 56: StreamReader reads schema from the stream itself
-    // If we have separate schema_bytes, we can validate, but StreamReader doesn't take it as parameter
-    let mut reader = StreamReader::try_new(cursor, None)
-        .map_err(|e| anyhow::anyhow!("Failed to create Arrow IPC stream reader: {}", e))?;
-    
-    let mut all_rows = Vec::new();
-    
-    // Read all batches from the stream
-    while let Some(batch_result) = reader.next() {
-        let batch = batch_result
-            .map_err(|e| anyhow::anyhow!("Failed to read Arrow batch: {}", e))?;
-        
-        // Convert columnar Arrow format to row-oriented format
-        let num_rows = batch.num_rows();
-        let num_cols = batch.num_columns();
-        
-        // Arrow 56 requires FormatOptions for ArrayFormatter
-        use arrow::util::display::FormatOptions;
-        let format_options = FormatOptions::default();
-        
-        for row_idx in 0..num_rows {
-            let mut row = Vec::with_capacity(num_cols);
-            for col_idx in 0..num_cols {
-                let col = batch.column(col_idx);
-                let formatter = ArrayFormatter::try_new(col.as_ref(), &format_options)
-                    .map_err(|e| anyhow::anyhow!("Failed to create formatter for column {}: {}", col_idx, e))?;
-                let value = formatter.value(row_idx);
-                row.push(value.to_string());
-            }
-            all_rows.push(row);
-        }
-    }
-    
-    Ok(all_rows)
 }
