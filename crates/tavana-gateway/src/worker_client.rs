@@ -62,7 +62,12 @@ impl WorkerClient {
         let channel = Channel::from_shared(self.worker_addr.clone())?
             .timeout(std::time::Duration::from_secs(1800)) // 30 minutes
             .connect_timeout(std::time::Duration::from_secs(30))
+            // TCP keepalive - OS-level connection health check
             .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
+            // HTTP/2 keepalive - application-level PING frames for faster detection
+            .http2_keep_alive_interval(std::time::Duration::from_secs(10))
+            .keep_alive_timeout(std::time::Duration::from_secs(20))
+            .keep_alive_while_idle(true)
             .connect()
             .await?;
 

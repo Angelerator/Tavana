@@ -240,6 +240,11 @@ impl DuckDbExecutor {
             tracing::debug!("Could not set streaming_buffer_size: {}", e);
         }
 
+        // Disable progress bar to reduce overhead (saves CPU cycles on query tracking)
+        if let Err(e) = connection.execute("SET enable_progress_bar = false", params![]) {
+            tracing::debug!("Could not disable progress bar: {}", e);
+        }
+
         // Enable auto-install for extensions (allows on-demand installation at query time)
         // Extensions not pre-installed will be downloaded from DuckDB's extension repository
         connection.execute("SET autoinstall_known_extensions = true", params![])?;
