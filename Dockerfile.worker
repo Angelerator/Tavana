@@ -127,23 +127,7 @@ EOF
 # 4. Eliminates "extension not found" errors on first query
 RUN set -eux && \
     echo "Pre-loading DuckDB extensions at build time (as tavana user)..." && \
-    duckdb -c "
-        SET home_directory = '/home/tavana';
-        SET extension_directory = '/home/tavana/.duckdb/extensions';
-        -- Load all pre-downloaded extensions to initialize them
-        LOAD parquet;
-        LOAD json;
-        LOAD httpfs;
-        LOAD azure;
-        LOAD aws;
-        LOAD delta;
-        LOAD iceberg;
-        LOAD icu;
-        LOAD fts;
-        LOAD inet;
-        -- Verify extensions are loaded
-        SELECT extension_name, loaded FROM duckdb_extensions() WHERE loaded = true ORDER BY extension_name;
-    " && \
+    duckdb -c "SET home_directory = '/home/tavana'; SET extension_directory = '/home/tavana/.duckdb/extensions'; LOAD parquet; LOAD json; LOAD httpfs; LOAD azure; LOAD aws; LOAD delta; LOAD iceberg; LOAD icu; LOAD fts; LOAD inet; SELECT extension_name, loaded FROM duckdb_extensions() WHERE loaded = true ORDER BY extension_name;" && \
     echo "✓ Extensions pre-loaded and verified"
 
 # Pre-create temp directory structure (avoid mkdir at runtime)
