@@ -227,15 +227,69 @@ impl DuckDbExecutor {
         Some(handle)
     }
 
+    /// Load .duckdbrc configuration file if it exists
+    /// This file is created at Docker build time with static settings
+    /// Benefits: Single source of truth, no hardcoded values in Rust
+    fn load_duckdbrc(connection: &Connection) {
+        // Check for .duckdbrc in order of precedence:
+        // 1. DUCKDB_INIT_FILE env var (Docker sets this)
+        // 2. $HOME/.duckdbrc
+        // 3. /home/tavana/.duckdbrc (fallback)
+        let init_file = std::env::var("DUCKDB_INIT_FILE")
+            .ok()
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| format!("{}/.duckdbrc", h))
+            })
+            .unwrap_or_else(|| "/home/tavana/.duckdbrc".to_string());
+
+        let path = std::path::Path::new(&init_file);
+        if !path.exists() {
+            tracing::debug!("No .duckdbrc found at {}, using defaults", init_file);
+            // Fallback to essential defaults if no .duckdbrc
+            let _ = connection.execute("SET enable_progress_bar = false", params![]);
+            let _ = connection.execute("SET autoload_known_extensions = true", params![]);
+            return;
+        }
+
+        tracing::info!("Loading DuckDB settings from {}", init_file);
+        
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                // Execute each non-comment line as a SQL statement
+                for line in contents.lines() {
+                    let line = line.trim();
+                    // Skip empty lines and comments
+                    if line.is_empty() || line.starts_with("--") || line.starts_with("#") {
+                        continue;
+                    }
+                    // Execute the SET command
+                    if let Err(e) = connection.execute(line, params![]) {
+                        tracing::debug!("Could not execute '{}': {}", line, e);
+                    }
+                }
+                tracing::debug!("Loaded settings from .duckdbrc");
+            }
+            Err(e) => {
+                tracing::warn!("Could not read {}: {}", init_file, e);
+            }
+        }
+    }
+
     /// Create a single DuckDB connection
     fn create_connection(max_memory: u64, threads: u32) -> Result<Connection> {
         let connection = Connection::open_in_memory()?;
 
+        // Dynamic settings that depend on pod resources
         connection.execute(&format!("SET memory_limit = '{}B'", max_memory), params![])?;
         connection.execute(&format!("SET threads = {}", threads), params![])?;
 
-        // Enable parallel streaming for large result sets (DuckDB 1.1.0+)
-        // This allows results to be streamed to clients without full materialization
+        // Load .duckdbrc if present (created at Docker build time)
+        // This applies static settings without hardcoding them in Rust
+        Self::load_duckdbrc(&connection);
+
+        // Dynamic streaming buffer (can be overridden by env var)
         let streaming_buffer = std::env::var("DUCKDB_STREAMING_BUFFER_SIZE")
             .unwrap_or_else(|_| "100MB".to_string());
         if let Err(e) = connection.execute(
@@ -243,22 +297,6 @@ impl DuckDbExecutor {
             params![]
         ) {
             tracing::debug!("Could not set streaming_buffer_size: {}", e);
-        }
-
-        // Disable progress bar to reduce overhead (saves CPU cycles on query tracking)
-        if let Err(e) = connection.execute("SET enable_progress_bar = false", params![]) {
-            tracing::debug!("Could not disable progress bar: {}", e);
-        }
-
-        // Enable auto-install for extensions (allows on-demand installation at query time)
-        // Extensions not pre-installed will be downloaded from DuckDB's extension repository
-        connection.execute("SET autoinstall_known_extensions = true", params![])?;
-        connection.execute("SET autoload_known_extensions = true", params![])?;
-        
-        // Allow community extensions (not just core extensions)
-        // This enables installation of any extension from the DuckDB community repository
-        if let Err(e) = connection.execute("SET allow_community_extensions = true", params![]) {
-            tracing::debug!("Could not enable community extensions: {}", e);
         }
 
         // Load pre-installed extensions from Docker image
