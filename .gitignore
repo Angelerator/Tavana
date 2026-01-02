@@ -47,6 +47,12 @@ kubeconfig.yaml
 
 # Helm
 helm/**/*.tgz
+# Customer-specific values (use *.example.yaml as template)
+helm/**/values-*.local.yaml
+helm/**/values-customer*.yaml
+helm/**/values-prod*.yaml
+helm/**/values-staging*.yaml
+!helm/**/values-*.example.yaml
 
 # Logs
 *.log

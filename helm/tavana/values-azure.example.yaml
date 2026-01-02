@@ -1,0 +1,41 @@
+# Tavana Helm Chart - Azure Example Values
+# 
+# This is an EXAMPLE file. Copy and customize for your environment:
+#   cp values-azure.example.yaml values-mycompany.yaml
+#   # Edit values-mycompany.yaml with your settings
+#   # Add values-mycompany.yaml to .gitignore
+#
+# Deploy with:
+#   helm install tavana ./helm/tavana -f values-azure.yaml -f values-mycompany.yaml
+
+global:
+  namespace: tavana
+  # Your Azure Container Registry
+  imageRegistry: "myacr.azurecr.io"
+  imageTag: "1.0.73"
+
+# Azure Storage Account for Delta Lake
+config:
+  azure:
+    storageAccountName: "mystorageaccount"
+    containerName: "my-data-container"
+  
+  # Azure AD / Entra ID for Workload Identity
+  workloadIdentity:
+    clientId: "00000000-0000-0000-0000-000000000000"
+    tenantId: "00000000-0000-0000-0000-000000000000"
+
+# Ingress for external access
+ingress:
+  enabled: true
+  className: "azure-application-gateway"
+  hosts:
+    - host: tavana.mycompany.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: tavana-tls
+      hosts:
+        - tavana.mycompany.com
+

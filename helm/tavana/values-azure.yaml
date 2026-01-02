@@ -9,12 +9,16 @@
 # Global settings
 global:
   namespace: tavana
-  # Container registry - Use ACR for Azure deployments
-  # The AKS cluster network blocks external registries (GHCR, Docker Hub)
-  # Always use ACR: acrtavanadev.azurecr.io
-  imageRegistry: "acrtavanadev.azurecr.io"
+  # Container registry - Override with your ACR at deploy time:
+  #   helm install tavana ./helm/tavana -f values-azure.yaml \
+  #     --set global.imageRegistry=YOUR_ACR.azurecr.io \
+  #     --set global.imageTag=1.0.73
+  # 
+  # NOTE: Many enterprise AKS clusters block external registries (GHCR, Docker Hub)
+  # due to firewall rules. Always use your private ACR in those cases.
+  imageRegistry: ""  # REQUIRED: Set via --set global.imageRegistry=YOUR_ACR.azurecr.io
   imagePullPolicy: Always
-  imageTag: "1.0.73"
+  imageTag: ""       # REQUIRED: Set via --set global.imageTag=VERSION
 
 # Private registry credentials (optional for Docker Hub public, required for ACR)
 imagePullSecrets: []
