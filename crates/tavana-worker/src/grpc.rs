@@ -7,7 +7,12 @@ use crate::cursor_manager::{CursorManager, CursorManagerConfig};
 use crate::executor::{DuckDbExecutor, ExecutorConfig};
 use duckdb::arrow::array::Array;
 use duckdb::arrow::util::display::ArrayFormatter;
+use duckdb::arrow::array::RecordBatch as DuckDbRecordBatch;
+use arrow_ipc::writer::StreamWriter;
+use arrow_ipc::writer::FileWriter;
+use arrow::record_batch::RecordBatch as ArrowRecordBatch;
 use std::sync::Arc;
+use std::io::Cursor;
 use tavana_common::proto;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -106,8 +111,10 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
 
             // Use the streaming API - batches are sent as they're produced
             let result = executor.execute_query_streaming(&sql, |batch| {
-                // On first batch, send metadata
-                if !metadata_sent {
+                let is_first_batch = !metadata_sent;
+                
+                // On first batch, extract schema and send metadata
+                if is_first_batch {
                     let schema = batch.schema();
                     columns = schema.fields().iter().map(|f| f.name().clone()).collect();
                     column_types = schema.fields().iter().map(|f| format!("{:?}", f.data_type())).collect();
@@ -132,24 +139,81 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                     debug!("Sent metadata: {} columns", columns.len());
                 }
 
-                // Serialize and send this batch immediately (TRUE STREAMING)
-                let mut rows_json: Vec<Vec<String>> = Vec::with_capacity(batch.num_rows());
-                for row_idx in 0..batch.num_rows() {
-                    let mut row: Vec<String> = Vec::with_capacity(batch.num_columns());
-                    for col_idx in 0..batch.num_columns() {
-                        let col = batch.column(col_idx);
-                        let value = format_array_value(col.as_ref(), row_idx);
-                        row.push(value);
-                    }
-                    rows_json.push(row);
-                }
-
+                // Serialize to Arrow IPC format (zero-copy, binary, efficient)
                 total_rows += batch.num_rows() as u64;
-                let json_data = serde_json::to_vec(&rows_json).unwrap_or_default();
+                
+                // DuckDB uses Arrow internally - DuckDB's RecordBatch IS Arrow's RecordBatch
+                // Since versions match (56), we can use them directly
+                let schema = batch.schema();
+                let schema_ref: &duckdb::arrow::datatypes::Schema = schema.as_ref();
+                
+                // DuckDB's RecordBatch is Arrow's RecordBatch - use directly
+                // Extract columns - DuckDB columns are Arrow arrays
+                let mut arrow_columns: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
+                for i in 0..batch.num_columns() {
+                    let duckdb_col = batch.column(i);
+                    // Clone the Arc - DuckDB's Array is Arrow's Array (same version)
+                    arrow_columns.push(Arc::clone(duckdb_col));
+                }
+                
+                // Create Arrow RecordBatch using DuckDB's schema (which is Arrow's schema)
+                let arrow_batch_result = ArrowRecordBatch::try_new(
+                    schema.clone(), // DuckDB Schema is Arrow Schema
+                    arrow_columns,
+                );
+                
+                let (schema_bytes, batch_bytes) = match arrow_batch_result {
+                    Ok(arrow_batch) => {
+                        // Serialize schema (only on first batch)
+                        let schema_bytes = if is_first_batch {
+                            let mut schema_buffer = Vec::new();
+                            {
+                                // DuckDB Schema is Arrow Schema - use directly
+                                let mut writer = FileWriter::try_new(&mut schema_buffer, schema_ref)
+                                    .map_err(|e| anyhow::anyhow!("Failed to create Arrow schema writer: {}", e))?;
+                                writer.finish()
+                                    .map_err(|e| anyhow::anyhow!("Failed to finish Arrow schema writer: {}", e))?;
+                            }
+                            schema_buffer
+                        } else {
+                            Vec::new()
+                        };
+                        
+                        // Serialize record batch to Arrow IPC streaming format
+                        let mut batch_buffer = Vec::new();
+                        {
+                            // Use DuckDB's schema (which is Arrow's schema)
+                            let mut writer = StreamWriter::try_new(&mut batch_buffer, schema_ref)
+                                .map_err(|e| anyhow::anyhow!("Failed to create Arrow IPC writer: {}", e))?;
+                            writer.write(&arrow_batch)
+                                .map_err(|e| anyhow::anyhow!("Failed to write Arrow batch: {}", e))?;
+                            writer.finish()
+                                .map_err(|e| anyhow::anyhow!("Failed to finish Arrow IPC writer: {}", e))?;
+                        }
+                        
+                        (schema_bytes, batch_buffer)
+                    }
+                    Err(e) => {
+                        // Fallback to JSON if Arrow IPC conversion fails
+                        warn!("Arrow IPC conversion failed, falling back to JSON: {}", e);
+                        let mut rows_json: Vec<Vec<String>> = Vec::with_capacity(batch.num_rows());
+                        for row_idx in 0..batch.num_rows() {
+                            let mut row: Vec<String> = Vec::with_capacity(batch.num_columns());
+                            for col_idx in 0..batch.num_columns() {
+                                let col = batch.column(col_idx);
+                                let value = format_array_value(col.as_ref(), row_idx);
+                                row.push(value);
+                            }
+                            rows_json.push(row);
+                        }
+                        let json_data = serde_json::to_vec(&rows_json).unwrap_or_default();
+                        (Vec::new(), json_data)
+                    }
+                };
 
                 let arrow_batch = proto::ArrowRecordBatch {
-                    schema: vec![],
-                    data: json_data,
+                    schema: schema_bytes, // Arrow IPC schema (empty if not first batch or fallback)
+                    data: batch_bytes, // Arrow IPC binary format (or JSON fallback)
                     row_count: batch.num_rows() as u64,
                 };
 
