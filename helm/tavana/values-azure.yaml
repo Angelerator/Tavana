@@ -58,15 +58,16 @@ worker:
   image:
     repository: tavana-worker
   
-  # Resource sizing for D4s_v3 nodes (4 vCPU, 16 GB)
-  # Each worker can handle large queries with up to 12GB RAM
+  # Resource sizing optimized by VPA
+  # Smaller limits allow more workers = better parallelism
+  # VPA will adjust based on actual usage
   resources:
     requests:
-      memory: "2Gi"
-      cpu: "500m"
+      memory: "2Gi"       # VPA recommendation
+      cpu: "250m"         # VPA recommendation
     limits:
-      memory: "12Gi"      # Large limit for heavy queries
-      cpu: "3500m"        # Almost full node CPU
+      memory: "4Gi"       # Allow bursting to 4Gi
+      cpu: "2"            # 2 cores max per worker
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AUTOSCALING (HPA)
