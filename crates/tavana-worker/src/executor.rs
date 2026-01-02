@@ -70,6 +70,7 @@ pub struct PoolStats {
 /// DuckDB query executor with connection pool
 ///
 /// Maintains multiple DuckDB connections for parallel query execution.
+#[allow(dead_code)]
 pub struct DuckDbExecutor {
     connections: Vec<Arc<PooledConnection>>,
     semaphore: Arc<Semaphore>,
@@ -83,6 +84,7 @@ pub struct DuckDbExecutor {
     query_count: std::sync::atomic::AtomicU64,
 }
 
+#[allow(dead_code)]
 impl DuckDbExecutor {
     /// Create a new DuckDB executor with connection pool
     pub fn new(config: ExecutorConfig) -> Result<Self> {
