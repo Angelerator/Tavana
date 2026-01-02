@@ -64,7 +64,7 @@ spec:
             - name: FLIGHT_SQL_ENABLED
               value: "{{ .Values.gateway.flightSql.enabled | default true }}"
             - name: FLIGHT_SQL_PORT
-              value: "{{ .Values.gateway.flightSql.port | default 8815 }}"
+              value: "{{ .Values.gateway.flightSql.port | default 9091 }}"
             # TLS configuration
             - name: TLS_ENABLED
               value: "{{ .Values.gateway.tls.enabled | default false }}"

@@ -49,7 +49,7 @@ struct Args {
     pg_port: u16,
 
     /// Arrow Flight SQL port (high-performance binary protocol)
-    #[arg(long, env = "FLIGHT_SQL_PORT", default_value = "8815")]
+    #[arg(long, env = "FLIGHT_SQL_PORT", default_value = "9091")]
     flight_sql_port: u16,
 
     /// HTTP metrics and health check port
