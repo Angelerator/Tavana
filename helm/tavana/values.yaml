@@ -4,6 +4,8 @@
 # Global settings
 global:
   namespace: tavana
+  # Container registry - GHCR for public, ACR for Azure (see values-azure.yaml)
+  # NOTE: Some AKS clusters block external registries. Use ACR in those cases.
   imageRegistry: "ghcr.io/angelerator"
   imagePullPolicy: IfNotPresent
   imageTag: "latest"
