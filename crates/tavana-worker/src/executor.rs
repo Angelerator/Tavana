@@ -724,6 +724,12 @@ impl DuckDbExecutor {
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
 
+        // Clear any stale transaction state from previous failed queries.
+        // This ensures each query starts with a clean connection, preventing
+        // "Current transaction is aborted (please ROLLBACK)" errors.
+        // DuckDB silently ignores ROLLBACK if no transaction is active.
+        let _ = conn.execute("ROLLBACK", params![]);
+
         let mut stmt = conn.prepare(sql)?;
         let batches = stmt.query_arrow(params![])?.collect();
         Ok(batches)
@@ -739,11 +745,17 @@ impl DuckDbExecutor {
         // Increment query counter for metrics
         self.query_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         
+        // Refresh Azure token if needed
+        self.check_azure_token_emergency_refresh();
+        
         let pooled_conn = self.get_connection();
         let conn = pooled_conn
             .connection
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        // Clear any stale transaction state from previous failed queries
+        let _ = conn.execute("ROLLBACK", params![]);
 
         let mut stmt = conn.prepare(sql)?;
         let batches = stmt.query_arrow(params)?.collect();

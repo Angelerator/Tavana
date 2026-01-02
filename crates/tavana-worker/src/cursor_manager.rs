@@ -264,6 +264,9 @@ impl CursorManager {
 
         info!(cursor_id = %cursor_id, sql = %&sql[..sql.len().min(100)], "Declaring cursor");
 
+        // Clear any stale transaction state before executing cursor query
+        let _ = connection.execute("ROLLBACK", params![]);
+
         // Execute query and collect batches
         let mut stmt = connection.prepare(sql)?;
         let arrow_result = stmt.query_arrow(params![])?;
