@@ -87,8 +87,10 @@ COPY --from=builder /app/target/release/tavana-worker /usr/local/bin/
 
 # Download DuckDB CLI for extension verification (as root, before switching user)
 ARG DUCKDB_VERSION=v1.4.3
-RUN curl -fsSL "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip" -o /tmp/duckdb.zip && \
-    cd /tmp && unzip -oq duckdb.zip && chmod +x duckdb && mv duckdb /usr/local/bin/ && rm duckdb.zip
+RUN mkdir -p /tmp/duckdb_cli && \
+    curl -fsSL "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip" -o /tmp/duckdb_cli/duckdb.zip && \
+    cd /tmp/duckdb_cli && unzip -oq duckdb.zip && chmod +x duckdb && mv duckdb /usr/local/bin/ && \
+    rm -rf /tmp/duckdb_cli
 
 USER tavana
 WORKDIR /home/tavana
