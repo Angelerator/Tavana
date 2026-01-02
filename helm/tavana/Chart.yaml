@@ -3,8 +3,8 @@ name: tavana
 description: Cloud-Agnostic Auto-Scaling DuckDB Query Platform
 
 type: application
-version: 1.0.71
-appVersion: "1.0.71"
+version: 1.0.72
+appVersion: "1.0.72"
 
 keywords:
   - duckdb
