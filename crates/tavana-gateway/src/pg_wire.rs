@@ -1650,12 +1650,26 @@ where
             }
             b'E' => {
                 // Execute - for Extended Query Protocol
-                // RowDescription was already sent during Describe phase
-                // We only send DataRows and CommandComplete here
+                // Message format: portal_name (C string) + max_rows (int32)
+                // max_rows = 0 means unlimited, otherwise limit to that many rows
+                // This is how JDBC clients control streaming via setFetchSize()
                 socket.read_exact(&mut buf).await?;
                 let len = u32::from_be_bytes(buf) as usize - 4;
                 let mut data = vec![0u8; len];
                 socket.read_exact(&mut data).await?;
+                
+                // Parse Execute message: portal name (null-terminated) + max_rows (4 bytes)
+                let portal_end = data.iter().position(|&b| b == 0).unwrap_or(0);
+                let max_rows = if portal_end + 5 <= data.len() {
+                    let max_rows_bytes = &data[portal_end + 1..portal_end + 5];
+                    i32::from_be_bytes([max_rows_bytes[0], max_rows_bytes[1], max_rows_bytes[2], max_rows_bytes[3]])
+                } else {
+                    0 // Unlimited
+                };
+                
+                if max_rows > 0 {
+                    debug!("Extended Protocol - Execute with max_rows={} (client streaming mode)", max_rows);
+                }
                 
                 if let Some(ref sql) = prepared_query {
                     // CRITICAL: If Describe sent NoData, we MUST NOT send DataRows
@@ -1678,7 +1692,7 @@ where
                         socket.flush().await?;
                     } else {
                         // Describe sent RowDescription, so we can send DataRows
-                        info!("Extended Protocol - Execute: Describe sent RowDescription ({} cols), executing query", describe_column_count);
+                        info!("Extended Protocol - Execute: Describe sent RowDescription ({} cols), max_rows={}, executing query", describe_column_count, max_rows);
                         let result = execute_query_extended_protocol(
                             socket,
                             worker_client,
@@ -1687,13 +1701,36 @@ where
                             user_id,
                             smart_scaler,
                             describe_column_count,
+                            max_rows,
                         ).await;
                         
-                        if let Err(e) = result {
-                            error!("Extended Protocol - Execute: query failed: {}", e);
-                            send_error_generic(socket, &e.to_string()).await?;
+                        match result {
+                            Ok((rows_sent, more_available)) => {
+                                if more_available {
+                                    // Send PortalSuspended - indicates more rows are available
+                                    // Client will send another Execute to get more rows
+                                    debug!("Extended Protocol - Execute: {} rows sent, sending PortalSuspended", rows_sent);
+                                    socket.write_all(&[b's', 0, 0, 0, 4]).await?; // PortalSuspended
+                                    socket.flush().await?;
+                                    // DON'T clear prepared_query - client will Execute again
+                                } else {
+                                    // All rows sent - send CommandComplete
+                                    let cmd_tag = format!("SELECT {}", rows_sent);
+                                    let cmd = cmd_tag.as_bytes();
+                                    let cmd_len = (4 + cmd.len() + 1) as u32;
+                                    let mut msg = vec![b'C'];
+                                    msg.extend_from_slice(&cmd_len.to_be_bytes());
+                                    msg.extend_from_slice(cmd);
+                                    msg.push(0);
+                                    socket.write_all(&msg).await?;
+                                    socket.flush().await?;
+                                }
+                            }
+                            Err(e) => {
+                                error!("Extended Protocol - Execute: query failed: {}", e);
+                                send_error_generic(socket, &e.to_string()).await?;
+                            }
                         }
-                        // CommandComplete is sent by execute_query_extended_protocol
                     }
                 } else {
                     // No prepared statement - send empty CommandComplete
@@ -1883,6 +1920,8 @@ where
 /// Unlike execute_query_tls, this does NOT send RowDescription because
 /// it was already sent during the Describe phase.
 /// `expected_column_count` ensures DataRow column count matches RowDescription.
+/// `max_rows` controls streaming - if > 0, limits rows sent and sends PortalSuspended
+/// instead of CommandComplete when limit is reached (enabling JDBC cursor streaming).
 async fn execute_query_extended_protocol<S>(
     socket: &mut S,
     worker_client: &WorkerClient,
@@ -1891,7 +1930,8 @@ async fn execute_query_extended_protocol<S>(
     user_id: &str,
     _smart_scaler: Option<&SmartScaler>,
     expected_column_count: usize,
-) -> anyhow::Result<usize>
+    max_rows: i32,
+) -> anyhow::Result<(usize, bool)>  // Returns (rows_sent, more_rows_available)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1901,7 +1941,7 @@ where
     if let Some(result) = handle_pg_specific_command(sql) {
         // For extended protocol, don't send RowDescription again (it was sent during Describe or NoData was sent)
         send_data_rows_only_generic(socket, &result.rows, result.rows.len(), result.command_tag.as_deref(), expected_column_count).await?;
-        return Ok(result.rows.len());
+        return Ok((result.rows.len(), false)); // PG commands are always complete
     }
     
     // Handle COPY commands by extracting inner query
@@ -1942,16 +1982,35 @@ where
         }
     };
     
-    let row_count = rows.len();
+    let total_rows = rows.len();
     
-    // For Extended Protocol, only send DataRows and CommandComplete
+    // Apply max_rows limit if specified (JDBC cursor streaming mode)
+    // max_rows > 0 means the client wants to stream in chunks
+    let (rows_to_send, more_available) = if max_rows > 0 && (max_rows as usize) < total_rows {
+        info!(
+            max_rows = max_rows,
+            total_rows = total_rows,
+            "Extended Protocol - Streaming with max_rows limit (JDBC cursor mode)"
+        );
+        (&rows[..(max_rows as usize)], true)
+    } else {
+        (&rows[..], false)
+    };
+    
+    let row_count = rows_to_send.len();
+    
+    // For Extended Protocol, only send DataRows
     // RowDescription was already sent during Describe phase
     // Use expected_column_count to ensure DataRow column count matches
-    send_data_rows_only_generic(socket, &rows, row_count, None, expected_column_count).await?;
+    send_data_rows_only_generic(socket, rows_to_send, row_count, None, expected_column_count).await?;
     
-    debug!("Extended Protocol Execute completed: {} rows", row_count);
+    if more_available {
+        debug!("Extended Protocol Execute: {} rows sent, more available (PortalSuspended)", row_count);
+    } else {
+        debug!("Extended Protocol Execute completed: {} rows (all sent)", row_count);
+    }
     
-    Ok(row_count)
+    Ok((row_count, more_available))
 }
 
 /// Execute query on a specific worker address and return buffered results
