@@ -264,18 +264,28 @@ impl CursorManager {
 
         info!(cursor_id = %cursor_id, sql = %&sql[..sql.len().min(100)], "Declaring cursor");
 
-        // Clear any stale transaction state before executing cursor query
-        let _ = connection.execute("ROLLBACK", params![]);
+        // Execute query and collect batches, rolling back on error
+        let execute_result = (|| -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
+            let mut stmt = connection.prepare(sql)?;
+            let arrow_result = stmt.query_arrow(params![])?;
+            
+            // Get schema before consuming iterator
+            let schema = arrow_result.get_schema();
 
-        // Execute query and collect batches
-        let mut stmt = connection.prepare(sql)?;
-        let arrow_result = stmt.query_arrow(params![])?;
-        
-        // Get schema before consuming iterator
-        let schema = arrow_result.get_schema();
+            // Collect all batches (DuckDB streams internally with streaming_buffer_size)
+            let batches: Vec<RecordBatch> = arrow_result.collect();
+            Ok((schema, batches))
+        })();
 
-        // Collect all batches (DuckDB streams internally with streaming_buffer_size)
-        let batches: Vec<RecordBatch> = arrow_result.collect();
+        // Rollback on error to clear transaction state for next query on this connection
+        let (schema, batches) = match execute_result {
+            Ok(result) => result,
+            Err(e) => {
+                debug!("Cursor query failed, rolling back to clear transaction state");
+                let _ = connection.execute("ROLLBACK", params![]);
+                return Err(e);
+            }
+        };
 
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         info!(
