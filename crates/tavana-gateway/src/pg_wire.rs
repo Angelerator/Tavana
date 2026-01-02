@@ -2534,31 +2534,22 @@ async fn execute_query_streaming_to_worker_impl(
             }
             Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
                 if !batch.data.is_empty() {
-                    // Deserialize Arrow IPC format (binary, efficient)
-                    let rows = match crate::worker_client::deserialize_arrow_ipc_to_rows(&batch.data, &batch.schema) {
-                        Ok(rows) => rows,
-                        Err(e) => {
-                            warn!("Failed to decode Arrow IPC batch, falling back to JSON: {}", e);
-                            // Fallback to JSON for backward compatibility
-                            serde_json::from_slice::<Vec<Vec<String>>>(&batch.data)
-                                .map_err(|e2| anyhow::anyhow!("Failed to decode batch (Arrow IPC and JSON both failed): Arrow={}, JSON={}", e, e2))?
-                        }
-                    };
-                    
-                    for row in rows {
-                        send_data_row(socket, &row).await?;
-                        total_rows += 1;
-                        batch_rows += 1;
+                    if let Ok(rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                        for row in rows {
+                            send_data_row(socket, &row).await?;
+                            total_rows += 1;
+                            batch_rows += 1;
 
-                        // Flush every STREAMING_BATCH_SIZE rows for backpressure
-                        if batch_rows >= STREAMING_BATCH_SIZE {
-                            socket.flush().await?;
-                            batch_rows = 0;
-                        }
+                            // Flush every STREAMING_BATCH_SIZE rows for backpressure
+                            if batch_rows >= STREAMING_BATCH_SIZE {
+                                socket.flush().await?;
+                                batch_rows = 0;
+                            }
 
-                        // Log progress for very large queries
-                        if total_rows % 1_000_000 == 0 {
-                            info!("Streaming progress: {} rows sent", total_rows);
+                            // Log progress for very large queries
+                            if total_rows % 1_000_000 == 0 {
+                                info!("Streaming progress: {} rows sent", total_rows);
+                            }
                         }
                     }
                 }

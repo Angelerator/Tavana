@@ -14,6 +14,7 @@
 mod auth;
 mod cursors;
 mod data_sizer;
+mod flight_sql;
 mod metrics;
 mod pg_wire;
 mod query_queue;
@@ -47,6 +48,10 @@ struct Args {
     #[arg(long, env = "PG_PORT", default_value = "15432")]
     pg_port: u16,
 
+    /// Arrow Flight SQL port (high-performance binary protocol)
+    #[arg(long, env = "FLIGHT_SQL_PORT", default_value = "8815")]
+    flight_sql_port: u16,
+
     /// HTTP metrics and health check port
     #[arg(long, env = "HTTP_PORT", default_value = "8080")]
     http_port: u16,
@@ -58,6 +63,10 @@ struct Args {
     /// Enable TLS
     #[arg(long, env = "TLS_ENABLED", default_value = "false")]
     tls_enabled: bool,
+
+    /// Enable Flight SQL server
+    #[arg(long, env = "FLIGHT_SQL_ENABLED", default_value = "true")]
+    flight_sql_enabled: bool,
 
     /// Log level
     #[arg(long, env = "LOG_LEVEL", default_value = "info")]
@@ -85,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting Tavana Gateway");
     info!("  PostgreSQL port: {}", args.pg_port);
+    info!("  Flight SQL port: {} (enabled: {})", args.flight_sql_port, args.flight_sql_enabled);
     info!("  HTTP port: {}", args.http_port);
     info!("  TLS enabled: {}", args.tls_enabled);
     info!("  Worker address: {}", args.worker_addr);
@@ -235,6 +245,39 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Start Arrow Flight SQL server if enabled (high-performance binary protocol)
+    let flight_handle = if args.flight_sql_enabled {
+        let flight_port = args.flight_sql_port;
+        let flight_worker_addr = args.worker_addr.clone();
+        Some(tokio::spawn(async move {
+            use arrow_flight::flight_service_server::FlightServiceServer;
+            use flight_sql::TavanaFlightSqlService;
+            use tonic::transport::Server;
+
+            let addr: SocketAddr = format!("0.0.0.0:{}", flight_port)
+                .parse()
+                .expect("Invalid Flight SQL address");
+
+            let flight_service = TavanaFlightSqlService::new(flight_worker_addr);
+            let svc = FlightServiceServer::new(flight_service);
+
+            info!("Arrow Flight SQL server listening on {}", addr);
+            info!("  - Python: pyarrow.flight.connect('grpc://{}:{}')", "host", flight_port);
+            info!("  - JDBC: jdbc:arrow-flight-sql://host:{}/?useEncryption=false", flight_port);
+
+            if let Err(e) = Server::builder()
+                .add_service(svc)
+                .serve(addr)
+                .await
+            {
+                tracing::error!("Flight SQL server error: {}", e);
+            }
+        }))
+    } else {
+        info!("Flight SQL server disabled");
+        None
+    };
+
     // Simple HTTP server for health checks and metrics only
     async fn health() -> &'static str {
         "ok"
@@ -298,6 +341,9 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Tavana Gateway started successfully");
     info!("Architecture: QueryQueue + SmartScaler (VPA-first, HPA-second)");
+    info!("Protocols: PostgreSQL Wire (port {}), Flight SQL (port {})", 
+          args.pg_port, 
+          if args.flight_sql_enabled { args.flight_sql_port.to_string() } else { "disabled".to_string() });
 
     // Wait for shutdown signal
     tokio::select! {
@@ -306,6 +352,13 @@ async fn main() -> anyhow::Result<()> {
         }
         _ = pg_handle => {}
         _ = http_handle => {}
+        _ = async {
+            if let Some(h) = flight_handle {
+                h.await.ok();
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {}
     }
 
     Ok(())

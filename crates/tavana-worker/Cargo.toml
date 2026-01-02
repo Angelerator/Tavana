@@ -22,11 +22,15 @@ futures = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 
-# Arrow
+# Arrow (use workspace versions for compatibility with DuckDB's bundled Arrow)
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
+arrow-flight = { workspace = true }
+
+# Note: DuckDB bundles Arrow 56.x, workspace uses 54.x
+# Arrow IPC serialization deferred until versions align
 
 # DuckDB
 duckdb = { workspace = true }
