@@ -1326,6 +1326,23 @@ async fn run_query_loop(
                 prepared_query = None;
                 describe_sent_row_description = false;
             }
+            b'C' => {
+                // Close message - close a prepared statement or portal
+                socket.read_exact(&mut buf).await?;
+                let len = u32::from_be_bytes(buf) as usize - 4;
+                let mut data = vec![0u8; len];
+                socket.read_exact(&mut data).await?;
+                
+                // Clear prepared query state
+                prepared_query = None;
+                describe_sent_row_description = false;
+                describe_column_count = 0;
+                
+                // Send CloseComplete
+                let close_complete = [b'3', 0, 0, 0, 4];
+                socket.write_all(&close_complete).await?;
+                socket.flush().await?;
+            }
             b'S' => {
                 // Sync message has length field (4 bytes with value 4)
                 socket.read_exact(&mut buf).await?;
@@ -1344,9 +1361,19 @@ async fn run_query_loop(
     Ok(())
 }
 
+/// Portal state for Extended Query Protocol cursor support
+/// This enables JDBC setFetchSize() streaming by maintaining row state between Execute calls
+struct PortalState {
+    /// Buffered rows from query execution
+    rows: Vec<Vec<String>>,
+    /// Current row offset (for resumption)
+    offset: usize,
+    /// Column count for DataRow consistency
+    column_count: usize,
+}
+
 /// Run the main query loop for generic streams (TLS)
-/// Note: For TLS streams, we use a simplified query handler that only supports simple queries
-/// Extended protocol support for TLS would require significant refactoring
+/// Supports both Simple Query and Extended Query protocols with proper cursor streaming
 async fn run_query_loop_generic<S>(
     socket: &mut S,
     worker_client: &WorkerClient,
@@ -1369,6 +1396,9 @@ where
     // Server-side cursor storage for this connection
     // Enables DECLARE CURSOR / FETCH / CLOSE for large result sets
     let mut cursors = ConnectionCursors::new();
+    // Portal state for Extended Query Protocol cursor streaming
+    // Stores buffered rows and offset for resumption after PortalSuspended
+    let mut portal_state: Option<PortalState> = None;
 
     loop {
         let mut msg_type = [0u8; 1];
@@ -1667,63 +1697,86 @@ where
                     0 // Unlimited
                 };
                 
-                if max_rows > 0 {
-                    debug!("Extended Protocol - Execute with max_rows={} (client streaming mode)", max_rows);
-                }
-                
-                if let Some(ref sql) = prepared_query {
+                // Check if we're resuming from a suspended portal
+                if let Some(ref mut state) = portal_state {
+                    // Resume from stored rows
+                    let remaining = state.rows.len() - state.offset;
+                    let rows_to_send = if max_rows > 0 && (max_rows as usize) < remaining {
+                        max_rows as usize
+                    } else {
+                        remaining
+                    };
+                    
+                    let end = state.offset + rows_to_send;
+                    debug!("Extended Protocol - Execute: Resuming from offset {}, sending {} rows", state.offset, rows_to_send);
+                    
+                    // Send rows from offset to end
+                    for row in &state.rows[state.offset..end] {
+                        send_data_row_generic(socket, row, state.column_count).await?;
+                    }
+                    socket.flush().await?;
+                    
+                    state.offset = end;
+                    
+                    if state.offset >= state.rows.len() {
+                        // All rows sent
+                        let cmd_tag = format!("SELECT {}", state.rows.len());
+                        send_command_complete_generic(socket, &cmd_tag).await?;
+                        portal_state = None;
+                        prepared_query = None;
+                        describe_sent_row_description = false;
+                        describe_column_count = 0;
+                    } else {
+                        // More rows available
+                        socket.write_all(&[b's', 0, 0, 0, 4]).await?; // PortalSuspended
+                        socket.flush().await?;
+                        continue; // Don't clear state
+                    }
+                } else if let Some(ref sql) = prepared_query {
+                    // First Execute - need to run query
                     // CRITICAL: If Describe sent NoData, we MUST NOT send DataRows
-                    // The JDBC client expects no data after NoData response
                     if !describe_sent_row_description {
-                        // Get the correct command tag for this SQL (BEGIN, SET, COMMIT, etc.)
                         let cmd_tag = if let Some(result) = handle_pg_specific_command(sql) {
                             result.command_tag.unwrap_or_else(|| "SELECT 0".to_string())
                         } else {
                             "SELECT 0".to_string()
                         };
                         debug!("Extended Protocol - Execute: Describe sent NoData, sending CommandComplete: {}", cmd_tag);
-                        let cmd = cmd_tag.as_bytes();
-                        let cmd_len = (4 + cmd.len() + 1) as u32;
-                        let mut msg = vec![b'C'];
-                        msg.extend_from_slice(&cmd_len.to_be_bytes());
-                        msg.extend_from_slice(cmd);
-                        msg.push(0);
-                        socket.write_all(&msg).await?;
-                        socket.flush().await?;
+                        send_command_complete_generic(socket, &cmd_tag).await?;
                     } else {
-                        // Describe sent RowDescription, so we can send DataRows
+                        // Execute query and get all rows
                         info!("Extended Protocol - Execute: Describe sent RowDescription ({} cols), max_rows={}, executing query", describe_column_count, max_rows);
-                        let result = execute_query_extended_protocol(
-                            socket,
-                            worker_client,
-                            query_router,
-                            sql,
-                            user_id,
-                            smart_scaler,
-                            describe_column_count,
-                            max_rows,
-                        ).await;
                         
-                        match result {
-                            Ok((rows_sent, more_available)) => {
-                                if more_available {
-                                    // Send PortalSuspended - indicates more rows are available
-                                    // Client will send another Execute to get more rows
-                                    debug!("Extended Protocol - Execute: {} rows sent, sending PortalSuspended", rows_sent);
+                        match execute_query_get_rows(worker_client, query_router, sql, user_id, smart_scaler).await {
+                            Ok(rows) => {
+                                let total_rows = rows.len();
+                                let rows_to_send = if max_rows > 0 && (max_rows as usize) < total_rows {
+                                    max_rows as usize
+                                } else {
+                                    total_rows
+                                };
+                                
+                                // Send first batch of rows
+                                for row in &rows[..rows_to_send] {
+                                    send_data_row_generic(socket, row, describe_column_count).await?;
+                                }
+                                socket.flush().await?;
+                                
+                                if rows_to_send < total_rows {
+                                    // More rows - store state and send PortalSuspended
+                                    portal_state = Some(PortalState {
+                                        rows,
+                                        offset: rows_to_send,
+                                        column_count: describe_column_count,
+                                    });
+                                    debug!("Extended Protocol - Execute: {} rows sent, {} remaining, sending PortalSuspended", rows_to_send, total_rows - rows_to_send);
                                     socket.write_all(&[b's', 0, 0, 0, 4]).await?; // PortalSuspended
                                     socket.flush().await?;
-                                    // DON'T clear prepared_query - client will Execute again
+                                    continue; // Don't clear state
                                 } else {
-                                    // All rows sent - send CommandComplete
-                                    let cmd_tag = format!("SELECT {}", rows_sent);
-                                    let cmd = cmd_tag.as_bytes();
-                                    let cmd_len = (4 + cmd.len() + 1) as u32;
-                                    let mut msg = vec![b'C'];
-                                    msg.extend_from_slice(&cmd_len.to_be_bytes());
-                                    msg.extend_from_slice(cmd);
-                                    msg.push(0);
-                                    socket.write_all(&msg).await?;
-                                    socket.flush().await?;
+                                    // All rows sent
+                                    let cmd_tag = format!("SELECT {}", total_rows);
+                                    send_command_complete_generic(socket, &cmd_tag).await?;
                                 }
                             }
                             Err(e) => {
@@ -1732,23 +1785,36 @@ where
                             }
                         }
                     }
+                    
+                    // Clear state only if no more rows
+                    prepared_query = None;
+                    describe_sent_row_description = false;
+                    describe_column_count = 0;
                 } else {
                     // No prepared statement - send empty CommandComplete
                     debug!("Extended Protocol - Execute: no prepared query");
-                    let cmd = b"SELECT 0";
-                    let cmd_len = (4 + cmd.len() + 1) as u32;
-                    let mut msg = vec![b'C'];
-                    msg.extend_from_slice(&cmd_len.to_be_bytes());
-                    msg.extend_from_slice(cmd);
-                    msg.push(0);
-                    socket.write_all(&msg).await?;
-                    socket.flush().await?;
+                    send_command_complete_generic(socket, "SELECT 0").await?;
                 }
+            }
+            b'C' => {
+                // Close message - close a prepared statement or portal
+                socket.read_exact(&mut buf).await?;
+                let len = u32::from_be_bytes(buf) as usize - 4;
+                let mut data = vec![0u8; len];
+                socket.read_exact(&mut data).await?;
                 
+                let close_type = if data.is_empty() { b'S' } else { data[0] };
+                debug!("Extended Protocol - Close type: {}", close_type as char);
+                
+                // Clear ALL state when closing
                 prepared_query = None;
-                // Reset state after Execute
                 describe_sent_row_description = false;
                 describe_column_count = 0;
+                portal_state = None; // Clear buffered rows
+                
+                // Send CloseComplete
+                socket.write_all(&[b'3', 0, 0, 0, 4]).await?;
+                socket.flush().await?;
             }
             b'S' => {
                 // Sync message has length field (4 bytes with value 4)
@@ -2052,6 +2118,55 @@ where
     debug!("Extended Protocol Execute completed: {} rows (all sent)", row_count);
     
     Ok((row_count, more_available))
+}
+
+/// Execute query and return rows only (for cursor streaming with portal state)
+/// Used by Extended Query Protocol with proper cursor resumption support
+async fn execute_query_get_rows(
+    worker_client: &WorkerClient,
+    query_router: &QueryRouter,
+    sql: &str,
+    user_id: &str,
+    _smart_scaler: Option<&SmartScaler>,
+) -> anyhow::Result<Vec<Vec<String>>> {
+    use crate::query_router::QueryTarget;
+    
+    // Handle PostgreSQL-specific commands locally
+    if let Some(result) = handle_pg_specific_command(sql) {
+        return Ok(result.rows);
+    }
+    
+    // Handle COPY commands by extracting inner query
+    let actual_sql = if let Some(inner) = extract_copy_inner_query(sql) {
+        debug!("execute_query_get_rows - Converted COPY to SELECT");
+        inner
+    } else {
+        sql.to_string()
+    };
+    let sql = &actual_sql;
+
+    let estimate = query_router.route(sql).await;
+    
+    // Execute query on the routed target worker
+    let (_columns, rows) = match &estimate.target {
+        QueryTarget::PreSizedWorker { address, worker_name } => {
+            debug!("execute_query_get_rows - Executing on pre-sized worker: {}", worker_name);
+            execute_query_on_worker_buffered(address, sql, user_id).await?
+        }
+        QueryTarget::TenantPool { service_addr, tenant_id } => {
+            debug!("execute_query_get_rows - Executing on tenant pool: {}", tenant_id);
+            execute_query_on_worker_buffered(service_addr, sql, user_id).await?
+        }
+        QueryTarget::WorkerPool => {
+            let result = worker_client.execute_query(sql, user_id).await?;
+            let cols: Vec<(String, String)> = result.columns.iter()
+                .map(|c| (c.name.clone(), c.type_name.clone()))
+                .collect();
+            (cols, result.rows)
+        }
+    };
+    
+    Ok(rows)
 }
 
 /// Execute query on a specific worker address and return buffered results
