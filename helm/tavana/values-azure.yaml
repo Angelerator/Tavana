@@ -9,12 +9,12 @@
 # Global settings
 global:
   namespace: tavana
-  # Container registry (Docker Hub or private ACR)
-  # Docker Hub: docker.io/angelerator
-  # ACR: myacr.azurecr.io
-  imageRegistry: "docker.io/angelerator"
+  # Container registry - Use ACR for Azure deployments
+  # The AKS cluster network blocks external registries (GHCR, Docker Hub)
+  # Always use ACR: acrtavanadev.azurecr.io
+  imageRegistry: "acrtavanadev.azurecr.io"
   imagePullPolicy: Always
-  imageTag: "v1.0.0"
+  imageTag: "1.0.73"
 
 # Private registry credentials (optional for Docker Hub public, required for ACR)
 imagePullSecrets: []
