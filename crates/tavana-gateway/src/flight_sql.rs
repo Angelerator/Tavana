@@ -4,10 +4,10 @@
 //! Uses the base Flight protocol (simpler than Flight SQL) for compatibility.
 //!
 //! Protocol: gRPC over HTTP/2
-//! Port: 8815 (configurable)
+//! Port: 9091 (configurable, 9091 allowed by Azure Policy)
 //!
 //! Clients can use:
-//! - Python: pyarrow.flight.connect('grpc://host:8815')
+//! - Python: pyarrow.flight.connect('grpc://host:9091')
 //! - Go/Rust: arrow-flight client libraries
 
 use arrow_flight::{

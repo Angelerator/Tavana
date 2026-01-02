@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 
 COPY --from=builder /app/target/release/tavana-gateway /usr/local/bin/
 
-EXPOSE 15432 8815 8080
+EXPOSE 15432 9091 8080
 
 ENTRYPOINT ["tavana-gateway"]
 

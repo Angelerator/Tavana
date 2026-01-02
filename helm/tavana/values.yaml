@@ -29,7 +29,7 @@ gateway:
   # Arrow Flight SQL configuration (high-performance binary protocol)
   flightSql:
     enabled: true
-    port: 8815         # Arrow Flight gRPC port
+    port: 9091         # Arrow Flight gRPC port (9091 allowed by Azure Policy)
   
   # TLS configuration for PostgreSQL wire protocol
   tls:
