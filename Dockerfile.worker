@@ -85,11 +85,47 @@ RUN set -eux && \
 
 COPY --from=builder /app/target/release/tavana-worker /usr/local/bin/
 
+# Download DuckDB CLI for extension verification (as root, before switching user)
+ARG DUCKDB_VERSION=v1.4.3
+RUN curl -fsSL "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip" -o /tmp/duckdb.zip && \
+    cd /tmp && unzip -q duckdb.zip && chmod +x duckdb && mv duckdb /usr/local/bin/ && rm duckdb.zip
+
 USER tavana
 WORKDIR /home/tavana
 
+# Pre-load extensions at build time as the tavana user
+# This ensures extension cache and metadata are in the correct location
+# Benefits:
+# 1. Validates all extensions are correctly downloaded
+# 2. Creates extension metadata cache in ~/.duckdb
+# 3. JIT compilation cached for faster subsequent loads
+# 4. Eliminates "extension not found" errors on first query
+RUN set -eux && \
+    echo "Pre-loading DuckDB extensions at build time (as tavana user)..." && \
+    duckdb -c "
+        SET home_directory = '/home/tavana';
+        SET extension_directory = '/home/tavana/.duckdb/extensions';
+        -- Load all pre-downloaded extensions to initialize them
+        LOAD parquet;
+        LOAD json;
+        LOAD httpfs;
+        LOAD azure;
+        LOAD aws;
+        LOAD delta;
+        LOAD iceberg;
+        LOAD icu;
+        LOAD fts;
+        LOAD inet;
+        -- Verify extensions are loaded
+        SELECT extension_name, loaded FROM duckdb_extensions() WHERE loaded = true ORDER BY extension_name;
+    " && \
+    echo "✓ Extensions pre-loaded and verified"
+
 ENV HOME=/home/tavana
 ENV TEMP_DIR=/tmp/duckdb
+# Tell DuckDB to use pre-downloaded extensions (no network fetch at runtime)
+ENV DUCKDB_EXTENSION_AUTOINSTALL=false
+ENV DUCKDB_EXTENSION_AUTOLOAD=true
 
 EXPOSE 50053
 
