@@ -1,0 +1,29 @@
+{{- if .Values.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "tavana.fullname" . }}-gateway-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tavana.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.pdb.gateway.minAvailable | default 1 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tavana-gateway
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "tavana.fullname" . }}-worker-pdb
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tavana.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.pdb.worker.minAvailable | default 2 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tavana-worker
+{{- end }}
+

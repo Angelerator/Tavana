@@ -75,11 +75,11 @@ worker:
   
   resources:
     requests:
-      memory: "2Gi"
+      memory: "4Gi"
       cpu: "500m"
     limits:
-      memory: "12Gi"
-      cpu: "3500m"
+      memory: "16Gi"
+      cpu: "4"
   
   # Environment variables
   env: []
@@ -105,6 +105,43 @@ hpa:
   # Custom metrics (requires metrics-server and prometheus-adapter)
   queueDepthTarget: "5"
   queueWaitTimeSecondsTarget: "30s"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+
+# Vertical Pod Autoscaler
+vpa:
+  enabled: true
+  gateway:
+    updateMode: "Auto"
+    minCpu: "100m"
+    minMemory: "512Mi"
+    maxCpu: "4"
+    maxMemory: "8Gi"
+  worker:
+    updateMode: "Auto"
+    minCpu: "250m"
+    minMemory: "2Gi"
+    maxCpu: "8"
+    maxMemory: "32Gi"
+
+# Pod Disruption Budgets
+pdb:
+  enabled: true
+  gateway:
+    minAvailable: 1
+  worker:
+    minAvailable: 2
 
 # Object Storage (S3-compatible)
 objectStorage:
