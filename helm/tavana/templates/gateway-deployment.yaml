@@ -44,6 +44,11 @@ spec:
             - name: http
               containerPort: {{ .Values.gateway.service.httpPort }}
               protocol: TCP
+            {{- if .Values.gateway.flightSql.enabled }}
+            - name: flight
+              containerPort: {{ .Values.gateway.flightSql.port }}
+              protocol: TCP
+            {{- end }}
           env:
             - name: RUST_LOG
               value: {{ .Values.config.logLevel | default "info" }}
@@ -55,6 +60,11 @@ spec:
               value: "{{ .Values.gateway.service.pgPort }}"
             - name: HTTP_PORT
               value: "{{ .Values.gateway.service.httpPort }}"
+            # Arrow Flight SQL configuration
+            - name: FLIGHT_SQL_ENABLED
+              value: "{{ .Values.gateway.flightSql.enabled | default true }}"
+            - name: FLIGHT_SQL_PORT
+              value: "{{ .Values.gateway.flightSql.port | default 8815 }}"
             # TLS configuration
             - name: TLS_ENABLED
               value: "{{ .Values.gateway.tls.enabled | default false }}"
@@ -132,6 +142,12 @@ spec:
       port: {{ .Values.gateway.service.httpPort }}
       targetPort: http
       protocol: TCP
+    {{- if .Values.gateway.flightSql.enabled }}
+    - name: flight
+      port: {{ .Values.gateway.flightSql.port }}
+      targetPort: flight
+      protocol: TCP
+    {{- end }}
   selector:
     app: tavana-gateway
 {{- end }}
