@@ -1126,6 +1126,7 @@ impl DuckDbExecutor {
 }
 
 /// Query execution statistics
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct QueryStats {
     pub threads: u32,
