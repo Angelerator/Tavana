@@ -1835,10 +1835,18 @@ where
 }
 
 /// Execute query for TLS streams - uses WorkerClient for query execution
+/// Execute query with TRUE STREAMING - OOM-proof implementation
+/// 
+/// Unlike the previous buffered implementation, this function:
+/// 1. NEVER loads all rows into memory
+/// 2. Streams each batch to the client as it arrives from the worker
+/// 3. Uses bounded channels for backpressure
+/// 
+/// This is how Databricks/Snowflake/BigQuery handle large result sets.
 async fn execute_query_tls<S>(
     socket: &mut S,
     worker_client: &WorkerClient,
-    query_router: &QueryRouter,
+    _query_router: &QueryRouter,
     sql: &str,
     user_id: &str,
     _smart_scaler: Option<&SmartScaler>,
@@ -1846,21 +1854,17 @@ async fn execute_query_tls<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    use crate::query_router::QueryTarget;
-    
     // Handle PostgreSQL-specific commands locally
     if let Some(result) = handle_pg_specific_command(sql) {
-        // Send simple result for TLS stream with correct command tag
         let columns: Vec<(&str, i32)> = result.columns.iter().map(|(n, _t)| (n.as_str(), 25i32)).collect();
         send_simple_result_generic(socket, &columns, &result.rows, result.command_tag.as_deref()).await?;
         return Ok(0);
     }
     
-    // Check if this is a COPY command - need to send COPY protocol response
+    // Check if this is a COPY command
     let is_copy_command = sql.trim().to_uppercase().starts_with("COPY");
     
     // Handle COPY commands by extracting inner query
-    // COPY (SELECT ...) TO STDOUT -> execute the inner SELECT
     let actual_sql = if let Some(inner) = extract_copy_inner_query(sql) {
         info!("Rewrote COPY command to inner query: {}", &inner[..inner.len().min(80)]);
         inner
@@ -1870,50 +1874,90 @@ where
     let sql = &actual_sql;
 
     metrics::query_started();
+    let start_time = std::time::Instant::now();
 
-    let estimate = query_router.route(sql).await;
-    info!(
-        data_mb = estimate.data_size_mb,
-        target = ?estimate.target,
-        "Query routed for TLS execution"
-    );
+    // TRUE STREAMING: Use streaming API instead of buffered
+    // This is the key change for OOM-proof execution
+    match worker_client.execute_query_streaming(sql, user_id).await {
+        Ok(mut stream) => {
+            let mut columns_sent = false;
+            let mut total_rows: usize = 0;
+            let mut batch_rows: usize = 0;
+            let mut column_names: Vec<String> = vec![];
+            let mut column_types: Vec<String> = vec![];
 
-    // Execute query on the routed target worker
-    let (columns, rows) = match &estimate.target {
-        QueryTarget::PreSizedWorker { address, worker_name } => {
-            info!("Executing on pre-sized worker: {} ({})", worker_name, address);
-            execute_query_on_worker_buffered(address, sql, user_id).await?
+            while let Some(batch) = stream.next().await {
+                match batch? {
+                    StreamingBatch::Metadata { columns, column_types: types } => {
+                        column_names = columns;
+                        column_types = types;
+                        
+                        if !columns_sent {
+                            if is_copy_command {
+                                // Send CopyOutResponse for COPY commands
+                                send_copy_out_response_header_generic(socket, column_names.len()).await?;
+                            } else {
+                                // Send RowDescription for SELECT
+                                let col_pairs: Vec<(String, String)> = column_names.iter()
+                                    .zip(column_types.iter())
+                                    .map(|(n, t)| (n.clone(), t.clone()))
+                                    .collect();
+                                send_row_description_generic(socket, &col_pairs).await?;
+                            }
+                            columns_sent = true;
+                        }
+                    }
+                    StreamingBatch::Rows(rows) => {
+                        for row in rows {
+                            if is_copy_command {
+                                send_copy_data_row_generic(socket, &row).await?;
+                            } else {
+                                send_data_row_generic(socket, &row, column_names.len()).await?;
+                            }
+                            total_rows += 1;
+                            batch_rows += 1;
+
+                            // Flush periodically to provide backpressure and prevent client timeout
+                            if batch_rows >= STREAMING_BATCH_SIZE {
+                                socket.flush().await?;
+                                batch_rows = 0;
+                            }
+                        }
+                    }
+                    StreamingBatch::Error(msg) => {
+                        return Err(anyhow::anyhow!("{}", msg));
+                    }
+                }
+            }
+
+            // Send completion messages
+            if is_copy_command {
+                send_copy_done_generic(socket).await?;
+            }
+            
+            // If no columns were sent (empty result), send empty row description
+            if !columns_sent && !is_copy_command {
+                send_row_description_generic(socket, &[]).await?;
+            }
+            
+            let tag = format!("SELECT {}", total_rows);
+            send_command_complete_generic(socket, &tag).await?;
+            socket.flush().await?;
+
+            metrics::query_ended();
+            debug!(
+                rows = total_rows,
+                elapsed_ms = start_time.elapsed().as_millis(),
+                "Query completed (TRUE STREAMING - OOM-proof)"
+            );
+            
+            Ok(total_rows)
         }
-        QueryTarget::TenantPool { service_addr, tenant_id } => {
-            info!("Executing on tenant pool: {} ({})", tenant_id, service_addr);
-            execute_query_on_worker_buffered(service_addr, sql, user_id).await?
+        Err(e) => {
+            error!("Streaming query failed: {}", e);
+            Err(e)
         }
-        QueryTarget::WorkerPool => {
-            // Fallback to default worker client
-            let result = worker_client.execute_query(sql, user_id).await?;
-            let cols: Vec<(String, String)> = result.columns.iter()
-                .map(|c| (c.name.clone(), c.type_name.clone()))
-                .collect();
-            let rows = result.rows;
-            (cols, rows)
-        }
-    };
-    
-    let row_count = rows.len();
-    
-    if is_copy_command {
-        // Send COPY protocol response for COPY commands
-        // This is what postgres_scanner expects
-        send_copy_out_response(socket, &columns, &rows).await?;
-    } else {
-        // Send regular RowDescription and DataRows for SELECT
-        let col_refs: Vec<(&str, i32)> = columns.iter().map(|(n, _t)| (n.as_str(), 25i32)).collect();
-        send_simple_result_generic(socket, &col_refs, &rows, None).await?;
     }
-    
-    debug!("Query completed: {} rows", row_count);
-    
-    Ok(row_count)
 }
 
 /// Execute query for Extended Query Protocol (Parse/Bind/Describe/Execute)
@@ -3626,6 +3670,105 @@ where
     msg[1..5].copy_from_slice(&len.to_be_bytes());
     
     socket.write_all(&msg).await?;
+    Ok(())
+}
+
+/// Send CommandComplete for generic streams (TLS)
+async fn send_command_complete_generic<S>(socket: &mut S, tag: &str) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut msg = Vec::new();
+    msg.push(b'C'); // CommandComplete
+    let tag_bytes = tag.as_bytes();
+    let len = (4 + tag_bytes.len() + 1) as u32;
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(tag_bytes);
+    msg.push(0); // Null terminator
+    socket.write_all(&msg).await?;
+    Ok(())
+}
+
+/// Send CopyOutResponse header for generic streams (TLS)
+/// Used for COPY TO STDOUT commands
+async fn send_copy_out_response_header_generic<S>(socket: &mut S, column_count: usize) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    // CopyOutResponse: 'H' + length + format (0=text) + column count + format per column
+    let mut msg = Vec::new();
+    msg.push(b'H'); // CopyOutResponse
+    let body_len = 4 + 1 + 2 + (column_count * 2); // length + format + col count + format per col
+    msg.extend_from_slice(&(body_len as u32).to_be_bytes());
+    msg.push(0); // Overall format: 0 = text
+    msg.extend_from_slice(&(column_count as i16).to_be_bytes());
+    for _ in 0..column_count {
+        msg.extend_from_slice(&0i16.to_be_bytes()); // Per-column format: 0 = text
+    }
+    socket.write_all(&msg).await?;
+    Ok(())
+}
+
+/// Send CopyData row for generic streams (TLS)
+async fn send_copy_data_row_generic<S>(socket: &mut S, row: &[String]) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    // Build tab-separated row with newline
+    let row_text = row.join("\t") + "\n";
+    let row_bytes = row_text.as_bytes();
+    
+    // CopyData: 'd' + length + data
+    let mut msg = Vec::new();
+    msg.push(b'd'); // CopyData
+    let len = (4 + row_bytes.len()) as u32;
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(row_bytes);
+    socket.write_all(&msg).await?;
+    Ok(())
+}
+
+/// Send CopyDone for generic streams (TLS)
+async fn send_copy_done_generic<S>(socket: &mut S) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    // CopyDone: 'c' + length (4)
+    socket.write_all(&[b'c', 0, 0, 0, 4]).await?;
+    Ok(())
+}
+
+/// Send a single DataRow for generic streams (TLS)
+async fn send_data_row_generic<S>(socket: &mut S, row: &[String], expected_cols: usize) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut data_row = Vec::with_capacity(5 + row.len() * 20);
+    data_row.push(b'D');
+
+    let mut row_data = Vec::with_capacity(2 + row.len() * 20);
+    let cols_to_send = if expected_cols > 0 { expected_cols } else { row.len() };
+    row_data.extend_from_slice(&(cols_to_send as i16).to_be_bytes());
+
+    for i in 0..cols_to_send {
+        if i < row.len() {
+            let value = &row[i];
+            if value.is_empty() || value == "null" || value == "NULL" {
+                row_data.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
+            } else {
+                row_data.extend_from_slice(&(value.len() as i32).to_be_bytes());
+                row_data.extend_from_slice(value.as_bytes());
+            }
+        } else {
+            row_data.extend_from_slice(&(-1i32).to_be_bytes()); // NULL for missing columns
+        }
+    }
+
+    let len = (4 + row_data.len()) as u32;
+    data_row.extend_from_slice(&len.to_be_bytes());
+    data_row.extend_from_slice(&row_data);
+
+    socket.write_all(&data_row).await?;
     Ok(())
 }
 
