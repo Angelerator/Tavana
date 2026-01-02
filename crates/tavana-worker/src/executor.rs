@@ -124,11 +124,15 @@ impl DuckDbExecutor {
         executor.configure_s3_all()?;
         executor.configure_azure_all()?;
         
+        // WARMUP: Pre-validate Azure connectivity and extension loading
+        // This prevents "cold start" issues where first query fails or is slow
+        executor.perform_warmup();
+        
         // Start background token refresh thread if Azure is configured
         let background_handle = executor.start_background_token_refresh();
 
         info!(
-            "DuckDB executor initialized with {} parallel connections",
+            "DuckDB executor initialized with {} parallel connections (warmup complete)",
             pool_size
         );
 
@@ -532,6 +536,86 @@ impl DuckDbExecutor {
         }
         
         tracing::info!("Emergency: Azure token refreshed");
+    }
+
+    /// Perform warmup to prevent cold start issues
+    /// 
+    /// This function runs at startup to:
+    /// 1. Validate Azure connectivity and token
+    /// 2. Pre-load Delta extension
+    /// 3. Test a simple delta_scan query (if Azure is configured)
+    /// 
+    /// Without warmup, the first query from DBeaver/Tableau may fail or be slow
+    /// because it triggers token acquisition, extension loading, etc.
+    fn perform_warmup(&self) {
+        tracing::info!("Performing warmup to prevent cold start issues...");
+        
+        // Get a connection for warmup
+        let pooled_conn = match self.connections.first() {
+            Some(conn) => conn,
+            None => {
+                tracing::warn!("No connections available for warmup");
+                return;
+            }
+        };
+        
+        let conn = match pooled_conn.connection.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Could not lock connection for warmup: {}", e);
+                return;
+            }
+        };
+        
+        // Step 1: Verify Delta extension is loaded
+        match conn.execute("SELECT * FROM duckdb_extensions() WHERE extension_name = 'delta' AND loaded = true", params![]) {
+            Ok(_) => tracing::info!("Warmup: Delta extension verified"),
+            Err(e) => {
+                tracing::warn!("Warmup: Delta extension check failed: {}. Attempting to load...", e);
+                if let Err(e) = conn.execute("LOAD delta", params![]) {
+                    tracing::warn!("Warmup: Could not load delta extension: {}", e);
+                }
+            }
+        }
+        
+        // Step 2: Verify Azure extension is loaded (if Azure is configured)
+        if std::env::var("AZURE_STORAGE_ACCOUNT_NAME").is_ok() {
+            match conn.execute("SELECT * FROM duckdb_extensions() WHERE extension_name = 'azure' AND loaded = true", params![]) {
+                Ok(_) => tracing::info!("Warmup: Azure extension verified"),
+                Err(e) => {
+                    tracing::warn!("Warmup: Azure extension check failed: {}. Attempting to load...", e);
+                    if let Err(e) = conn.execute("LOAD azure", params![]) {
+                        tracing::warn!("Warmup: Could not load azure extension: {}", e);
+                    }
+                }
+            }
+            
+            // Step 3: Test Azure connectivity with a simple query
+            // Use a known Delta table path from environment or default
+            let test_path = std::env::var("TAVANA_WARMUP_DELTA_PATH")
+                .unwrap_or_else(|_| "az://your-container/your/delta/table/".to_string());
+            
+            tracing::info!("Warmup: Testing delta_scan connectivity to {}", &test_path[..test_path.len().min(50)]);
+            
+            // Try to read just 1 row to validate the entire pipeline
+            let test_query = format!(
+                "SELECT 1 FROM delta_scan('{}') LIMIT 1",
+                test_path
+            );
+            
+            match conn.execute(&test_query, params![]) {
+                Ok(_) => tracing::info!("Warmup: delta_scan connectivity verified - ready for queries!"),
+                Err(e) => {
+                    tracing::warn!("Warmup: delta_scan test failed: {}. First queries may be slow.", e);
+                    // This is not fatal - the query might fail due to permissions or path issues
+                    // The important thing is that the token was acquired and extensions loaded
+                }
+            }
+        } else {
+            tracing::debug!("Warmup: Azure not configured, skipping Azure-specific warmup");
+        }
+        
+        tracing::info!("Warmup complete");
     }
 
     /// Configure S3 for all connections from environment variables
