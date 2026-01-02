@@ -85,22 +85,95 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
         request: Request<proto::ExecuteQueryRequest>,
     ) -> Result<Response<Self::ExecuteQueryStream>, Status> {
         let req = request.into_inner();
-        info!(query_id = %req.query_id, "Executing query");
+        info!(query_id = %req.query_id, "Executing query with TRUE STREAMING");
 
-        let (tx, rx) = mpsc::channel(32);
+        let (tx, rx) = mpsc::channel(64); // Larger buffer for streaming
         let executor = self.executor.clone();
         let sql = req.sql.clone();
         let query_id = req.query_id.clone();
 
-        // Spawn query execution in background
-        tokio::spawn(async move {
+        // Spawn query execution in background with TRUE STREAMING
+        // This never loads all results into memory - streams as DuckDB produces them
+        tokio::task::spawn_blocking(move || {
             let start = std::time::Instant::now();
+            let tx_clone = tx.clone();
+            let query_id_clone = query_id.clone();
+            
+            let mut metadata_sent = false;
+            let mut total_rows: u64 = 0;
+            let mut columns: Vec<String> = vec![];
+            let mut column_types: Vec<String> = vec![];
 
-            match executor.execute_query(&sql) {
-                Ok(batches) => {
-                    if batches.is_empty() {
-                        debug!("Query returned no batches");
-                        // Send empty metadata
+            // Use the streaming API - batches are sent as they're produced
+            let result = executor.execute_query_streaming(&sql, |batch| {
+                // On first batch, send metadata
+                if !metadata_sent {
+                    let schema = batch.schema();
+                    columns = schema.fields().iter().map(|f| f.name().clone()).collect();
+                    column_types = schema.fields().iter().map(|f| format!("{:?}", f.data_type())).collect();
+                    
+                    let metadata = proto::QueryMetadata {
+                        query_id: query_id_clone.clone(),
+                        columns: columns.clone(),
+                        column_types: column_types.clone(),
+                        total_rows: 0, // Unknown in streaming mode
+                        total_bytes: 0,
+                    };
+                    
+                    // Use blocking send since we're in spawn_blocking
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(async {
+                        let _ = tx_clone.send(Ok(proto::QueryResultBatch {
+                            result: Some(proto::query_result_batch::Result::Metadata(metadata)),
+                        })).await;
+                    });
+                    
+                    metadata_sent = true;
+                    debug!("Sent metadata: {} columns", columns.len());
+                }
+
+                // Serialize and send this batch immediately (TRUE STREAMING)
+                let mut rows_json: Vec<Vec<String>> = Vec::with_capacity(batch.num_rows());
+                for row_idx in 0..batch.num_rows() {
+                    let mut row: Vec<String> = Vec::with_capacity(batch.num_columns());
+                    for col_idx in 0..batch.num_columns() {
+                        let col = batch.column(col_idx);
+                        let value = format_array_value(col.as_ref(), row_idx);
+                        row.push(value);
+                    }
+                    rows_json.push(row);
+                }
+
+                total_rows += batch.num_rows() as u64;
+                let json_data = serde_json::to_vec(&rows_json).unwrap_or_default();
+
+                let arrow_batch = proto::ArrowRecordBatch {
+                    schema: vec![],
+                    data: json_data,
+                    row_count: batch.num_rows() as u64,
+                };
+
+                // Send batch immediately - TRUE STREAMING
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(async {
+                    let _ = tx_clone.send(Ok(proto::QueryResultBatch {
+                        result: Some(proto::query_result_batch::Result::RecordBatch(arrow_batch)),
+                    })).await;
+                });
+
+                // Log progress for very large queries
+                if total_rows % 100_000 == 0 {
+                    debug!("Streaming: {} rows sent to client", total_rows);
+                }
+
+                Ok(())
+            });
+
+            // Handle result
+            match result {
+                Ok((_schema, rows)) => {
+                    // If no batches were produced (empty result), send empty metadata
+                    if !metadata_sent {
                         let metadata = proto::QueryMetadata {
                             query_id: query_id.clone(),
                             columns: vec![],
@@ -108,81 +181,12 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                             total_rows: 0,
                             total_bytes: 0,
                         };
-                        let _ = tx
-                            .send(Ok(proto::QueryResultBatch {
+                        let rt = tokio::runtime::Handle::current();
+                        rt.block_on(async {
+                            let _ = tx.send(Ok(proto::QueryResultBatch {
                                 result: Some(proto::query_result_batch::Result::Metadata(metadata)),
-                            }))
-                            .await;
-                    } else {
-                        // Extract column info from first batch's schema
-                        let schema = batches[0].schema();
-                        let columns: Vec<String> =
-                            schema.fields().iter().map(|f| f.name().clone()).collect();
-                        let column_types: Vec<String> = schema
-                            .fields()
-                            .iter()
-                            .map(|f| format!("{:?}", f.data_type()))
-                            .collect();
-                        let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-
-                        debug!(
-                            "Sending metadata: {} columns, {} total rows",
-                            columns.len(),
-                            total_rows
-                        );
-
-                        // Send metadata first
-                        let metadata = proto::QueryMetadata {
-                            query_id: query_id.clone(),
-                            columns: columns.clone(),
-                            column_types: column_types.clone(),
-                            total_rows,
-                            total_bytes: 0,
-                        };
-
-                        let _ = tx
-                            .send(Ok(proto::QueryResultBatch {
-                                result: Some(proto::query_result_batch::Result::Metadata(metadata)),
-                            }))
-                            .await;
-
-                        // Send each batch with serialized data as JSON rows
-                        for batch in &batches {
-                            // Serialize rows as JSON array
-                            let mut rows_json: Vec<Vec<String>> = Vec::new();
-                            for row_idx in 0..batch.num_rows() {
-                                let mut row: Vec<String> = Vec::new();
-                                for col_idx in 0..batch.num_columns() {
-                                    let col = batch.column(col_idx);
-                                    let value = format_array_value(col.as_ref(), row_idx);
-                                    row.push(value);
-                                }
-                                rows_json.push(row);
-                            }
-
-                            // Serialize to JSON
-                            let json_data = serde_json::to_vec(&rows_json).unwrap_or_default();
-
-                            debug!(
-                                "Sending batch: {} rows, {} bytes",
-                                batch.num_rows(),
-                                json_data.len()
-                            );
-
-                            let arrow_batch = proto::ArrowRecordBatch {
-                                schema: vec![],
-                                data: json_data,
-                                row_count: batch.num_rows() as u64,
-                            };
-
-                            let _ = tx
-                                .send(Ok(proto::QueryResultBatch {
-                                    result: Some(proto::query_result_batch::Result::RecordBatch(
-                                        arrow_batch,
-                                    )),
-                                }))
-                                .await;
-                        }
+                            })).await;
+                        });
                     }
 
                     // Send profile at the end
@@ -191,18 +195,21 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                         execution_time_ms: elapsed.as_millis() as u64,
                         rows_scanned: 0,
                         bytes_scanned: 0,
-                        rows_returned: batches.iter().map(|b| b.num_rows() as u64).sum(),
+                        rows_returned: rows,
                         bytes_returned: 0,
                         peak_memory_bytes: 0,
                         cpu_seconds: elapsed.as_secs_f32(),
                         tables_accessed: vec![],
                     };
 
-                    let _ = tx
-                        .send(Ok(proto::QueryResultBatch {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(async {
+                        let _ = tx.send(Ok(proto::QueryResultBatch {
                             result: Some(proto::query_result_batch::Result::Profile(profile)),
-                        }))
-                        .await;
+                        })).await;
+                    });
+                    
+                    info!("Query completed: {} rows streamed in {:?}", rows, elapsed);
                 }
                 Err(e) => {
                     error!("Query execution failed: {}", e);
@@ -211,11 +218,12 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                         message: e.to_string(),
                         details: Default::default(),
                     };
-                    let _ = tx
-                        .send(Ok(proto::QueryResultBatch {
+                    let rt = tokio::runtime::Handle::current();
+                    rt.block_on(async {
+                        let _ = tx.send(Ok(proto::QueryResultBatch {
                             result: Some(proto::query_result_batch::Result::Error(error)),
-                        }))
-                        .await;
+                        })).await;
+                    });
                 }
             }
         });
