@@ -66,11 +66,13 @@ impl QueryServiceImpl {
     }
     
     /// Get the worker ID (for cursor affinity routing)
+    #[allow(dead_code)]
     pub fn worker_id(&self) -> &str {
         &self.worker_id
     }
     
     /// Get cursor manager stats
+    #[allow(dead_code)]
     pub fn cursor_stats(&self) -> crate::cursor_manager::CursorManagerStats {
         self.cursor_manager.stats()
     }
@@ -492,6 +494,7 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
 /// 
 /// Now that Arrow 56 matches DuckDB's bundled version, we can use Arrow IPC directly.
 /// This is 10-100x faster than JSON serialization and uses 50-80% less bandwidth.
+#[allow(dead_code)]
 fn serialize_batch_to_arrow_ipc(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u8> {
     let mut buffer = Vec::new();
     
