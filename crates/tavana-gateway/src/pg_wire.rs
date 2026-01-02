@@ -1183,6 +1183,23 @@ async fn run_query_loop(
                     }
                 }
 
+                // Handle ROLLBACK - must actually execute in DuckDB to clear aborted transaction state
+                if query_trimmed == "ROLLBACK" {
+                    debug!("Executing ROLLBACK in DuckDB to clear transaction state");
+                    // Execute ROLLBACK in DuckDB to clear any aborted transaction state
+                    let _ = worker_client.execute_query("ROLLBACK", user_id).await;
+                    // Return success regardless of result (ROLLBACK always succeeds, even if no transaction)
+                    send_query_result_immediate(socket, QueryExecutionResult {
+                        columns: vec![],
+                        rows: vec![],
+                        row_count: 0,
+                        command_tag: Some("ROLLBACK".to_string()),
+                    }).await?;
+                    socket.write_all(&ready).await?;
+                    socket.flush().await?;
+                    continue;
+                }
+
                 let query_id = uuid::Uuid::new_v4().to_string();
                 let estimate = query_router.route(&query).await;
                 let estimated_data_mb = estimate.data_size_mb;
@@ -1222,9 +1239,17 @@ async fn run_query_loop(
                     }
                     Err(e) => {
                                 error!("Query {} error: {}", query_id, e);
-                                send_error(socket, &e.to_string()).await?;
+                                
+                                // If error is a transaction error, automatically rollback to clear state
+                                let error_msg = e.to_string();
+                                if error_msg.contains("transaction") && error_msg.contains("aborted") {
+                                    warn!("Transaction error detected, automatically rolling back");
+                                    let _ = worker_client.execute_query("ROLLBACK", user_id).await;
+                                }
+                                
+                                send_error(socket, &error_msg).await?;
                                 QueryOutcome::Failure {
-                                    error: e.to_string(),
+                                    error: error_msg,
                                     duration_ms,
                                 }
                             }
@@ -1433,6 +1458,18 @@ where
                     }
                 }
 
+                // Handle ROLLBACK - must actually execute in DuckDB to clear aborted transaction state
+                if query_trimmed == "ROLLBACK" {
+                    debug!("Executing ROLLBACK in DuckDB to clear transaction state (TLS)");
+                    // Execute ROLLBACK in DuckDB to clear any aborted transaction state
+                    let _ = worker_client.execute_query("ROLLBACK", user_id).await;
+                    // Return success regardless of result (ROLLBACK always succeeds, even if no transaction)
+                    send_simple_result_generic(socket, &[], &[], Some("ROLLBACK")).await?;
+                    socket.write_all(&ready).await?;
+                    socket.flush().await?;
+                    continue;
+                }
+
                 // For TLS connections, execute queries directly using a simpler path
                 let query_id = uuid::Uuid::new_v4().to_string();
                 let estimate = query_router.route(&query).await;
@@ -1475,9 +1512,17 @@ where
                             }
                             Err(e) => {
                                 error!("Query {} error (TLS): {}", query_id, e);
-                                send_error_generic(socket, &e.to_string()).await?;
+                                
+                                // If error is a transaction error, automatically rollback to clear state
+                                let error_msg = e.to_string();
+                                if error_msg.contains("transaction") && error_msg.contains("aborted") {
+                                    warn!("Transaction error detected (TLS), automatically rolling back");
+                                    let _ = worker_client.execute_query("ROLLBACK", user_id).await;
+                                }
+                                
+                                send_error_generic(socket, &error_msg).await?;
                                 QueryOutcome::Failure {
-                                    error: e.to_string(),
+                                    error: error_msg,
                                     duration_ms,
                                 }
                             }
@@ -2200,6 +2245,27 @@ async fn execute_query_streaming_impl(
     smart_scaler: Option<&SmartScaler>,
     skip_row_description: bool,
 ) -> anyhow::Result<usize> {
+    // Handle ROLLBACK specially - must actually execute in DuckDB to clear aborted transaction state
+    let sql_trimmed = sql.trim().to_uppercase();
+    if sql_trimmed == "ROLLBACK" {
+        debug!("Executing ROLLBACK in DuckDB to clear transaction state (streaming)");
+        // Execute ROLLBACK in DuckDB to clear any aborted transaction state
+        let _ = worker_client.execute_query("ROLLBACK", user_id).await;
+        // Return success regardless of result (ROLLBACK always succeeds, even if no transaction)
+        let result = QueryExecutionResult {
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
+            command_tag: Some("ROLLBACK".to_string()),
+        };
+        if skip_row_description {
+            send_query_result_data_only(socket, result).await?;
+        } else {
+            send_query_result_immediate(socket, result).await?;
+        }
+        return Ok(0);
+    }
+
     // Handle PostgreSQL-specific commands locally
     if let Some(result) = handle_pg_specific_command(sql) {
         if skip_row_description {
