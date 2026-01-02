@@ -238,20 +238,21 @@ impl WorkerClient {
                     }
                     Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
                         if !batch.data.is_empty() {
-                            // Decode Arrow IPC data (10-100x faster than JSON!)
-                            match deserialize_arrow_ipc(&batch.data) {
-                                Ok(record_batches) => {
-                                    let mut all_rows = Vec::new();
-                                    for rb in record_batches {
-                                        let rows = arrow_batch_to_string_rows(&rb);
-                                        all_rows.extend(rows);
-                                    }
-                                    Ok(StreamingBatch::Rows(all_rows))
-                                }
+                            // Try JSON first (worker now sends JSON for reliability)
+                            // Arrow IPC has issues with DuckDB's bundled Arrow vs standalone crate
+                            match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                                Ok(rows) => Ok(StreamingBatch::Rows(rows)),
                                 Err(_) => {
-                                    // Fallback to JSON for backwards compatibility
-                                    match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
-                                        Ok(rows) => Ok(StreamingBatch::Rows(rows)),
+                                    // Fallback to Arrow IPC for backwards compatibility
+                                    match deserialize_arrow_ipc(&batch.data) {
+                                        Ok(record_batches) => {
+                                            let mut all_rows = Vec::new();
+                                            for rb in record_batches {
+                                                let rows = arrow_batch_to_string_rows(&rb);
+                                                all_rows.extend(rows);
+                                            }
+                                            Ok(StreamingBatch::Rows(all_rows))
+                                        }
                                         Err(e) => Err(anyhow::anyhow!("Failed to decode batch: {}", e)),
                                     }
                                 }

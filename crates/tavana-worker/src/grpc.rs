@@ -133,11 +133,13 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                     debug!("Sent metadata: {} columns", columns.len());
                 }
 
-                // Serialize batch using Arrow IPC (10-100x faster than JSON!)
+                // Serialize batch using JSON for reliable cross-crate compatibility
+                // Arrow IPC has issues with DuckDB's bundled Arrow vs standalone Arrow crate
                 // TRUE STREAMING: batches are sent as they're produced, never buffered
                 total_rows += batch.num_rows() as u64;
                 
-                let ipc_data = serialize_batch_to_arrow_ipc(&batch);
+                // Use JSON serialization for reliable data transfer
+                let ipc_data = serialize_batch_to_json_fallback(&batch);
                 
                 let arrow_batch = proto::ArrowRecordBatch {
                     schema: vec![], // Schema sent in metadata
