@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use duckdb::arrow::array::RecordBatch;
+use duckdb::arrow::datatypes::Schema;
 use duckdb::{params, Connection};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
@@ -712,6 +713,9 @@ impl DuckDbExecutor {
 
     /// Execute a query and return Arrow record batches
     /// Uses connection pool for parallel execution
+    /// 
+    /// WARNING: This method collects ALL results into memory before returning.
+    /// For large result sets (SELECT * without LIMIT), use execute_query_streaming instead.
     #[instrument(skip(self))]
     pub fn execute_query(&self, sql: &str) -> Result<Vec<RecordBatch>> {
         // Increment query counter for metrics
@@ -740,6 +744,62 @@ impl DuckDbExecutor {
         // This ensures the next query on this connection will succeed
         if result.is_err() {
             debug!("Query failed, rolling back to clear transaction state");
+            let _ = conn.execute("ROLLBACK", params![]);
+        }
+
+        result
+    }
+
+    /// Execute a query with TRUE STREAMING - sends batches one at a time via callback
+    /// This prevents OOM by never loading the entire result set into memory.
+    /// 
+    /// The callback receives each RecordBatch as it's produced by DuckDB.
+    /// Returns (schema, total_rows) on success.
+    #[instrument(skip(self, batch_callback))]
+    pub fn execute_query_streaming<F>(&self, sql: &str, mut batch_callback: F) -> Result<(Arc<Schema>, u64)>
+    where
+        F: FnMut(RecordBatch) -> Result<()>,
+    {
+        // Increment query counter for metrics
+        self.query_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        
+        // Background thread handles token refresh proactively
+        self.check_azure_token_emergency_refresh();
+        
+        let pooled_conn = self.get_connection();
+        debug!("Using connection {} for streaming query", pooled_conn.id);
+
+        let conn = pooled_conn
+            .connection
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        // Execute the query and stream results
+        let result: Result<(Arc<Schema>, u64)> = (|| {
+            let mut stmt = conn.prepare(sql)?;
+            let arrow_iter = stmt.query_arrow(params![])?;
+            // get_schema() returns Arc<Schema>, so don't double-wrap
+            let schema: Arc<Schema> = arrow_iter.get_schema();
+            
+            let mut total_rows: u64 = 0;
+            
+            // Stream each batch through the callback - NEVER collect into Vec
+            for batch in arrow_iter {
+                total_rows += batch.num_rows() as u64;
+                batch_callback(batch)?;
+                
+                // Log progress for very large queries
+                if total_rows % 1_000_000 == 0 {
+                    info!("Streaming progress: {} rows processed", total_rows);
+                }
+            }
+            
+            Ok((schema, total_rows))
+        })();
+
+        // If query failed, rollback to clear any aborted transaction state
+        if result.is_err() {
+            debug!("Streaming query failed, rolling back to clear transaction state");
             let _ = conn.execute("ROLLBACK", params![]);
         }
 
