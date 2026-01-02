@@ -1984,18 +1984,19 @@ where
     
     let total_rows = rows.len();
     
-    // Apply max_rows limit if specified (JDBC cursor streaming mode)
-    // max_rows > 0 means the client wants to stream in chunks
-    let (rows_to_send, more_available) = if max_rows > 0 && (max_rows as usize) < total_rows {
-        info!(
+    // NOTE: max_rows cursor streaming is DISABLED for now.
+    // Proper JDBC cursor streaming requires maintaining row offset state between Execute calls,
+    // which we don't have. Until we implement proper stateful cursors, always send all rows.
+    // This prevents the bug where we'd send PortalSuspended but then clear prepared_query anyway.
+    let (rows_to_send, more_available) = (&rows[..], false);
+    
+    if max_rows > 0 {
+        debug!(
             max_rows = max_rows,
             total_rows = total_rows,
-            "Extended Protocol - Streaming with max_rows limit (JDBC cursor mode)"
+            "Extended Protocol - max_rows requested but cursor streaming not yet implemented, sending all rows"
         );
-        (&rows[..(max_rows as usize)], true)
-    } else {
-        (&rows[..], false)
-    };
+    }
     
     let row_count = rows_to_send.len();
     
@@ -2004,11 +2005,7 @@ where
     // Use expected_column_count to ensure DataRow column count matches
     send_data_rows_only_generic(socket, rows_to_send, row_count, None, expected_column_count).await?;
     
-    if more_available {
-        debug!("Extended Protocol Execute: {} rows sent, more available (PortalSuspended)", row_count);
-    } else {
-        debug!("Extended Protocol Execute completed: {} rows (all sent)", row_count);
-    }
+    debug!("Extended Protocol Execute completed: {} rows (all sent)", row_count);
     
     Ok((row_count, more_available))
 }
