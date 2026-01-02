@@ -138,6 +138,9 @@ pub struct WorkerState {
     pub last_activity: Instant,
     /// Whether a resize is in progress
     pub resize_in_progress: bool,
+    /// Reserved memory for pending queries (prevents race conditions)
+    /// This tracks memory reserved by select_worker but not yet confirmed by query_started
+    pub reserved_memory_mb: u64,
 
     // --- ADAPTIVE SCALING FIELDS ---
     /// When this worker was created (for 5-hour age limit)
@@ -153,17 +156,19 @@ pub struct WorkerState {
 }
 
 impl WorkerState {
-    /// Calculate available memory
+    /// Calculate available memory (accounting for reserved memory from pending queries)
     pub fn available_memory_mb(&self) -> u64 {
-        self.memory_limit_mb.saturating_sub(self.memory_used_mb)
+        self.memory_limit_mb
+            .saturating_sub(self.memory_used_mb)
+            .saturating_sub(self.reserved_memory_mb)
     }
 
-    /// Calculate memory utilization ratio
+    /// Calculate memory utilization ratio (including reserved memory)
     pub fn memory_utilization(&self) -> f64 {
         if self.memory_limit_mb == 0 {
             return 0.0;
         }
-        self.memory_used_mb as f64 / self.memory_limit_mb as f64
+        (self.memory_used_mb + self.reserved_memory_mb) as f64 / self.memory_limit_mb as f64
     }
 
     /// Calculate effective capacity (with headroom)
@@ -172,15 +177,34 @@ impl WorkerState {
     }
 
     /// Check if worker can accept a new query with given memory requirement
+    /// Accounts for both used memory AND reserved memory from pending queries
     pub fn can_accept_query(&self, required_mb: u64) -> bool {
         let required_with_safety = (required_mb as f64 * ESTIMATION_SAFETY) as u64;
         self.available_memory_mb() >= required_with_safety
     }
 
-    /// Calculate new limit needed to run a query
+    /// Calculate new limit needed to run a query (accounts for reserved memory)
     pub fn required_limit_for_query(&self, query_estimated_mb: u64) -> u64 {
         let required_with_safety = (query_estimated_mb as f64 * ESTIMATION_SAFETY) as u64;
-        self.memory_used_mb + required_with_safety
+        self.memory_used_mb + self.reserved_memory_mb + required_with_safety
+    }
+    
+    /// Reserve memory for a pending query (atomic allocation)
+    /// Returns true if reservation succeeded
+    pub fn reserve_memory(&mut self, memory_mb: u64) -> bool {
+        let required_with_safety = (memory_mb as f64 * ESTIMATION_SAFETY) as u64;
+        if self.available_memory_mb() >= required_with_safety {
+            self.reserved_memory_mb += required_with_safety;
+            true
+        } else {
+            false
+        }
+    }
+    
+    /// Release reserved memory (called when query starts or fails)
+    pub fn release_reservation(&mut self, memory_mb: u64) {
+        let required_with_safety = (memory_mb as f64 * ESTIMATION_SAFETY) as u64;
+        self.reserved_memory_mb = self.reserved_memory_mb.saturating_sub(required_with_safety);
     }
 
     // --- ADAPTIVE SCALING METHODS ---
@@ -553,6 +577,9 @@ impl SmartScaler {
 
                 let total_query_memory_mb = existing.map(|w| w.total_query_memory_mb).unwrap_or(0);
 
+                // Preserve reserved_memory_mb from existing worker to avoid losing reservations
+                let reserved_memory_mb = existing.map(|w| w.reserved_memory_mb).unwrap_or(0);
+                
                 discovered.insert(
                     name.clone(),
                     WorkerState {
@@ -565,6 +592,7 @@ impl SmartScaler {
                         running_queries,
                         last_activity,
                         resize_in_progress: false,
+                        reserved_memory_mb, // Preserve existing reservations
                         // Adaptive fields
                         created_at,
                         idle_since,
@@ -1145,7 +1173,14 @@ impl SmartScaler {
     // WORKER SELECTION & PRE-ASSIGNMENT VPA
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Select best worker for a query and determine if resize needed
+    /// Select best worker for a query and ATOMICALLY reserve memory
+    /// 
+    /// This fixes the race condition where multiple concurrent queries could select
+    /// the same worker before any of them registered with `query_started`.
+    /// 
+    /// The reservation is released when:
+    /// - `query_started` is called (converts reservation to actual query)
+    /// - `release_reservation` is called (if query fails to start)
     pub async fn select_worker(
         &self,
         query_id: &str,
@@ -1156,21 +1191,34 @@ impl SmartScaler {
             warn!("Failed to refresh workers: {}", e);
         }
 
-        let workers = self.workers.read().await;
+        // Use WRITE lock to atomically select AND reserve
+        let mut workers = self.workers.write().await;
 
         if workers.is_empty() {
             warn!("No workers available");
             return None;
         }
 
-        let required_with_safety = (estimated_memory_mb as f64 * ESTIMATION_SAFETY) as u64;
-
         // Find best fit worker
         // Priority: 1) Can accept without resize, 2) Least utilized, 3) Fewest queries
-        let mut candidates: Vec<_> = workers.values().filter(|w| !w.resize_in_progress).collect();
-
-        // Sort by: can accept > utilization > query count
-        candidates.sort_by(|a, b| {
+        // Collect names first to avoid borrowing issues
+        let candidate_names: Vec<String> = workers
+            .values()
+            .filter(|w| !w.resize_in_progress)
+            .map(|w| w.name.clone())
+            .collect();
+        
+        if candidate_names.is_empty() {
+            warn!("No workers available (all resizing)");
+            return None;
+        }
+        
+        // Sort candidates by preference
+        let mut sorted_names = candidate_names;
+        sorted_names.sort_by(|a_name, b_name| {
+            let a = workers.get(a_name).unwrap();
+            let b = workers.get(b_name).unwrap();
+            
             let a_can_accept = a.can_accept_query(estimated_memory_mb);
             let b_can_accept = b.can_accept_query(estimated_memory_mb);
 
@@ -1189,7 +1237,9 @@ impl SmartScaler {
             a.running_queries.len().cmp(&b.running_queries.len()) // Prefer fewer queries
         });
 
-        let selected = candidates.first()?;
+        // Try to reserve memory on best candidate
+        let selected_name = sorted_names.first()?.clone();
+        let selected = workers.get_mut(&selected_name)?;
 
         // Determine if resize is needed
         let needs_resize = !selected.can_accept_query(estimated_memory_mb);
@@ -1201,23 +1251,51 @@ impl SmartScaler {
             selected.memory_limit_mb
         };
 
+        // ATOMICALLY reserve memory (prevents race condition)
+        // Note: reserve_memory will fail if not enough capacity, but we proceed anyway
+        // because `needs_resize` is true and we'll resize the worker before query starts
+        let reservation_succeeded = selected.reserve_memory(estimated_memory_mb);
+        
+        if !reservation_succeeded && !needs_resize {
+            // This shouldn't happen - can_accept_query said yes but reserve_memory said no
+            // This indicates a race condition we're preventing
+            warn!(
+                "Memory reservation failed for worker {} despite can_accept_query=true (race prevented)",
+                selected_name
+            );
+        }
+
         info!(
-            "Selected worker {} for query {}: needs_resize={}, limit={}MB->{}MB, estimated={}MB",
-            selected.name,
+            "Selected worker {} for query {}: needs_resize={}, limit={}MB->{}MB, estimated={}MB, reserved={}",
+            selected_name,
             query_id,
             needs_resize,
             selected.memory_limit_mb,
             new_limit_mb,
-            estimated_memory_mb
+            estimated_memory_mb,
+            reservation_succeeded
         );
 
         Some(WorkerSelection {
-            worker_name: selected.name.clone(),
+            worker_name: selected_name,
             worker_address: selected.address.clone(),
             needs_resize,
             new_limit_mb,
             current_limit_mb: selected.memory_limit_mb,
         })
+    }
+    
+    /// Release memory reservation if query fails to start
+    /// Call this if the query cannot be executed after select_worker was called
+    pub async fn release_reservation(&self, worker_name: &str, estimated_memory_mb: u64) {
+        let mut workers = self.workers.write().await;
+        if let Some(worker) = workers.get_mut(worker_name) {
+            worker.release_reservation(estimated_memory_mb);
+            debug!(
+                "Released reservation of {}MB from worker {}",
+                estimated_memory_mb, worker_name
+            );
+        }
     }
 
     /// Pre-size worker before assigning query (VPA pre-assignment)
@@ -1343,6 +1421,10 @@ impl SmartScaler {
         let mut workers = self.workers.write().await;
 
         if let Some(worker) = workers.get_mut(worker_name) {
+            // Release the reservation (convert to actual running query)
+            // This prevents the race condition where memory was double-counted
+            worker.release_reservation(estimated_memory_mb);
+            
             worker.running_queries.push(QueryState {
                 id: query_id.to_string(),
                 estimated_memory_mb,
@@ -1352,10 +1434,11 @@ impl SmartScaler {
             worker.last_activity = Instant::now();
 
             debug!(
-                "Query {} started on worker {}, running: {}",
+                "Query {} started on worker {}, running: {}, reserved_mb: {}",
                 query_id,
                 worker_name,
-                worker.running_queries.len()
+                worker.running_queries.len(),
+                worker.reserved_memory_mb
             );
         }
 
@@ -1856,6 +1939,7 @@ mod tests {
             running_queries: vec![],
             last_activity: Instant::now(),
             resize_in_progress: false,
+            reserved_memory_mb: 0,
             // Adaptive fields
             created_at: Instant::now(),
             idle_since: Some(Instant::now()),
@@ -1903,6 +1987,7 @@ mod tests {
             running_queries: vec![],
             last_activity: Instant::now(),
             resize_in_progress: false,
+            reserved_memory_mb: 0,
             created_at: Instant::now(),
             idle_since: Some(Instant::now()),
             cpu_history: std::collections::VecDeque::new(),
