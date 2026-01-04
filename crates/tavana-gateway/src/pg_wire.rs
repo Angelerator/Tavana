@@ -636,6 +636,9 @@ async fn handle_connection_with_tls(
     tls_config: Option<Arc<TlsConfig>>,
     config: Arc<PgWireConfig>,
 ) -> anyhow::Result<()> {
+    // Get client IP before TLS upgrade (socket ref is consumed by TLS)
+    let client_ip = socket.peer_addr().ok().map(|addr| addr.ip().to_string());
+    
     let mut buf = [0u8; 4];
     
     // Read initial message to check for SSL request
@@ -673,7 +676,7 @@ async fn handle_connection_with_tls(
                     
                     info!("TLS connection established");
                     
-                    // Continue with TLS stream
+                    // Continue with TLS stream (pass client_ip captured before TLS)
                     return handle_connection_generic(
                         tls_stream,
                         auth_service,
@@ -684,6 +687,7 @@ async fn handle_connection_with_tls(
                         smart_scaler,
                         query_queue,
                         config,
+                        client_ip,
                     ).await;
                 } else {
                     debug!("SSL negotiation requested, declining (no TLS config)");
@@ -747,7 +751,7 @@ async fn handle_connection_with_tls(
 /// Handle connection after SSL negotiation declined - expects client to retry without SSL
 async fn handle_connection(
     mut socket: tokio::net::TcpStream,
-    _auth_service: Arc<AuthService>,
+    auth_service: Arc<AuthService>,
     worker_client: Arc<WorkerClient>,
     query_router: Arc<QueryRouter>,
     _pool_manager: Option<Arc<WorkerPoolManager>>,
@@ -758,6 +762,12 @@ async fn handle_connection(
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; 4];
     let mut startup_msg;
+
+    // Get client IP for auth context
+    let client_ip = socket.peer_addr().ok().map(|addr| addr.ip().to_string());
+    
+    // Get auth gateway from service
+    let auth_gateway = auth_service.gateway().cloned();
 
     // Loop to handle multiple negotiation requests (SSL, GSSAPI)
     loop {
@@ -803,8 +813,8 @@ async fn handle_connection(
         extract_startup_param(&startup_msg, "user").unwrap_or_else(|| "anonymous".to_string());
     info!("PostgreSQL client connected as user: {}", user_id);
 
-    // Perform MD5 password authentication (Tableau/DBeaver compatibility)
-    perform_md5_auth(&mut socket, &user_id).await?;
+    // Perform password authentication with auth gateway
+    let _principal = perform_md5_auth(&mut socket, &user_id, auth_gateway.as_ref(), client_ip).await?;
 
     // Send common parameter status messages
     send_parameter_status(&mut socket, "server_version", "15.0 (Tavana DuckDB)").await?;
@@ -844,7 +854,7 @@ async fn handle_connection(
 async fn handle_connection_with_startup(
     mut socket: tokio::net::TcpStream,
     startup_msg: Vec<u8>,
-    _auth_service: Arc<AuthService>,
+    auth_service: Arc<AuthService>,
     worker_client: Arc<WorkerClient>,
     query_router: Arc<QueryRouter>,
     _pool_manager: Option<Arc<WorkerPoolManager>>,
@@ -853,13 +863,19 @@ async fn handle_connection_with_startup(
     query_queue: Arc<QueryQueue>,
     config: Arc<PgWireConfig>,
 ) -> anyhow::Result<()> {
+    // Get client IP for auth context
+    let client_ip = socket.peer_addr().ok().map(|addr| addr.ip().to_string());
+    
+    // Get auth gateway from service
+    let auth_gateway = auth_service.gateway().cloned();
+
     // Extract user from startup message
     let user_id =
         extract_startup_param(&startup_msg, "user").unwrap_or_else(|| "anonymous".to_string());
     info!("PostgreSQL client connected as user: {}", user_id);
 
-    // Perform MD5 password authentication (Tableau/DBeaver compatibility)
-    perform_md5_auth(&mut socket, &user_id).await?;
+    // Perform password authentication with auth gateway
+    let _principal = perform_md5_auth(&mut socket, &user_id, auth_gateway.as_ref(), client_ip).await?;
 
     // Send common parameter status messages
     send_parameter_status(&mut socket, "server_version", "15.0 (Tavana DuckDB)").await?;
@@ -890,7 +906,7 @@ async fn handle_connection_with_startup(
 /// Generic connection handler for both TLS and non-TLS streams
 async fn handle_connection_generic<S>(
     mut socket: S,
-    _auth_service: Arc<AuthService>,
+    auth_service: Arc<AuthService>,
     worker_client: Arc<WorkerClient>,
     query_router: Arc<QueryRouter>,
     _pool_manager: Option<Arc<WorkerPoolManager>>,
@@ -898,10 +914,14 @@ async fn handle_connection_generic<S>(
     smart_scaler: Option<Arc<SmartScaler>>,
     query_queue: Arc<QueryQueue>,
     config: Arc<PgWireConfig>,
+    client_ip: Option<String>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Get auth gateway from service
+    let auth_gateway = auth_service.gateway().cloned();
+
     let mut buf = [0u8; 4];
     let mut startup_msg;
 
@@ -944,8 +964,8 @@ where
         extract_startup_param(&startup_msg, "user").unwrap_or_else(|| "anonymous".to_string());
     info!("PostgreSQL client connected as user: {} (TLS)", user_id);
 
-    // Perform MD5 password authentication (Tableau/DBeaver compatibility)
-    perform_md5_auth_generic(&mut socket, &user_id).await?;
+    // Perform password authentication with auth gateway
+    let _principal = perform_md5_auth_generic(&mut socket, &user_id, auth_gateway.as_ref(), client_ip).await?;
 
     // Send common parameter status messages
     send_parameter_status_generic(&mut socket, "server_version", "15.0 (Tavana DuckDB)").await?;
@@ -3337,10 +3357,13 @@ fn pg_type_len(type_name: &str) -> i16 {
 
 /// Perform cleartext password authentication for TcpStream
 /// Uses cleartext to allow JWTs, API keys, or other tokens in the password field
-async fn perform_md5_auth(socket: &mut tokio::net::TcpStream, user: &str) -> anyhow::Result<()> {
-    // For backwards compatibility, use cleartext passthrough mode
-    let _ = perform_cleartext_auth_internal(socket, user, None).await?;
-    Ok(())
+async fn perform_md5_auth(
+    socket: &mut tokio::net::TcpStream,
+    user: &str,
+    auth_gateway: Option<&Arc<AuthGateway>>,
+    client_ip: Option<String>,
+) -> anyhow::Result<Option<AuthenticatedPrincipal>> {
+    perform_cleartext_auth_internal(socket, user, Some((auth_gateway, client_ip))).await
 }
 
 /// Perform cleartext password authentication with optional gateway validation
@@ -3447,40 +3470,16 @@ async fn perform_cleartext_auth_internal(
 }
 
 /// Perform cleartext password authentication for generic async streams (TLS connections)
-async fn perform_md5_auth_generic<S>(socket: &mut S, user: &str) -> anyhow::Result<()>
+async fn perform_md5_auth_generic<S>(
+    socket: &mut S,
+    user: &str,
+    auth_gateway: Option<&Arc<AuthGateway>>,
+    client_ip: Option<String>,
+) -> anyhow::Result<Option<AuthenticatedPrincipal>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Send AuthenticationCleartextPassword (R with auth type 3)
-    let auth_req = [b'R', 0, 0, 0, 8, 0, 0, 0, 3]; // auth type 3 = Cleartext
-    socket.write_all(&auth_req).await?;
-    socket.flush().await?;
-    
-    debug!("Sent cleartext auth request to client for user: {} (TLS)", user);
-    
-    // Read password response
-    let mut msg_type = [0u8; 1];
-    socket.read_exact(&mut msg_type).await?;
-    
-    if msg_type[0] != b'p' {
-        return Err(anyhow::anyhow!("Expected password message, got: {:?}", msg_type[0]));
-    }
-    
-    let mut len_buf = [0u8; 4];
-    socket.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize - 4;
-    
-    let mut password_data = vec![0u8; len];
-    socket.read_exact(&mut password_data).await?;
-    
-    debug!("Received password response, accepting (passthrough mode TLS)");
-    
-    // Send AuthenticationOk
-    socket.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0]).await?;
-    socket.flush().await?;
-    
-    info!("Authentication completed for user: {} (TLS passthrough)", user);
-    Ok(())
+    perform_cleartext_auth_generic_with_gateway(socket, user, auth_gateway, client_ip).await
 }
 
 /// Perform cleartext password authentication for TLS with optional gateway
