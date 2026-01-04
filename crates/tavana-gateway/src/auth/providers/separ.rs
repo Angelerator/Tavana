@@ -28,17 +28,39 @@ pub struct SeparProvider {
 }
 
 impl SeparProvider {
-    /// Create a new Separ provider
+    /// Create a new Separ provider with optimized connection pooling
     pub fn new(config: SeparConfig) -> anyhow::Result<Self> {
         let client = Client::builder()
+            // Connection settings
             .connect_timeout(config.connect_timeout())
             .timeout(config.request_timeout())
+            // Connection pooling - keep connections alive for reuse
+            .pool_idle_timeout(config.pool_idle_timeout())
+            .pool_max_idle_per_host(config.pool_max_idle_per_host)
+            // TCP keep-alive to detect dead connections
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            // Enable HTTP/1.1 keep-alive
+            .http1_only()
             .build()?;
 
-        Ok(Self {
+        let provider = Self {
             client,
             config: Arc::new(config),
-        })
+        };
+
+        // Spawn a warmup task to pre-establish connection
+        let warmup_client = provider.client.clone();
+        let warmup_endpoint = provider.config.endpoint.clone();
+        tokio::spawn(async move {
+            // Try to establish connection early
+            let _ = warmup_client
+                .get(format!("{}/health", warmup_endpoint))
+                .send()
+                .await;
+            tracing::debug!("Separ connection warmup completed");
+        });
+
+        Ok(provider)
     }
 
     /// Detect the credential type from the secret

@@ -125,6 +125,14 @@ pub struct SeparConfig {
     /// Request timeout
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
+
+    /// Pool idle timeout (how long to keep idle connections)
+    #[serde(default = "default_pool_idle_timeout")]
+    pub pool_idle_timeout_secs: u64,
+
+    /// Max idle connections per host
+    #[serde(default = "default_pool_max_idle")]
+    pub pool_max_idle_per_host: usize,
 }
 
 impl SeparConfig {
@@ -138,8 +146,24 @@ impl SeparConfig {
             enable_authz: std::env::var("SEPAR_ENABLE_AUTHZ")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(true),
-            connect_timeout_secs: 5,
-            request_timeout_secs: 10,
+            connect_timeout_secs: std::env::var("SEPAR_CONNECT_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map(|ms: u64| ms / 1000)
+                .unwrap_or(5),
+            request_timeout_secs: std::env::var("SEPAR_REQUEST_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .map(|ms: u64| ms / 1000)
+                .unwrap_or(10),
+            pool_idle_timeout_secs: std::env::var("SEPAR_POOL_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(90),
+            pool_max_idle_per_host: std::env::var("SEPAR_POOL_MAX_IDLE_PER_HOST")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
         }
     }
 
@@ -149,6 +173,10 @@ impl SeparConfig {
 
     pub fn request_timeout(&self) -> Duration {
         Duration::from_secs(self.request_timeout_secs)
+    }
+
+    pub fn pool_idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.pool_idle_timeout_secs)
     }
 }
 
@@ -270,6 +298,8 @@ pub enum ProviderConfig {
 fn default_true() -> bool { true }
 fn default_connect_timeout() -> u64 { 5 }
 fn default_request_timeout() -> u64 { 10 }
+fn default_pool_idle_timeout() -> u64 { 90 }
+fn default_pool_max_idle() -> usize { 10 }
 fn default_cache_ttl() -> u64 { 300 }
 fn default_cache_size() -> usize { 10000 }
 fn default_max_attempts() -> u32 { 5 }
