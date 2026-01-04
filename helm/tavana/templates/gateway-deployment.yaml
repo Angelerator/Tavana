@@ -93,6 +93,24 @@ spec:
               value: "{{ .Values.gateway.tls.commonName | default "tavana.local" }}"
             {{- end }}
             {{- end }}
+            # Authentication configuration
+            - name: TAVANA_AUTH_MODE
+              value: {{ .Values.auth.mode | default "passthrough" | quote }}
+            {{- if .Values.auth.separ.enabled }}
+            - name: SEPAR_ENDPOINT
+              value: {{ .Values.auth.separ.endpoint | quote }}
+            - name: SEPAR_ENABLE_AUTHZ
+              value: {{ .Values.auth.separ.enableAuthz | default true | quote }}
+            - name: SEPAR_TENANT_EXTRACTION
+              value: {{ .Values.auth.separ.tenantExtraction | default "email_domain" | quote }}
+            {{- if .Values.auth.separ.existingSecret }}
+            - name: SEPAR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.separ.existingSecret }}
+                  key: {{ .Values.auth.separ.existingSecretKey | default "separ-api-key" }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.gateway.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
