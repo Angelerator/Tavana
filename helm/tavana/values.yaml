@@ -255,6 +255,51 @@ monitoring:
       namespace: ""
       labels: {}
 
+# Authentication Configuration
+auth:
+  # Mode: passthrough (no auth), required, optional
+  mode: "passthrough"
+  
+  # Separ integration
+  separ:
+    enabled: false
+    endpoint: "http://separ.separ.svc.cluster.local:8080"
+    enableAuthz: true
+    tenantExtraction: "email_domain"
+    existingSecret: ""
+    existingSecretKey: "separ-api-key"
+  
+  # Cache and rate limiting
+  cache:
+    enabled: true
+    ttlSecs: 300
+  rateLimit:
+    enabled: true
+    maxFailedAttempts: 5
+
+# Authentication (Separ integration)
+# See docs/authentication.md for full configuration
+auth:
+  # Mode: passthrough (no auth), required (mandatory), optional (allow anonymous)
+  mode: "passthrough"
+  # Separ integration
+  separ:
+    enabled: false
+    endpoint: "http://separ.separ.svc.cluster.local:8080"
+    enableAuthz: true
+    tenantExtraction: "email_domain"
+    # Use existingSecret for API key (don't inline secrets!)
+    existingSecret: ""
+    existingSecretKey: "separ-api-key"
+  # Cache settings
+  cache:
+    enabled: true
+    ttlSecs: 300
+  # Rate limiting
+  rateLimit:
+    enabled: true
+    maxFailedAttempts: 5
+
 # ConfigMap for gateway configuration
 config:
   # Log level: debug, info, warn, error
