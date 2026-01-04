@@ -255,50 +255,70 @@ monitoring:
       namespace: ""
       labels: {}
 
-# Authentication Configuration
+# =============================================================================
+# Authentication Gateway Configuration
+# =============================================================================
+# Tavana supports multiple authentication modes and providers.
+# Auth is OPTIONAL - community editions can run without any auth.
+#
+# Modes:
+#   - passthrough: No auth required (default for community edition)
+#   - required:    Auth required via configured providers
+#   - optional:    Allow anonymous if no credentials provided
+#
+# Providers (can enable multiple):
+#   - separ:       Centralized authorization platform (enterprise)
+#   - jwt:         Direct JWT/OIDC validation (any IdP)
+#   - staticKeys:  Simple API key authentication
+#
 auth:
-  # Mode: passthrough (no auth), required, optional
+  # Auth mode - "passthrough" for community/dev, "required" for enterprise
   mode: "passthrough"
   
-  # Separ integration
+  # --- Provider 1: Separ (Enterprise Authorization Platform) ---
+  # Enable for centralized multi-tenant authorization
   separ:
     enabled: false
     endpoint: "http://separ.separ.svc.cluster.local:8080"
     enableAuthz: true
-    tenantExtraction: "email_domain"
-    existingSecret: ""
+    tenantExtraction: "email_domain"  # email_domain, backslash_prefix, none
+    existingSecret: ""                 # K8s secret with API key
     existingSecretKey: "separ-api-key"
+    # Connection tuning
+    connectTimeoutMs: 5000
+    requestTimeoutMs: 10000
+    poolIdleTimeoutSecs: 90
+    poolMaxIdlePerHost: 10
   
-  # Cache and rate limiting
-  cache:
-    enabled: true
-    ttlSecs: 300
-  rateLimit:
-    enabled: true
-    maxFailedAttempts: 5
-
-# Authentication (Separ integration)
-# See docs/authentication.md for full configuration
-auth:
-  # Mode: passthrough (no auth), required (mandatory), optional (allow anonymous)
-  mode: "passthrough"
-  # Separ integration
-  separ:
+  # --- Provider 2: Direct JWT/OIDC (Any Identity Provider) ---
+  # Enable for direct JWT validation without Separ
+  # Works with: Azure AD, Okta, Auth0, Keycloak, etc.
+  jwt:
     enabled: false
-    endpoint: "http://separ.separ.svc.cluster.local:8080"
-    enableAuthz: true
-    tenantExtraction: "email_domain"
-    # Use existingSecret for API key (don't inline secrets!)
-    existingSecret: ""
-    existingSecretKey: "separ-api-key"
-  # Cache settings
+    # issuer: "https://your-idp.example.com"
+    # audience: "tavana"
+    # algorithm: "RS256"  # RS256 for asymmetric, HS256 for symmetric
+    # jwksUri: "https://your-idp.example.com/.well-known/jwks.json"
+    # secretOrKeyPath: ""  # For HS256 or local public key
+    # clockSkewSecs: 60
+  
+  # --- Provider 3: Static API Keys ---
+  # Enable for simple service-to-service auth
+  staticKeys:
+    enabled: false
+    # keys: []  # Define via secrets, not inline
+  
+  # --- Auth Caching ---
   cache:
     enabled: true
-    ttlSecs: 300
-  # Rate limiting
+    ttlSecs: 300        # Cache successful auth for 5 minutes
+    maxSize: 10000      # Max cached entries
+  
+  # --- Rate Limiting ---
   rateLimit:
     enabled: true
     maxFailedAttempts: 5
+    banDurationSecs: 300
 
 # ConfigMap for gateway configuration
 config:
