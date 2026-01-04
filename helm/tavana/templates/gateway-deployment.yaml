@@ -110,7 +110,30 @@ spec:
                   name: {{ .Values.auth.separ.existingSecret }}
                   key: {{ .Values.auth.separ.existingSecretKey | default "separ-api-key" }}
             {{- end }}
+            # Separ connection optimization
+            - name: SEPAR_CONNECT_TIMEOUT_MS
+              value: {{ .Values.auth.separ.connectTimeoutMs | default 5000 | quote }}
+            - name: SEPAR_REQUEST_TIMEOUT_MS
+              value: {{ .Values.auth.separ.requestTimeoutMs | default 10000 | quote }}
+            - name: SEPAR_POOL_IDLE_TIMEOUT_SECS
+              value: {{ .Values.auth.separ.poolIdleTimeoutSecs | default 90 | quote }}
+            - name: SEPAR_POOL_MAX_IDLE_PER_HOST
+              value: {{ .Values.auth.separ.poolMaxIdlePerHost | default 10 | quote }}
             {{- end }}
+            # Auth cache configuration
+            - name: TAVANA_AUTH_CACHE_ENABLED
+              value: {{ .Values.auth.cache.enabled | default true | quote }}
+            - name: TAVANA_AUTH_CACHE_TTL_SECS
+              value: {{ .Values.auth.cache.ttlSecs | default 300 | quote }}
+            - name: TAVANA_AUTH_CACHE_MAX_SIZE
+              value: {{ .Values.auth.cache.maxSize | default 10000 | quote }}
+            # Rate limiting
+            - name: TAVANA_AUTH_RATE_LIMIT_ENABLED
+              value: {{ .Values.auth.rateLimit.enabled | default true | quote }}
+            - name: TAVANA_AUTH_RATE_LIMIT_MAX_FAILED
+              value: {{ .Values.auth.rateLimit.maxFailedAttempts | default 5 | quote }}
+            - name: TAVANA_AUTH_RATE_LIMIT_BAN_SECS
+              value: {{ .Values.auth.rateLimit.banDurationSecs | default 300 | quote }}
             {{- with .Values.gateway.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
