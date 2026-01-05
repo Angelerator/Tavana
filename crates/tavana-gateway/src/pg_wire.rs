@@ -1711,6 +1711,23 @@ where
                         debug!("Extended Protocol - Execute: Describe sent NoData, sending CommandComplete: {}", cmd_tag);
                         send_command_complete_generic(socket, &cmd_tag).await?;
                     } else {
+                        // FIRST: Check if this is an intercepted command (like Tableau temp table SELECT)
+                        // If so, return the fake rows instead of executing against worker
+                        if let Some(result) = handle_pg_specific_command(sql) {
+                            if !result.rows.is_empty() {
+                                info!("Extended Protocol - Execute: Intercepted command returns {} rows", result.rows.len());
+                                for row in &result.rows {
+                                    send_data_row_generic(socket, row, __describe_column_count).await?;
+                                }
+                                let cmd_tag = result.command_tag.unwrap_or_else(|| format!("SELECT {}", result.rows.len()));
+                                send_command_complete_generic(socket, &cmd_tag).await?;
+                                prepared_query = None;
+                                describe_sent_row_description = false;
+                                __describe_column_count = 0;
+                                continue;
+                            }
+                        }
+                        
                         // Execute query and get all rows
                         // NOTE: This still buffers all rows for JDBC cursor support.
                         // True streaming for JDBC requires DECLARE CURSOR / FETCH instead.
@@ -3978,6 +3995,41 @@ async fn handle_execute_extended(
         "Extended query protocol - Execute: {}",
         &sql[..sql.len().min(100)]
     );
+
+    // FIRST: Check if this is an intercepted command (like Tableau temp table SELECT)
+    // If so, return the fake rows instead of executing against worker
+    if let Some(result) = handle_pg_specific_command(sql) {
+        if !result.rows.is_empty() {
+            info!("Extended query protocol - Execute: Intercepted command returns {} rows", result.rows.len());
+            // Send DataRow for each row
+            for row in &result.rows {
+                let mut row_msg = vec![b'D'];
+                let field_count = row.len() as i16;
+                let mut row_data = Vec::new();
+                row_data.extend_from_slice(&field_count.to_be_bytes());
+                for value in row {
+                    let bytes = value.as_bytes();
+                    row_data.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                    row_data.extend_from_slice(bytes);
+                }
+                let row_len = (4 + row_data.len()) as u32;
+                row_msg.extend_from_slice(&row_len.to_be_bytes());
+                row_msg.extend_from_slice(&row_data);
+                socket.write_all(&row_msg).await?;
+            }
+            // Send CommandComplete
+            let cmd_tag = result.command_tag.unwrap_or_else(|| format!("SELECT {}", result.rows.len()));
+            let cmd_bytes = cmd_tag.as_bytes();
+            let cmd_len = (4 + cmd_bytes.len() + 1) as u32;
+            let mut cmd_msg = vec![b'C'];
+            cmd_msg.extend_from_slice(&cmd_len.to_be_bytes());
+            cmd_msg.extend_from_slice(cmd_bytes);
+            cmd_msg.push(0);
+            socket.write_all(&cmd_msg).await?;
+            socket.flush().await?;
+            return Ok(());
+        }
+    }
 
     let query_id = uuid::Uuid::new_v4().to_string();
 
