@@ -940,11 +940,11 @@ where
 
         if len == 8 && startup_msg.len() >= 4 {
             let code = u32::from_be_bytes([
-                startup_msg[0],
-                startup_msg[1],
-                startup_msg[2],
-                startup_msg[3],
-            ]);
+            startup_msg[0],
+            startup_msg[1],
+            startup_msg[2],
+            startup_msg[3],
+        ]);
             match code {
                 80877103 | 80877104 => {
                     // SSLRequest or GSSENCRequest after TLS - decline (already encrypted)
@@ -1055,7 +1055,7 @@ async fn run_query_loop(
                         socket.write_all(&ready).await?;
                         socket.flush().await?;
                         continue;
-                    } else {
+            } else {
                         warn!(query = %query, "DECLARE CURSOR parsing failed (non-TLS)");
                     }
                 }
@@ -1204,8 +1204,8 @@ async fn run_query_loop(
                     }
                 }
 
-                socket.write_all(&ready).await?;
-                socket.flush().await?;
+    socket.write_all(&ready).await?;
+    socket.flush().await?;
             }
             b'P' => {
                 let sql = handle_parse_extended(socket, &mut buf).await?;
@@ -1426,8 +1426,8 @@ where
                     if let Some(result) = cursors::handle_close_cursor(&query, &mut cursors, worker_client).await {
                         info!(command_tag = ?result.command_tag, "CLOSE CURSOR handled (TLS extended query)");
                         send_simple_result_generic(socket, &[], &[], result.command_tag.as_deref()).await?;
-                        socket.write_all(&ready).await?;
-                        socket.flush().await?;
+                socket.write_all(&ready).await?;
+                socket.flush().await?;
                         continue;
                     }
                 }
@@ -1743,6 +1743,7 @@ where
                         match query_result {
                             Ok(Ok(rows)) => {
                                 let total_rows = rows.len();
+                                info!("Extended Protocol - Execute: query returned {} rows", total_rows);
                                 let rows_to_send = if max_rows > 0 && (max_rows as usize) < total_rows {
                                     max_rows as usize
                                 } else {
@@ -3067,10 +3068,10 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
         // CREATE TABLE (with or without TEMP/TEMPORARY keyword)
         if sql_upper.contains("CREATE") && sql_upper.contains("TABLE") {
             tracing::info!("Intercepted Tableau CREATE TABLE - returning success");
-            return Some(QueryExecutionResult {
-                columns: vec![],
-                rows: vec![],
-                row_count: 0,
+        return Some(QueryExecutionResult {
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
                 command_tag: Some("CREATE TABLE".to_string()),
             });
         }
@@ -3078,10 +3079,10 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
         // SELECT INTO (Tableau uses this for temp table creation)
         if sql_upper.contains("SELECT") && sql_upper.contains("INTO") {
             tracing::info!("Intercepted Tableau SELECT INTO - returning success");
-            return Some(QueryExecutionResult {
-                columns: vec![],
-                rows: vec![],
-                row_count: 0,
+        return Some(QueryExecutionResult {
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
                 command_tag: Some("SELECT 0".to_string()),
             });
         }
@@ -3354,9 +3355,9 @@ async fn send_error(socket: &mut tokio::net::TcpStream, message: &str) -> anyhow
 /// Send error response with specific SQLSTATE code
 async fn send_error_response(socket: &mut tokio::net::TcpStream, code: &str, message: &str) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
-    
+
     let code_bytes = format!("{}\0", code);
-    
+
     let mut msg = Vec::new();
     msg.push(b'E');
     let mut fields = Vec::new();
@@ -3800,7 +3801,7 @@ async fn handle_describe(
     } else {
         // No prepared statement - send NoData
         socket.write_all(&[b'n', 0, 0, 0, 4]).await?;
-        socket.flush().await?;
+    socket.flush().await?;
         return Ok((false, 0));
     }
 }
@@ -4026,7 +4027,7 @@ async fn handle_execute_extended(
             cmd_msg.extend_from_slice(cmd_bytes);
             cmd_msg.push(0);
             socket.write_all(&cmd_msg).await?;
-            socket.flush().await?;
+    socket.flush().await?;
             return Ok(());
         }
     }
