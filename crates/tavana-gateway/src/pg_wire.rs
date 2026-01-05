@@ -3021,6 +3021,78 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
     // NOTE: DECLARE CURSOR, FETCH, and CLOSE are handled in run_query_loop_generic
     // because they require access to per-connection cursor state
 
+    // =========================================================================
+    // TABLEAU TEMP TABLE INTERCEPTION
+    // =========================================================================
+    // Tableau creates temporary tables like #Tableau_N_GUID_N_Connect_Check for
+    // connection validation. Since Tavana uses stateless workers, temp tables
+    // created on one worker don't exist on another. We intercept these and
+    // return fake success responses to make Tableau's connection check pass.
+    //
+    // Pattern: #Tableau_<N>_<GUID>_<N>_Connect_Check
+    // =========================================================================
+    
+    // Check for Tableau temp table patterns (case-insensitive)
+    let is_tableau_temp_table = sql_upper.contains("#TABLEAU_") && 
+        (sql_upper.contains("CONNECT_CHECK") || sql_upper.contains("_TEMP"));
+    
+    if is_tableau_temp_table {
+        // CREATE TEMP TABLE #Tableau_...
+        if sql_trimmed.starts_with("CREATE ") && sql_trimmed.contains(" TABLE ") {
+            tracing::debug!("Intercepted Tableau CREATE TEMP TABLE - returning success");
+            return Some(QueryExecutionResult {
+                columns: vec![],
+                rows: vec![],
+                row_count: 0,
+                command_tag: Some("CREATE TABLE".to_string()),
+            });
+        }
+        
+        // SELECT FROM #Tableau_... - return empty result with expected columns
+        if sql_trimmed.starts_with("SELECT ") {
+            tracing::debug!("Intercepted Tableau SELECT from temp table - returning empty result");
+            return Some(QueryExecutionResult {
+                columns: vec![("x".to_string(), "integer".to_string())],
+                rows: vec![vec!["1".to_string()]], // Return one row to indicate success
+                row_count: 1,
+                command_tag: None,
+            });
+        }
+        
+        // DROP TABLE #Tableau_...
+        if sql_trimmed.starts_with("DROP ") {
+            tracing::debug!("Intercepted Tableau DROP TABLE - returning success");
+            return Some(QueryExecutionResult {
+                columns: vec![],
+                rows: vec![],
+                row_count: 0,
+                command_tag: Some("DROP TABLE".to_string()),
+            });
+        }
+        
+        // INSERT INTO #Tableau_...
+        if sql_trimmed.starts_with("INSERT ") {
+            tracing::debug!("Intercepted Tableau INSERT - returning success");
+            return Some(QueryExecutionResult {
+                columns: vec![],
+                rows: vec![],
+                row_count: 1,
+                command_tag: Some("INSERT 0 1".to_string()),
+            });
+        }
+    }
+    
+    // Also intercept any SELECT that references #Tableau_ tables (may not have CONNECT_CHECK)
+    if sql_trimmed.starts_with("SELECT ") && sql_upper.contains("FROM") && sql_upper.contains("#TABLEAU_") {
+        tracing::debug!("Intercepted Tableau temp table query - returning success row");
+        return Some(QueryExecutionResult {
+            columns: vec![("x".to_string(), "integer".to_string())],
+            rows: vec![vec!["1".to_string()]],
+            row_count: 1,
+            command_tag: None,
+        });
+    }
+
     if sql_upper.contains("PG_CATALOG") || sql_upper.contains("INFORMATION_SCHEMA") {
         return Some(QueryExecutionResult {
             columns: vec![
