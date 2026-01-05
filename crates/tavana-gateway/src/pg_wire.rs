@@ -817,7 +817,7 @@ async fn handle_connection(
     let _principal = perform_md5_auth(&mut socket, &user_id, auth_gateway.as_ref(), client_ip).await?;
 
     // Send common parameter status messages
-    send_parameter_status(&mut socket, "server_version", "15.0 (Tavana DuckDB)").await?;
+    send_parameter_status(&mut socket, "server_version", "15.0.0 (Tavana DuckDB)").await?;
     send_parameter_status(&mut socket, "client_encoding", "UTF8").await?;
     send_parameter_status(&mut socket, "server_encoding", "UTF8").await?;
     send_parameter_status(&mut socket, "DateStyle", "ISO, MDY").await?;
@@ -878,7 +878,7 @@ async fn handle_connection_with_startup(
     let _principal = perform_md5_auth(&mut socket, &user_id, auth_gateway.as_ref(), client_ip).await?;
 
     // Send common parameter status messages
-    send_parameter_status(&mut socket, "server_version", "15.0 (Tavana DuckDB)").await?;
+    send_parameter_status(&mut socket, "server_version", "15.0.0 (Tavana DuckDB)").await?;
     send_parameter_status(&mut socket, "client_encoding", "UTF8").await?;
     send_parameter_status(&mut socket, "server_encoding", "UTF8").await?;
     send_parameter_status(&mut socket, "DateStyle", "ISO, MDY").await?;
@@ -968,7 +968,7 @@ where
     let _principal = perform_md5_auth_generic(&mut socket, &user_id, auth_gateway.as_ref(), client_ip).await?;
 
     // Send common parameter status messages
-    send_parameter_status_generic(&mut socket, "server_version", "15.0 (Tavana DuckDB)").await?;
+    send_parameter_status_generic(&mut socket, "server_version", "15.0.0 (Tavana DuckDB)").await?;
     send_parameter_status_generic(&mut socket, "client_encoding", "UTF8").await?;
     send_parameter_status_generic(&mut socket, "server_encoding", "UTF8").await?;
     send_parameter_status_generic(&mut socket, "DateStyle", "ISO, MDY").await?;
