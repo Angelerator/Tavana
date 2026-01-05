@@ -153,12 +153,18 @@ impl WorkerClient {
                                 }
                             }
                             Err(e) => {
-                                warn!("Arrow IPC decode failed: {}, trying JSON fallback", e);
+                                debug!("Arrow IPC decode failed: {}, trying JSON fallback", e);
                                 // Fallback to JSON for backwards compatibility
-                                if let Ok(batch_rows) =
-                                    serde_json::from_slice::<Vec<Vec<String>>>(&batch.data)
-                                {
-                                    rows.extend(batch_rows);
+                                match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                                    Ok(batch_rows) => {
+                                        debug!("JSON fallback successful: {} rows decoded", batch_rows.len());
+                                        rows.extend(batch_rows);
+                                    }
+                                    Err(json_err) => {
+                                        error!("JSON fallback ALSO failed: {}. Data preview (first 200 bytes): {:?}", 
+                                            json_err, 
+                                            String::from_utf8_lossy(&batch.data[..batch.data.len().min(200)]));
+                                    }
                                 }
                             }
                         }
