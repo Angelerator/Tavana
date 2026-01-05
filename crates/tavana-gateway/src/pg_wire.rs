@@ -3032,14 +3032,24 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
     // Pattern: #Tableau_<N>_<GUID>_<N>_Connect_Check
     // =========================================================================
     
-    // Check for Tableau temp table patterns (case-insensitive)
-    let is_tableau_temp_table = sql_upper.contains("#TABLEAU_") && 
-        (sql_upper.contains("CONNECT_CHECK") || sql_upper.contains("_TEMP"));
+    // =========================================================================
+    // TABLEAU TEMP TABLE INTERCEPTION - Comprehensive pattern matching
+    // =========================================================================
+    // Tableau creates temporary tables like #Tableau_N_GUID_N_Connect_Check
+    // and also uses SELECT INTO for connection validation.
+    // We intercept ALL queries containing #Tableau_ patterns.
+    // =========================================================================
     
-    if is_tableau_temp_table {
-        // CREATE TEMP TABLE #Tableau_...
-        if sql_trimmed.starts_with("CREATE ") && sql_trimmed.contains(" TABLE ") {
-            tracing::debug!("Intercepted Tableau CREATE TEMP TABLE - returning success");
+    // Check if this is ANY Tableau temp table operation
+    let is_tableau_temp = sql_upper.contains("#TABLEAU_");
+    
+    if is_tableau_temp {
+        tracing::info!("Intercepting Tableau temp table query: {}", 
+            if sql.len() > 100 { &sql[..100] } else { sql });
+        
+        // CREATE TABLE (with or without TEMP/TEMPORARY keyword)
+        if sql_upper.contains("CREATE") && sql_upper.contains("TABLE") {
+            tracing::info!("Intercepted Tableau CREATE TABLE - returning success");
             return Some(QueryExecutionResult {
                 columns: vec![],
                 rows: vec![],
@@ -3048,20 +3058,20 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
             });
         }
         
-        // SELECT FROM #Tableau_... - return empty result with expected columns
-        if sql_trimmed.starts_with("SELECT ") {
-            tracing::debug!("Intercepted Tableau SELECT from temp table - returning empty result");
+        // SELECT INTO (Tableau uses this for temp table creation)
+        if sql_upper.contains("SELECT") && sql_upper.contains("INTO") {
+            tracing::info!("Intercepted Tableau SELECT INTO - returning success");
             return Some(QueryExecutionResult {
-                columns: vec![("x".to_string(), "integer".to_string())],
-                rows: vec![vec!["1".to_string()]], // Return one row to indicate success
-                row_count: 1,
-                command_tag: None,
+                columns: vec![],
+                rows: vec![],
+                row_count: 0,
+                command_tag: Some("SELECT 0".to_string()),
             });
         }
         
-        // DROP TABLE #Tableau_...
-        if sql_trimmed.starts_with("DROP ") {
-            tracing::debug!("Intercepted Tableau DROP TABLE - returning success");
+        // DROP TABLE
+        if sql_upper.contains("DROP") {
+            tracing::info!("Intercepted Tableau DROP TABLE - returning success");
             return Some(QueryExecutionResult {
                 columns: vec![],
                 rows: vec![],
@@ -3070,9 +3080,9 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
             });
         }
         
-        // INSERT INTO #Tableau_...
-        if sql_trimmed.starts_with("INSERT ") {
-            tracing::debug!("Intercepted Tableau INSERT - returning success");
+        // INSERT INTO
+        if sql_upper.contains("INSERT") {
+            tracing::info!("Intercepted Tableau INSERT - returning success");
             return Some(QueryExecutionResult {
                 columns: vec![],
                 rows: vec![],
@@ -3080,16 +3090,25 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
                 command_tag: Some("INSERT 0 1".to_string()),
             });
         }
-    }
-    
-    // Also intercept any SELECT that references #Tableau_ tables (may not have CONNECT_CHECK)
-    if sql_trimmed.starts_with("SELECT ") && sql_upper.contains("FROM") && sql_upper.contains("#TABLEAU_") {
-        tracing::debug!("Intercepted Tableau temp table query - returning success row");
+        
+        // SELECT FROM #Tableau_ table - return one success row
+        if sql_upper.contains("SELECT") && sql_upper.contains("FROM") {
+            tracing::info!("Intercepted Tableau SELECT FROM temp table - returning success row");
+            return Some(QueryExecutionResult {
+                columns: vec![("x".to_string(), "integer".to_string())],
+                rows: vec![vec!["1".to_string()]],
+                row_count: 1,
+                command_tag: None,
+            });
+        }
+        
+        // Any other query referencing #Tableau_ - return empty success
+        tracing::info!("Intercepted unknown Tableau temp table query - returning empty success");
         return Some(QueryExecutionResult {
-            columns: vec![("x".to_string(), "integer".to_string())],
-            rows: vec![vec!["1".to_string()]],
-            row_count: 1,
-            command_tag: None,
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
+            command_tag: Some("OK".to_string()),
         });
     }
 
