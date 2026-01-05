@@ -1,0 +1,49 @@
+<?xml version='1.0' encoding='utf-8' ?>
+<!-- 
+  Tavana - Tableau Datasource Customization (TDC) File
+  
+  This file configures Tableau to work with Tavana's stateless architecture.
+  
+  Installation:
+    Mac: cp tavana.tdc ~/Documents/My\ Tableau\ Repository/Datasources/
+    Windows: copy tavana.tdc "%USERPROFILE%\Documents\My Tableau Repository\Datasources\"
+  
+  After copying, QUIT Tableau completely (Cmd+Q) and reopen.
+-->
+<connection-customization class='postgresql' enabled='true' version='10.0'>
+  <vendor name='postgresql' />
+  <driver name='postgresql' />
+  <customizations>
+    <!-- Disable temp table creation - Tavana workers are stateless -->
+    <customization name='CAP_CREATE_TEMP_TABLES' value='no' />
+    
+    <!-- Disable SELECT INTO (creates tables) -->
+    <customization name='CAP_SELECT_INTO' value='no' />
+    
+    <!-- Disable session-specific features -->
+    <customization name='CAP_SET_QUERY_BANDING' value='no' />
+    <customization name='CAP_ISOLATION_LEVEL_SERIALIZABLE' value='no' />
+    <customization name='CAP_ISOLATION_LEVEL_READ_COMMITTED' value='no' />
+    <customization name='CAP_ISOLATION_LEVEL_READ_UNCOMMITTED' value='no' />
+    <customization name='CAP_ISOLATION_LEVEL_REPEATABLE_READS' value='no' />
+    
+    <!-- Disable connection test features that require session state -->
+    <customization name='CAP_CONNECT_STORED_PROCEDURE' value='no' />
+    <customization name='CAP_STORED_PROCEDURE_PREFER_TEMP_TABLE' value='no' />
+    <customization name='CAP_STORED_PROCEDURE_TEMP_TABLE_FROM_BUFFER' value='no' />
+    <customization name='CAP_STORED_PROCEDURE_TEMP_TABLE_FROM_NEW_PROTOCOL' value='no' />
+    
+    <!-- Query capabilities -->
+    <customization name='CAP_QUERY_SUBQUERIES' value='yes' />
+    <customization name='CAP_QUERY_TOP_N' value='yes' />
+    <customization name='CAP_QUERY_TOPSTYLE_LIMIT' value='yes' />
+    <customization name='CAP_QUERY_TOPSTYLE_ROWNUM' value='no' />
+    <customization name='CAP_QUERY_TOPSTYLE_TOP' value='no' />
+    <customization name='CAP_QUERY_GROUP_BY_ALIAS' value='yes' />
+    <customization name='CAP_QUERY_GROUP_BY_DEGREE' value='yes' />
+    <customization name='CAP_QUERY_SORT_BY_DEGREE' value='yes' />
+    
+    <!-- String and unicode support -->
+    <customization name='CAP_SUPPORTS_UNICODE' value='yes' />
+  </customizations>
+</connection-customization>
