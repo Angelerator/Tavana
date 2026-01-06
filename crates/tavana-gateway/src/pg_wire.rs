@@ -3743,6 +3743,60 @@ async fn handle_bind(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4]) -> a
     let len = u32::from_be_bytes(*buf) as usize - 4;
     let mut data = vec![0u8; len];
     socket.read_exact(&mut data).await?;
+    
+    // Parse Bind message to log format codes
+    // Format: portal_name\0 + stmt_name\0 + param_format_count(i16) + param_formats + 
+    //         param_values_count(i16) + params + result_format_count(i16) + result_formats
+    let mut offset = 0;
+    // Skip portal name
+    while offset < data.len() && data[offset] != 0 { offset += 1; }
+    offset += 1; // skip null
+    // Skip statement name  
+    while offset < data.len() && data[offset] != 0 { offset += 1; }
+    offset += 1; // skip null
+    
+    // Skip parameter format codes
+    if offset + 2 <= data.len() {
+        let param_format_count = i16::from_be_bytes([data[offset], data[offset+1]]) as usize;
+        offset += 2 + param_format_count * 2;
+    }
+    
+    // Skip parameter values
+    if offset + 2 <= data.len() {
+        let param_count = i16::from_be_bytes([data[offset], data[offset+1]]) as usize;
+        offset += 2;
+        for _ in 0..param_count {
+            if offset + 4 <= data.len() {
+                let param_len = i32::from_be_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+                offset += 4;
+                if param_len > 0 {
+                    offset += param_len as usize;
+                }
+            }
+        }
+    }
+    
+    // Parse result format codes
+    if offset + 2 <= data.len() {
+        let result_format_count = i16::from_be_bytes([data[offset], data[offset+1]]) as usize;
+        offset += 2;
+        if result_format_count > 0 && offset + result_format_count * 2 <= data.len() {
+            let mut has_binary = false;
+            for i in 0..result_format_count {
+                let fmt = i16::from_be_bytes([data[offset + i*2], data[offset + i*2 + 1]]);
+                if fmt == 1 {
+                    has_binary = true;
+                }
+            }
+            if has_binary {
+                // CRITICAL: Client requested binary format but Tavana only supports text
+                warn!("Bind: client requested BINARY format for {} result columns! Tavana only supports TEXT format, this may cause client parsing errors.", result_format_count);
+            } else {
+                debug!("Bind: client requested TEXT format for {} result columns", result_format_count);
+            }
+        }
+    }
+    
     socket.write_all(&[b'2', 0, 0, 0, 4]).await?; // BindComplete
     socket.flush().await?;
     Ok(())
