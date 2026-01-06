@@ -1363,7 +1363,11 @@ where
                     .trim_end_matches('\0')
                     .to_string();
 
-                info!("Received query (TLS): {}", &query[..query.len().min(100)]); // DEBUG: Always log query
+                info!("Received query (TLS): '{}' (len={}, bytes={:?})", 
+                    &query[..query.len().min(100)],
+                    query.len(),
+                    &query.as_bytes()[..query.len().min(20)]
+                ); // DEBUG: Log query with length and bytes
 
                 // Check for cursor commands first (require connection-level state)
                 let query_upper = query.to_uppercase();
@@ -1447,7 +1451,7 @@ where
 
                 // Handle empty queries (sent by Metabase and other clients during connection test)
                 if query_trimmed.is_empty() {
-                    debug!("Empty query received (TLS), returning EmptyQueryResponse");
+                    info!("Empty query received (TLS), returning EmptyQueryResponse + ReadyForQuery");
                     // PostgreSQL protocol: send EmptyQueryResponse ('I') for empty queries
                     socket.write_all(&[b'I', 0, 0, 0, 4]).await?; // EmptyQueryResponse
                     socket.write_all(&ready).await?;
