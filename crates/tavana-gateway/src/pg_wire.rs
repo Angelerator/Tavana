@@ -1638,44 +1638,16 @@ where
                 }
                 
                 if client_wants_binary {
-                    // CRITICAL: Client requested binary format but we only support text
-                    // Send ErrorResponse to tell client to use text format
-                    warn!("Bind (TLS): client requested BINARY format! Sending error to force text format retry.");
-                    
-                    // Build ErrorResponse
-                    let mut error_msg = Vec::new();
-                    error_msg.push(b'E'); // ErrorResponse
-                    
-                    let mut error_body = Vec::new();
-                    // Severity
-                    error_body.push(b'S');
-                    error_body.extend_from_slice(b"ERROR\0");
-                    // SQLSTATE code (0A000 = feature_not_supported)
-                    error_body.push(b'C');
-                    error_body.extend_from_slice(b"0A000\0");
-                    // Message
-                    error_body.push(b'M');
-                    error_body.extend_from_slice(b"binary transfer mode not supported, please use text format\0");
-                    // Null terminator
-                    error_body.push(0);
-                    
-                    let error_len = (4 + error_body.len()) as u32;
-                    error_msg.extend_from_slice(&error_len.to_be_bytes());
-                    error_msg.extend_from_slice(&error_body);
-                    
-                    socket.write_all(&error_msg).await?;
-                    socket.write_all(&ready).await?;
-                    socket.flush().await?;
-                    
-                    // Clear prepared statement since bind failed
-                    prepared_query = None;
-                    describe_sent_row_description = false;
-                    __describe_column_count = 0;
-                } else {
-                    debug!("Bind (TLS): client requested TEXT format");
-                    socket.write_all(&[b'2', 0, 0, 0, 4]).await?; // BindComplete
-                    socket.flush().await?;
+                    // Client requested binary format but we only support text
+                    // Accept the bind anyway - we'll send text format in response
+                    // Most clients (including Tableau, JDBC drivers) handle this gracefully
+                    debug!("Bind (TLS): client requested BINARY format, will respond with TEXT (DuckDB limitation)");
                 }
+                
+                // Always send BindComplete - we'll respond with text format regardless
+                debug!("Bind (TLS): sending BindComplete");
+                socket.write_all(&[b'2', 0, 0, 0, 4]).await?; // BindComplete
+                socket.flush().await?;
             }
             b'D' => {
                 // Describe - return column info

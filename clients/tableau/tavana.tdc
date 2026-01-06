@@ -14,6 +14,9 @@
   <vendor name='postgresql' />
   <driver name='postgresql' />
   <customizations>
+    <!-- CRITICAL: Force text protocol - Tavana/DuckDB doesn't support binary transfer -->
+    <customization name='odbc-connect-string-extras' value='UseDeclareFetch=0;BinaryTransfer=0;TextAsLongVarchar=1' />
+    
     <!-- Disable temp table creation - Tavana workers are stateless -->
     <customization name='CAP_CREATE_TEMP_TABLES' value='no' />
     
