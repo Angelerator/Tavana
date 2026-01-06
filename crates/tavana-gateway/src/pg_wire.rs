@@ -1815,6 +1815,16 @@ where
                                         .map(|v| if v.len() > 30 { format!("{}...", &v[..30]) } else { v.clone() })
                                         .collect();
                                     debug!("Extended Protocol - First row preview (first 5 cols): {:?}", first_row_preview);
+                                    
+                                    // Check for potential issues in data
+                                    for (i, v) in rows[0].iter().enumerate() {
+                                        if v.contains('\0') {
+                                            warn!("Column {} contains NULL byte! Value preview: {:?}", i, &v[..v.len().min(50)]);
+                                        }
+                                        if v.len() > 10_000_000 {
+                                            warn!("Column {} has unusually large value: {} bytes", i, v.len());
+                                        }
+                                    }
                                 }
                                 let rows_to_send = if max_rows > 0 && (max_rows as usize) < total_rows {
                                     max_rows as usize
@@ -4084,11 +4094,18 @@ where
     for i in 0..cols_to_send {
         if i < row.len() {
             let value = &row[i];
-            if value.is_empty() || value == "null" || value == "NULL" {
+            // Treat explicit "NULL" strings as NULL, but preserve empty strings
+            if value == "NULL" {
                 row_data.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
+            } else if value.is_empty() {
+                // Empty string: length 0, no bytes
+                row_data.extend_from_slice(&0i32.to_be_bytes());
             } else {
-                row_data.extend_from_slice(&(value.len() as i32).to_be_bytes());
-                row_data.extend_from_slice(value.as_bytes());
+                // CRITICAL: PostgreSQL text format should not contain NULL bytes
+                // Remove any embedded NULL bytes to prevent parsing issues
+                let sanitized: String = value.chars().filter(|&c| c != '\0').collect();
+                row_data.extend_from_slice(&(sanitized.len() as i32).to_be_bytes());
+                row_data.extend_from_slice(sanitized.as_bytes());
             }
         } else {
             row_data.extend_from_slice(&(-1i32).to_be_bytes()); // NULL for missing columns
