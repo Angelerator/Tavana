@@ -1612,28 +1612,70 @@ where
                     }
                 }
                 
-                // Parse result format codes
+                // Parse result format codes - check for binary requests
+                let mut client_wants_binary = false;
                 if offset + 2 <= data.len() {
                     let result_format_count = i16::from_be_bytes([data[offset], data[offset+1]]) as usize;
                     offset += 2;
-                    if result_format_count > 0 && offset + result_format_count * 2 <= data.len() {
-                        let mut has_binary = false;
+                    
+                    // Check if client wants binary for any column
+                    if result_format_count == 1 && offset + 2 <= data.len() {
+                        // Single format applies to all columns
+                        let fmt = i16::from_be_bytes([data[offset], data[offset + 1]]);
+                        if fmt == 1 {
+                            client_wants_binary = true;
+                        }
+                    } else if result_format_count > 1 && offset + result_format_count * 2 <= data.len() {
+                        // Per-column formats
                         for i in 0..result_format_count {
                             let fmt = i16::from_be_bytes([data[offset + i*2], data[offset + i*2 + 1]]);
                             if fmt == 1 {
-                                has_binary = true;
+                                client_wants_binary = true;
+                                break;
                             }
-                        }
-                        if has_binary {
-                            warn!("Bind (TLS): client requested BINARY format for {} result columns! Tavana only supports TEXT format.", result_format_count);
-                        } else {
-                            debug!("Bind (TLS): client requested TEXT format for {} result columns", result_format_count);
                         }
                     }
                 }
                 
-                socket.write_all(&[b'2', 0, 0, 0, 4]).await?; // BindComplete
-                socket.flush().await?;
+                if client_wants_binary {
+                    // CRITICAL: Client requested binary format but we only support text
+                    // Send ErrorResponse to tell client to use text format
+                    warn!("Bind (TLS): client requested BINARY format! Sending error to force text format retry.");
+                    
+                    // Build ErrorResponse
+                    let mut error_msg = Vec::new();
+                    error_msg.push(b'E'); // ErrorResponse
+                    
+                    let mut error_body = Vec::new();
+                    // Severity
+                    error_body.push(b'S');
+                    error_body.extend_from_slice(b"ERROR\0");
+                    // SQLSTATE code (0A000 = feature_not_supported)
+                    error_body.push(b'C');
+                    error_body.extend_from_slice(b"0A000\0");
+                    // Message
+                    error_body.push(b'M');
+                    error_body.extend_from_slice(b"binary transfer mode not supported, please use text format\0");
+                    // Null terminator
+                    error_body.push(0);
+                    
+                    let error_len = (4 + error_body.len()) as u32;
+                    error_msg.extend_from_slice(&error_len.to_be_bytes());
+                    error_msg.extend_from_slice(&error_body);
+                    
+                    socket.write_all(&error_msg).await?;
+                    socket.write_all(&ready).await?;
+                    socket.flush().await?;
+                    
+                    // Clear prepared statement since bind failed
+                    prepared_query = None;
+                    describe_sent_row_description = false;
+                    __describe_column_count = 0;
+                } else {
+                    debug!("Bind (TLS): client requested TEXT format");
+                    socket.write_all(&[b'2', 0, 0, 0, 4]).await?; // BindComplete
+                    socket.flush().await?;
+                }
             }
             b'D' => {
                 // Describe - return column info
