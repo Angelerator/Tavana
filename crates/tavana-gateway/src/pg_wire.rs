@@ -1747,7 +1747,16 @@ where
                         match query_result {
                             Ok(Ok(rows)) => {
                                 let total_rows = rows.len();
-                                info!("Extended Protocol - Execute: query returned {} rows", total_rows);
+                                // CRITICAL: Validate that returned row column count matches Describe
+                                let actual_col_count = if total_rows > 0 { rows[0].len() } else { 0 };
+                                if actual_col_count > 0 && actual_col_count != __describe_column_count {
+                                    warn!(
+                                        "Extended Protocol - Execute: COLUMN COUNT MISMATCH! Describe announced {} cols, Execute returned {} cols. This may cause client errors.",
+                                        __describe_column_count, actual_col_count
+                                    );
+                                }
+                                info!("Extended Protocol - Execute: query returned {} rows, {} cols (expected {} cols)", 
+                                    total_rows, actual_col_count, __describe_column_count);
                                 let rows_to_send = if max_rows > 0 && (max_rows as usize) < total_rows {
                                     max_rows as usize
                                 } else {
