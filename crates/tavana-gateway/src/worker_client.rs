@@ -157,7 +157,19 @@ impl WorkerClient {
                                 // Fallback to JSON for backwards compatibility
                                 match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
                                     Ok(batch_rows) => {
-                                        debug!("JSON fallback successful: {} rows decoded", batch_rows.len());
+                                        // Log column counts for diagnostics
+                                        if !batch_rows.is_empty() {
+                                            let first_row_cols = batch_rows[0].len();
+                                            let all_same = batch_rows.iter().all(|r| r.len() == first_row_cols);
+                                            if !all_same {
+                                                warn!("JSON fallback: rows have INCONSISTENT column counts! First row has {} cols", first_row_cols);
+                                                for (i, r) in batch_rows.iter().enumerate().take(5) {
+                                                    warn!("  Row {}: {} cols", i, r.len());
+                                                }
+                                            } else {
+                                                debug!("JSON fallback successful: {} rows decoded, {} cols each", batch_rows.len(), first_row_cols);
+                                            }
+                                        }
                                         rows.extend(batch_rows);
                                     }
                                     Err(json_err) => {

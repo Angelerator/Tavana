@@ -1757,6 +1757,14 @@ where
                                 }
                                 info!("Extended Protocol - Execute: query returned {} rows, {} cols (expected {} cols)", 
                                     total_rows, actual_col_count, __describe_column_count);
+                                // Log sample of first row for debugging (truncated values)
+                                if total_rows > 0 && actual_col_count > 0 {
+                                    let first_row_preview: Vec<String> = rows[0].iter()
+                                        .take(5)
+                                        .map(|v| if v.len() > 30 { format!("{}...", &v[..30]) } else { v.clone() })
+                                        .collect();
+                                    debug!("Extended Protocol - First row preview (first 5 cols): {:?}", first_row_preview);
+                                }
                                 let rows_to_send = if max_rows > 0 && (max_rows as usize) < total_rows {
                                     max_rows as usize
                                 } else {
