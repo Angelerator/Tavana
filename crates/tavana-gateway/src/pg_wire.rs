@@ -1576,11 +1576,62 @@ where
                 socket.flush().await?;
             }
             b'B' => {
-                // Bind
+                // Bind - parse and check result format codes
                 socket.read_exact(&mut buf).await?;
                 let len = u32::from_be_bytes(buf) as usize - 4;
                 let mut data = vec![0u8; len];
                 socket.read_exact(&mut data).await?;
+                
+                // Parse Bind message to detect binary format requests
+                let mut offset = 0;
+                // Skip portal name
+                while offset < data.len() && data[offset] != 0 { offset += 1; }
+                offset += 1;
+                // Skip statement name  
+                while offset < data.len() && data[offset] != 0 { offset += 1; }
+                offset += 1;
+                
+                // Skip parameter format codes
+                if offset + 2 <= data.len() {
+                    let param_format_count = i16::from_be_bytes([data[offset], data[offset+1]]) as usize;
+                    offset += 2 + param_format_count * 2;
+                }
+                
+                // Skip parameter values
+                if offset + 2 <= data.len() {
+                    let param_count = i16::from_be_bytes([data[offset], data[offset+1]]) as usize;
+                    offset += 2;
+                    for _ in 0..param_count {
+                        if offset + 4 <= data.len() {
+                            let param_len = i32::from_be_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+                            offset += 4;
+                            if param_len > 0 {
+                                offset += param_len as usize;
+                            }
+                        }
+                    }
+                }
+                
+                // Parse result format codes
+                if offset + 2 <= data.len() {
+                    let result_format_count = i16::from_be_bytes([data[offset], data[offset+1]]) as usize;
+                    offset += 2;
+                    if result_format_count > 0 && offset + result_format_count * 2 <= data.len() {
+                        let mut has_binary = false;
+                        for i in 0..result_format_count {
+                            let fmt = i16::from_be_bytes([data[offset + i*2], data[offset + i*2 + 1]]);
+                            if fmt == 1 {
+                                has_binary = true;
+                            }
+                        }
+                        if has_binary {
+                            warn!("Bind (TLS): client requested BINARY format for {} result columns! Tavana only supports TEXT format.", result_format_count);
+                        } else {
+                            debug!("Bind (TLS): client requested TEXT format for {} result columns", result_format_count);
+                        }
+                    }
+                }
+                
                 socket.write_all(&[b'2', 0, 0, 0, 4]).await?; // BindComplete
                 socket.flush().await?;
             }
