@@ -1282,6 +1282,7 @@ async fn run_query_loop(
             b'S' => {
                 // Sync message has length field (4 bytes with value 4)
                 socket.read_exact(&mut buf).await?;
+                info!("Extended Protocol - Sync: sending ReadyForQuery");
                 socket.write_all(&ready).await?;
                 socket.flush().await?;
             }
@@ -1710,6 +1711,7 @@ where
                         };
                         debug!("Extended Protocol - Execute: Describe sent NoData, sending CommandComplete: {}", cmd_tag);
                         send_command_complete_generic(socket, &cmd_tag).await?;
+                        socket.flush().await?;
                     } else {
                         // FIRST: Check if this is an intercepted command (like Tableau temp table SELECT)
                         // If so, return the fake rows instead of executing against worker
@@ -1721,6 +1723,8 @@ where
                                 }
                                 let cmd_tag = result.command_tag.unwrap_or_else(|| format!("SELECT {}", result.rows.len()));
                                 send_command_complete_generic(socket, &cmd_tag).await?;
+                                socket.flush().await?;
+                                info!("Extended Protocol - Execute: sent intercepted CommandComplete ({}), flushed", cmd_tag);
                                 prepared_query = None;
                                 describe_sent_row_description = false;
                                 __describe_column_count = 0;
@@ -1771,6 +1775,8 @@ where
                                     // All rows sent
                                     let cmd_tag = format!("SELECT {}", total_rows);
                                     send_command_complete_generic(socket, &cmd_tag).await?;
+                                    socket.flush().await?;
+                                    info!("Extended Protocol - Execute: sent CommandComplete ({}), flushed", cmd_tag);
                                 }
                             }
                             Ok(Err(e)) => {
@@ -1822,7 +1828,7 @@ where
             b'S' => {
                 // Sync message has length field (4 bytes with value 4)
                 socket.read_exact(&mut buf).await?;
-                debug!("Extended Protocol - Sync");
+                info!("Extended Protocol - Sync: sending ReadyForQuery");
                 socket.write_all(&ready).await?;
                 socket.flush().await?;
             }
