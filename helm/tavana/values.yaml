@@ -38,7 +38,7 @@ gateway:
   # External LoadBalancer for client access (Tableau, PowerBI, psql)
   loadBalancer:
     enabled: false              # Enable to expose externally
-    externalPort: 443           # External port (443 passes corporate firewalls)
+    externalPort: 9090          # External port (9090 commonly allowed by policies)
     # loadBalancerIP: ""        # Optional: static IP
     # loadBalancerSourceRanges: # Optional: IP allowlist
     #   - "10.0.0.0/8"
