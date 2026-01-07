@@ -33,7 +33,7 @@ Close and reopen Tableau Desktop, or restart Tableau Server.
 2. Connect → PostgreSQL
 3. Enter connection details:
    - **Server**: `tavana.example.com`
-   - **Port**: `9090`
+   - **Port**: `443`
    - **Database**: `main` (or leave empty)
    - **Username**: Your Separ username (e.g., `user@example.com`)
    - **Password**: Your Separ password
@@ -75,7 +75,7 @@ If you still get connection errors:
 3. Check that SSL is enabled
 4. Verify your credentials with psql:
    ```bash
-   PGPASSWORD='your-password' psql -h tavana.example.com -p 9090 -U 'user@example.com' -c "SELECT 1"
+   PGPASSWORD='your-password' psql -h tavana.example.com -p 443 -U 'user@example.com' -c "SELECT 1"
    ```
 
 ### No Tables Visible

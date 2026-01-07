@@ -48,7 +48,7 @@ gateway:
   # External LoadBalancer for client access (Tableau, PowerBI, psql)
   loadBalancer:
     enabled: true               # Expose Tavana externally
-    externalPort: 9090          # External port (9090 allowed by Azure Policy)
+    externalPort: 443           # External port (443 passes corporate firewalls)
     exposeHttp: false
     exposeFlight: false
     annotations:
