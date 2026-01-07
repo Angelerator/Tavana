@@ -48,7 +48,7 @@ gateway:
   # External LoadBalancer for client access (Tableau, PowerBI, psql)
   loadBalancer:
     enabled: true               # Expose Tavana externally
-    externalPort: 5432          # External port (changed from 443)
+    externalPort: 443           # External port (443 passes firewalls)
     exposeHttp: false
     exposeFlight: false
     annotations:
