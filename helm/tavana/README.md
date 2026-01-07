@@ -70,7 +70,10 @@ helm uninstall tavana -n tavana
 | `gateway.replicaCount` | Number of replicas | `2` |
 | `gateway.resources.requests.memory` | Memory request | `1Gi` |
 | `gateway.resources.limits.memory` | Memory limit | `4Gi` |
-| `gateway.service.pgPort` | PostgreSQL port | `5432` |
+| `gateway.service.pgPort` | PostgreSQL port (internal) | `5432` |
+| `gateway.loadBalancer.enabled` | Enable external LoadBalancer | `false` |
+| `gateway.loadBalancer.externalPort` | External PostgreSQL port | `5432` |
+| `gateway.loadBalancer.annotations` | LoadBalancer annotations | `{}` |
 
 ### Worker
 

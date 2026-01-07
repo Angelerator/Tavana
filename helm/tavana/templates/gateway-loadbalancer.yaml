@@ -1,0 +1,45 @@
+{{- if .Values.gateway.loadBalancer.enabled }}
+# External LoadBalancer Service for PostgreSQL wire protocol
+# This exposes Tavana to external clients (Tableau, PowerBI, psql, etc.)
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-external
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    app: tavana-gateway
+    {{- include "tavana.labels" . | nindent 4 }}
+  {{- with .Values.gateway.loadBalancer.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: LoadBalancer
+  {{- if .Values.gateway.loadBalancer.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.gateway.loadBalancer.loadBalancerIP }}
+  {{- end }}
+  {{- if .Values.gateway.loadBalancer.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml .Values.gateway.loadBalancer.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
+  ports:
+    - name: pg
+      port: {{ .Values.gateway.loadBalancer.externalPort | default 5432 }}
+      targetPort: pg
+      protocol: TCP
+    {{- if .Values.gateway.loadBalancer.exposeHttp }}
+    - name: http
+      port: {{ .Values.gateway.loadBalancer.httpExternalPort | default 8080 }}
+      targetPort: http
+      protocol: TCP
+    {{- end }}
+    {{- if and .Values.gateway.flightSql.enabled .Values.gateway.loadBalancer.exposeFlight }}
+    - name: flight
+      port: {{ .Values.gateway.loadBalancer.flightExternalPort | default 9091 }}
+      targetPort: flight
+      protocol: TCP
+    {{- end }}
+  selector:
+    app: tavana-gateway
+{{- end }}
+

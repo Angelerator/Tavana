@@ -45,6 +45,16 @@ gateway:
     pgPort: 15432
     httpPort: 8080
   
+  # External LoadBalancer for client access (Tableau, PowerBI, psql)
+  loadBalancer:
+    enabled: true               # Expose Tavana externally
+    externalPort: 5432          # External port (changed from 443)
+    exposeHttp: false
+    exposeFlight: false
+    annotations:
+      # Use internal Azure Load Balancer (recommended for security)
+      # service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+  
   # Resource sizing for D4s_v3 nodes (4 vCPU, 16 GB)
   resources:
     requests:

@@ -32,8 +32,24 @@ gateway:
   
   service:
     type: ClusterIP
-    pgPort: 5432       # PostgreSQL wire protocol
+    pgPort: 5432       # PostgreSQL wire protocol (internal)
     httpPort: 8080     # Health + Metrics
+  
+  # External LoadBalancer for client access (Tableau, PowerBI, psql)
+  loadBalancer:
+    enabled: false              # Enable to expose externally
+    externalPort: 5432          # External port for PostgreSQL (was 443)
+    # loadBalancerIP: ""        # Optional: static IP
+    # loadBalancerSourceRanges: # Optional: IP allowlist
+    #   - "10.0.0.0/8"
+    exposeHttp: false           # Expose HTTP health/metrics externally
+    httpExternalPort: 8080
+    exposeFlight: false         # Expose Arrow Flight SQL externally  
+    flightExternalPort: 9091
+    annotations: {}
+    # Azure-specific annotations:
+    #   service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    #   service.beta.kubernetes.io/azure-load-balancer-internal-subnet: "subnet-name"
   
   # Arrow Flight SQL configuration (high-performance binary protocol)
   flightSql:
