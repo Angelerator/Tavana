@@ -3232,12 +3232,22 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
         });
     }
 
-    if sql_upper.contains("PG_CATALOG") || sql_upper.contains("INFORMATION_SCHEMA") {
+    // NOTE: information_schema queries are NO LONGER intercepted here.
+    // DuckDB has proper information_schema views that should be used.
+    // This allows Tableau and other BI tools to discover tables/views
+    // created via Initial SQL.
+    //
+    // Only intercept specific pg_catalog queries that DuckDB doesn't support:
+    if sql_upper.contains("PG_CATALOG.PG_CLASS") 
+        || sql_upper.contains("PG_CATALOG.PG_NAMESPACE")
+        || sql_upper.contains("PG_CATALOG.PG_ATTRIBUTE")
+        || sql_upper.contains("PG_CATALOG.PG_TYPE")
+        || sql_upper.contains("PG_CATALOG.PG_PROC") {
+        // Return empty for PostgreSQL-specific catalog queries
         return Some(QueryExecutionResult {
             columns: vec![
-                ("table_catalog".to_string(), "text".to_string()),
-                ("table_schema".to_string(), "text".to_string()),
-                ("table_name".to_string(), "text".to_string()),
+                ("oid".to_string(), "int4".to_string()),
+                ("name".to_string(), "text".to_string()),
             ],
             rows: vec![],
             row_count: 0,
