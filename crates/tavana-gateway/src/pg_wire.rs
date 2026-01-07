@@ -22,6 +22,7 @@
 
 use crate::auth::{AuthService, AuthGateway, AuthContext, AuthenticatedPrincipal};
 use crate::metrics;
+use crate::pg_compat;
 use crate::query_queue::{QueryOutcome, QueryQueue};
 use crate::query_router::{QueryRouter, QueryTarget};
 use crate::redis_queue::{RedisQueue, RedisQueueConfig};
@@ -2042,6 +2043,9 @@ where
     } else {
         sql.to_string()
     };
+    
+    // Rewrite PostgreSQL-specific syntax to DuckDB equivalents
+    let actual_sql = pg_compat::rewrite_pg_to_duckdb(&actual_sql);
     let sql = &actual_sql;
 
     metrics::query_started();
@@ -2167,6 +2171,9 @@ where
     } else {
         sql.to_string()
     };
+    
+    // Rewrite PostgreSQL-specific syntax to DuckDB equivalents
+    let actual_sql = pg_compat::rewrite_pg_to_duckdb(&actual_sql);
     let sql = &actual_sql;
 
     metrics::query_started();
@@ -2249,6 +2256,9 @@ async fn execute_query_get_rows(
     } else {
         sql.to_string()
     };
+    
+    // Rewrite PostgreSQL-specific syntax to DuckDB equivalents
+    let actual_sql = pg_compat::rewrite_pg_to_duckdb(&actual_sql);
     let sql = &actual_sql;
 
     let estimate = query_router.route(sql).await;
@@ -2611,6 +2621,10 @@ async fn execute_query_streaming_impl(
         }
         return Ok(0);
     }
+
+    // Rewrite PostgreSQL-specific syntax to DuckDB equivalents
+    let rewritten_sql = pg_compat::rewrite_pg_to_duckdb(sql);
+    let sql = rewritten_sql.as_str();
 
     // Track active queries for HPA scaling
     metrics::query_started();

@@ -24,6 +24,7 @@ mod redis_queue; // Stub for removed Redis functionality
 mod smart_scaler;
 mod telemetry;
 mod tls_config;
+mod pg_compat;
 mod worker_client;
 mod worker_pool;
 
