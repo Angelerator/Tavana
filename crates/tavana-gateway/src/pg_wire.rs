@@ -67,6 +67,10 @@ pub struct PgWireConfig {
     /// Worker query timeout in seconds
     #[allow(dead_code)]
     pub worker_query_timeout_secs: u64,
+    /// TCP keepalive time in seconds (detects dead connections)
+    pub tcp_keepalive_secs: u64,
+    /// Interval to check client connection health during streaming (in rows)
+    pub connection_check_interval_rows: usize,
 }
 
 impl Default for PgWireConfig {
@@ -79,7 +83,7 @@ impl Default for PgWireConfig {
             query_timeout_secs: std::env::var("TAVANA_QUERY_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(300), // 5 minutes
+                .unwrap_or(600), // 10 minutes - aligned with worker
             write_buffer_size: std::env::var("TAVANA_WRITE_BUFFER_SIZE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -96,6 +100,77 @@ impl Default for PgWireConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1800), // 30 minutes for large queries
+            tcp_keepalive_secs: std::env::var("TAVANA_TCP_KEEPALIVE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10), // 10 seconds - fast dead connection detection
+            connection_check_interval_rows: std::env::var("TAVANA_CONNECTION_CHECK_INTERVAL_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000), // Check every 1000 rows
+        }
+    }
+}
+
+/// Configure TCP keepalive on a socket for faster dead connection detection
+/// This is critical for Windows clients that may disconnect without proper FIN
+fn configure_tcp_keepalive(stream: &tokio::net::TcpStream, keepalive_secs: u64) {
+    use socket2::SockRef;
+    
+    // Set TCP_NODELAY for low latency
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!("Failed to set TCP_NODELAY: {}", e);
+    }
+    
+    // Configure TCP keepalive using socket2
+    let socket = SockRef::from(stream);
+    
+    // Enable keepalive
+    if let Err(e) = socket.set_keepalive(true) {
+        warn!("Failed to enable TCP keepalive: {}", e);
+        return;
+    }
+    
+    // Configure keepalive timing
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(keepalive_secs))
+        .with_interval(Duration::from_secs(keepalive_secs / 2 + 1));
+    
+    // Add retries on platforms that support it
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let keepalive = keepalive.with_retries(3);
+    
+    if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
+        warn!("Failed to configure TCP keepalive timing: {}", e);
+    } else {
+        debug!("TCP keepalive configured: {}s", keepalive_secs);
+    }
+}
+
+/// Check if client connection is still alive by attempting a zero-byte peek
+/// Returns true if connection is alive, false if disconnected
+async fn is_client_connected(stream: &tokio::net::TcpStream) -> bool {
+    use std::io::ErrorKind;
+    
+    // Try to peek at the socket to check connection state
+    // If the client has disconnected, this will return an error
+    match stream.peek(&mut [0u8; 0]).await {
+        Ok(_) => true,
+        Err(e) => {
+            match e.kind() {
+                // Connection reset or broken pipe = definitely disconnected
+                ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::NotConnected => {
+                    debug!("Client disconnected: {:?}", e.kind());
+                    false
+                }
+                // WouldBlock is expected for non-blocking sockets with no data
+                ErrorKind::WouldBlock => true,
+                // Other errors might be transient
+                _ => {
+                    debug!("Connection check returned: {:?}", e.kind());
+                    true
+                }
+            }
         }
     }
 }
@@ -389,11 +464,10 @@ impl PgWireServer {
             let (socket, peer_addr) = listener.accept().await?;
             info!("New PostgreSQL connection from {}", peer_addr);
 
-            // Configure TCP keepalive to prevent stale connections
-            // This is critical for DBeaver, Tableau, Power BI which may idle
-            if let Err(e) = configure_tcp_keepalive(&socket) {
-                warn!("Failed to configure TCP keepalive: {}", e);
-            }
+            // Configure TCP keepalive to detect dead connections quickly
+            // This is critical for Windows clients (DBeaver, Tableau, Power BI)
+            // that may disconnect without proper TCP FIN
+            configure_tcp_keepalive(&socket, self.config.tcp_keepalive_secs);
 
             let auth_service = self.auth_service.clone();
             let worker_client = self.worker_client.clone();
@@ -2831,8 +2905,13 @@ async fn execute_query_streaming_to_worker_impl(
     skip_row_description: bool,
 ) -> anyhow::Result<usize> {
     use tokio::io::AsyncWriteExt;
+    use std::io::ErrorKind;
 
     info!("Streaming query to worker: {}", worker_addr);
+
+    // Load config for connection check interval
+    let config = PgWireConfig::default();
+    let connection_check_interval = config.connection_check_interval_rows;
 
     // Connect to worker with large buffer settings for big result sets
     const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB per gRPC message
@@ -2841,6 +2920,9 @@ async fn execute_query_streaming_to_worker_impl(
         .timeout(std::time::Duration::from_secs(1800)) // 30 min for very large queries
         .connect_timeout(std::time::Duration::from_secs(30))
         .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
+        .http2_keep_alive_interval(std::time::Duration::from_secs(10))
+        .keep_alive_timeout(std::time::Duration::from_secs(20))
+        .keep_alive_while_idle(true)
         .connect()
         .await?;
 
@@ -2860,7 +2942,7 @@ async fn execute_query_streaming_to_worker_impl(
             claims: Default::default(),
         }),
         options: Some(proto::QueryOptions {
-            timeout_seconds: 600,
+            timeout_seconds: config.query_timeout_secs as u32,
             max_rows: 0, // Unlimited - we stream
             max_bytes: 0,
             enable_profiling: false,
@@ -2889,14 +2971,59 @@ async fn execute_query_streaming_to_worker_impl(
                 if !batch.data.is_empty() {
                     if let Ok(rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
                         for row in rows {
-                            send_data_row(socket, &row).await?;
+                            // Check for client disconnect during streaming
+                            // This catches broken pipe errors early
+                            match send_data_row(socket, &row).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    // Check if this is a connection error
+                                    let is_disconnect = e.to_string().contains("Broken pipe")
+                                        || e.to_string().contains("Connection reset")
+                                        || e.to_string().contains("connection reset");
+                                    if is_disconnect {
+                                        warn!("Client disconnected during streaming after {} rows", total_rows);
+                                        return Err(anyhow::anyhow!("Client disconnected"));
+                                    }
+                                    return Err(e);
+                                }
+                            }
                             total_rows += 1;
                             batch_rows += 1;
 
                             // Flush every STREAMING_BATCH_SIZE rows for backpressure
                             if batch_rows >= STREAMING_BATCH_SIZE {
-                                socket.flush().await?;
+                                // Flush with timeout to detect slow/dead clients
+                                match tokio::time::timeout(
+                                    Duration::from_secs(30),
+                                    socket.flush()
+                                ).await {
+                                    Ok(Ok(_)) => {}
+                                    Ok(Err(e)) => {
+                                        // Check for broken pipe on flush
+                                        if e.kind() == ErrorKind::BrokenPipe 
+                                            || e.kind() == ErrorKind::ConnectionReset {
+                                            warn!("Client disconnected during flush after {} rows", total_rows);
+                                            return Err(anyhow::anyhow!("Client disconnected"));
+                                        }
+                                        return Err(e.into());
+                                    }
+                                    Err(_) => {
+                                        warn!("Flush timeout - client may be unresponsive after {} rows", total_rows);
+                                        // Continue but log the issue
+                                    }
+                                }
                                 batch_rows = 0;
+                            }
+
+                            // Periodically check if client is still connected
+                            if total_rows % connection_check_interval == 0 {
+                                if !is_client_connected(socket).await {
+                                    warn!("Client disconnected during streaming after {} rows", total_rows);
+                                    return Err(anyhow::anyhow!("Client disconnected"));
+                                }
+                                
+                                // Log progress for large queries
+                                debug!("Streaming progress: {} rows sent, client still connected", total_rows);
                             }
 
                             // Log progress for very large queries
@@ -2947,6 +3074,11 @@ async fn execute_query_streaming_default_impl(
     skip_row_description: bool,
 ) -> anyhow::Result<usize> {
     use tokio::io::AsyncWriteExt;
+    use std::io::ErrorKind;
+
+    // Load config for connection check interval
+    let config = PgWireConfig::default();
+    let connection_check_interval = config.connection_check_interval_rows;
 
     // For the default path, we still need to use the existing client
     // but we'll stream the results to the client as they come
@@ -2970,13 +3102,50 @@ async fn execute_query_streaming_default_impl(
                     }
                     StreamingBatch::Rows(rows) => {
                         for row in rows {
-                            send_data_row(socket, &row).await?;
+                            // Check for client disconnect during streaming
+                            match send_data_row(socket, &row).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    let is_disconnect = e.to_string().contains("Broken pipe")
+                                        || e.to_string().contains("Connection reset");
+                                    if is_disconnect {
+                                        warn!("Client disconnected during streaming after {} rows", total_rows);
+                                        return Err(anyhow::anyhow!("Client disconnected"));
+                                    }
+                                    return Err(e);
+                                }
+                            }
                             total_rows += 1;
                             batch_rows += 1;
 
                             if batch_rows >= STREAMING_BATCH_SIZE {
-                                socket.flush().await?;
+                                // Flush with timeout to detect slow/dead clients
+                                match tokio::time::timeout(
+                                    Duration::from_secs(30),
+                                    socket.flush()
+                                ).await {
+                                    Ok(Ok(_)) => {}
+                                    Ok(Err(e)) => {
+                                        if e.kind() == ErrorKind::BrokenPipe 
+                                            || e.kind() == ErrorKind::ConnectionReset {
+                                            warn!("Client disconnected during flush after {} rows", total_rows);
+                                            return Err(anyhow::anyhow!("Client disconnected"));
+                                        }
+                                        return Err(e.into());
+                                    }
+                                    Err(_) => {
+                                        warn!("Flush timeout after {} rows", total_rows);
+                                    }
+                                }
                                 batch_rows = 0;
+                            }
+
+                            // Periodically check if client is still connected
+                            if total_rows % connection_check_interval == 0 {
+                                if !is_client_connected(socket).await {
+                                    warn!("Client disconnected during streaming after {} rows", total_rows);
+                                    return Err(anyhow::anyhow!("Client disconnected"));
+                                }
                             }
                         }
                     }
@@ -4298,32 +4467,4 @@ async fn handle_execute_empty(
     Ok(())
 }
 
-/// Configure TCP keepalive on a socket to prevent stale connections
-/// 
-/// This is essential for BI tools like DBeaver, Tableau, Power BI that may
-/// hold connections open for long periods. Without keepalive:
-/// - Network equipment (firewalls, load balancers) may drop idle connections
-/// - Clients see "connection reset" or "stale connection" errors
-/// - Users need to manually reconnect
-fn configure_tcp_keepalive(socket: &tokio::net::TcpStream) -> std::io::Result<()> {
-    use socket2::{SockRef, TcpKeepalive};
-    
-    let sock_ref = SockRef::from(socket);
-    
-    // Configure TCP keepalive with:
-    // - Start sending probes after 30 seconds of idle
-    // - Send probes every 15 seconds
-    // - On Linux, give up after 4 failed probes (~1 minute total)
-    let keepalive = TcpKeepalive::new()
-        .with_time(Duration::from_secs(30))
-        .with_interval(Duration::from_secs(15));
-    
-    sock_ref.set_tcp_keepalive(&keepalive)?;
-    
-    // Disable Nagle's algorithm for lower latency (useful for interactive queries)
-    sock_ref.set_nodelay(true)?;
-    
-    debug!("TCP keepalive configured: idle=30s, interval=15s, nodelay=true");
-    Ok(())
-}
 

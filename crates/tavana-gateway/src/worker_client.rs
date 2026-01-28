@@ -12,6 +12,15 @@ use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+/// Default query timeout in seconds - aligned across gateway and worker
+/// Can be overridden via TAVANA_QUERY_TIMEOUT_SECS environment variable
+fn query_timeout_secs() -> u32 {
+    std::env::var("TAVANA_QUERY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600) // 10 minutes default
+}
+
 /// Streaming batch types for true row-by-row streaming
 pub enum StreamingBatch {
     Metadata {
@@ -110,7 +119,7 @@ impl WorkerClient {
                 claims: Default::default(),
             }),
             options: Some(proto::QueryOptions {
-                timeout_seconds: 300,
+                timeout_seconds: query_timeout_secs(),
                 max_rows: 0, // 0 = unlimited rows (streaming)
                 max_bytes: 0,
                 enable_profiling: false,
@@ -228,7 +237,7 @@ impl WorkerClient {
                 claims: Default::default(),
             }),
             options: Some(proto::QueryOptions {
-                timeout_seconds: 600, // 10 minutes for large queries
+                timeout_seconds: query_timeout_secs(),
                 max_rows: 0,          // 0 = unlimited rows (streaming)
                 max_bytes: 0,
                 enable_profiling: false,
@@ -319,7 +328,7 @@ impl WorkerClient {
                 claims: Default::default(),
             }),
             options: Some(proto::QueryOptions {
-                timeout_seconds: 600, // 10 minutes
+                timeout_seconds: query_timeout_secs(),
                 max_rows: 0,          // Unlimited for cursors
                 max_bytes: 0,
                 enable_profiling: false,

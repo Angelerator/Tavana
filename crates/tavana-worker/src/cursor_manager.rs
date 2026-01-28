@@ -1,8 +1,8 @@
 //! Server-side cursor manager for true streaming queries
 //!
 //! This module manages active cursors that hold DuckDB query results.
-//! Instead of re-executing queries with LIMIT/OFFSET for each FETCH,
-//! cursors maintain the query state and stream results incrementally.
+//! Uses LIMIT/OFFSET pagination to avoid loading entire result sets into memory.
+//! This is critical for large Delta table scans that can return millions of rows.
 
 use anyhow::Result;
 use dashmap::DashMap;
@@ -10,10 +10,19 @@ use duckdb::arrow::array::RecordBatch;
 use duckdb::arrow::datatypes::Schema;
 use duckdb::{params, Connection};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+/// Maximum rows to fetch in a single batch to prevent memory exhaustion
+/// This is configurable via CURSOR_BATCH_SIZE environment variable
+fn max_cursor_batch_size() -> usize {
+    std::env::var("CURSOR_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000) // Default: 10K rows per batch
+}
 
 /// Metadata for a column in a cursor result
 #[derive(Debug, Clone)]
@@ -22,40 +31,49 @@ pub struct CursorColumnMeta {
     pub type_name: String,
 }
 
-/// Active cursor holding buffered results from a DuckDB query
+/// Active cursor with streaming-friendly design
 /// 
-/// Note: DuckDB's Arrow iterator requires holding the Statement alive,
-/// which creates lifetime issues. Instead, we buffer results in batches.
+/// Instead of loading all results into memory (which caused OOM for large tables),
+/// this cursor uses LIMIT/OFFSET pagination to fetch data on-demand.
+/// Only a configurable number of rows are kept in memory at a time.
 pub struct ActiveCursor {
     /// Unique cursor ID
     pub id: String,
     /// Column metadata from the query schema
     pub columns: Vec<CursorColumnMeta>,
-    /// Buffered record batches (fetched lazily)
+    /// Currently buffered record batches (small, fetched on-demand)
     batches: Mutex<Vec<RecordBatch>>,
-    /// Current position in the batches
+    /// Current position in the buffered batches
     batch_index: AtomicUsize,
     /// Current row within the current batch
     row_index: AtomicUsize,
-    /// Whether we've exhausted all results
-    exhausted: Mutex<bool>,
-    /// Total rows fetched so far
+    /// Whether we've exhausted all results from the query
+    exhausted: AtomicBool,
+    /// Total rows fetched and returned to client so far
     pub rows_fetched: AtomicUsize,
+    /// Total rows in the current buffer (for OFFSET calculation)
+    rows_in_buffer: AtomicUsize,
+    /// Current OFFSET for LIMIT/OFFSET pagination
+    current_offset: AtomicUsize,
     /// Creation time for timeout tracking
     pub created_at: Instant,
     /// Last access time for idle cleanup
     last_accessed: Mutex<Instant>,
-    /// The original SQL query (for potential re-execution if needed)
+    /// The original SQL query (wrapped with LIMIT/OFFSET for pagination)
     pub sql: String,
+    /// Schema for creating new batches
+    schema: Arc<Schema>,
 }
 
 impl ActiveCursor {
-    /// Create a new cursor from query results
+    /// Create a new cursor with initial batch of results
+    /// Only fetches a limited number of rows initially to avoid OOM
     pub fn new(
         id: String,
         sql: String,
-        schema: &Schema,
-        batches: Vec<RecordBatch>,
+        schema: Arc<Schema>,
+        initial_batches: Vec<RecordBatch>,
+        initial_exhausted: bool,
     ) -> Self {
         let columns = schema
             .fields()
@@ -66,17 +84,22 @@ impl ActiveCursor {
             })
             .collect();
 
+        let rows_in_buffer: usize = initial_batches.iter().map(|b| b.num_rows()).sum();
+
         Self {
             id,
             columns,
-            batches: Mutex::new(batches),
+            batches: Mutex::new(initial_batches),
             batch_index: AtomicUsize::new(0),
             row_index: AtomicUsize::new(0),
-            exhausted: Mutex::new(false),
+            exhausted: AtomicBool::new(initial_exhausted),
             rows_fetched: AtomicUsize::new(0),
+            rows_in_buffer: AtomicUsize::new(rows_in_buffer),
+            current_offset: AtomicUsize::new(rows_in_buffer), // Next fetch starts here
             created_at: Instant::now(),
             last_accessed: Mutex::new(Instant::now()),
             sql,
+            schema,
         }
     }
 
@@ -94,14 +117,61 @@ impl ActiveCursor {
     pub fn is_idle(&self, timeout: Duration) -> bool {
         self.last_accessed().elapsed() > timeout
     }
+    
+    /// Get the schema for this cursor
+    pub fn schema(&self) -> &Arc<Schema> {
+        &self.schema
+    }
+    
+    /// Get current offset for next batch fetch
+    pub fn current_offset(&self) -> usize {
+        self.current_offset.load(Ordering::Relaxed)
+    }
+    
+    /// Check if cursor is exhausted
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::Relaxed)
+    }
+    
+    /// Mark cursor as exhausted
+    pub fn set_exhausted(&self) {
+        self.exhausted.store(true, Ordering::Relaxed);
+    }
+    
+    /// Replace buffer with new batches (for streaming pagination)
+    pub fn replace_buffer(&self, new_batches: Vec<RecordBatch>, exhausted: bool) {
+        let new_rows: usize = new_batches.iter().map(|b| b.num_rows()).sum();
+        
+        // Update offset for next fetch
+        let current = self.current_offset.load(Ordering::Relaxed);
+        self.current_offset.store(current + new_rows, Ordering::Relaxed);
+        
+        // Replace buffer
+        let mut batches = self.batches.lock();
+        *batches = new_batches;
+        
+        // Reset position in new buffer
+        self.batch_index.store(0, Ordering::Relaxed);
+        self.row_index.store(0, Ordering::Relaxed);
+        self.rows_in_buffer.store(new_rows, Ordering::Relaxed);
+        
+        if exhausted {
+            self.exhausted.store(true, Ordering::Relaxed);
+        }
+    }
 
-    /// Fetch next N rows from the cursor
-    /// Returns (rows, is_exhausted)
-    pub fn fetch(&self, count: usize) -> (Vec<Vec<String>>, bool) {
+    /// Fetch next N rows from the current buffer
+    /// Returns (rows, need_more_data, is_exhausted)
+    /// - need_more_data: true if buffer is empty but cursor is not exhausted
+    pub fn fetch_from_buffer(&self, count: usize) -> (Vec<Vec<String>>, bool, bool) {
         self.touch();
 
-        if *self.exhausted.lock() {
-            return (vec![], true);
+        if self.exhausted.load(Ordering::Relaxed) {
+            let batches = self.batches.lock();
+            let batch_idx = self.batch_index.load(Ordering::Relaxed);
+            if batch_idx >= batches.len() {
+                return (vec![], false, true);
+            }
         }
 
         let batches = self.batches.lock();
@@ -129,12 +199,20 @@ impl ActiveCursor {
         self.row_index.store(row_idx, Ordering::Relaxed);
         self.rows_fetched.fetch_add(rows.len(), Ordering::Relaxed);
 
-        let is_exhausted = batch_idx >= batches.len();
-        if is_exhausted {
-            *self.exhausted.lock() = true;
-        }
-
-        (rows, is_exhausted)
+        let buffer_exhausted = batch_idx >= batches.len();
+        let cursor_exhausted = self.exhausted.load(Ordering::Relaxed);
+        
+        // need_more_data if we didn't get enough rows and cursor isn't exhausted
+        let need_more = rows.len() < count && buffer_exhausted && !cursor_exhausted;
+        
+        (rows, need_more, buffer_exhausted && cursor_exhausted)
+    }
+    
+    /// Legacy fetch method for backwards compatibility
+    /// Returns (rows, is_exhausted)
+    pub fn fetch(&self, count: usize) -> (Vec<Vec<String>>, bool) {
+        let (rows, _need_more, exhausted) = self.fetch_from_buffer(count);
+        (rows, exhausted)
     }
 
     /// Extract a single row from a RecordBatch as strings
@@ -208,14 +286,26 @@ pub struct CursorManagerConfig {
     pub idle_timeout_secs: u64,
     /// Cleanup interval in seconds
     pub cleanup_interval_secs: u64,
+    /// Maximum rows per batch (for streaming pagination)
+    pub batch_size: usize,
 }
 
 impl Default for CursorManagerConfig {
     fn default() -> Self {
         Self {
-            max_cursors: 100,
-            idle_timeout_secs: 300, // 5 minutes
-            cleanup_interval_secs: 60, // 1 minute
+            max_cursors: std::env::var("MAX_CURSORS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100),
+            idle_timeout_secs: std::env::var("CURSOR_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300), // 5 minutes
+            cleanup_interval_secs: std::env::var("CURSOR_CLEANUP_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60), // 1 minute
+            batch_size: max_cursor_batch_size(),
         }
     }
 }
@@ -242,7 +332,10 @@ impl CursorManager {
         Self::new(CursorManagerConfig::default())
     }
 
-    /// Declare a new cursor by executing the query
+    /// Declare a new cursor by executing the query with LIMIT for initial batch
+    /// 
+    /// IMPORTANT: This now uses LIMIT to fetch only the first batch of results,
+    /// preventing OOM for large Delta table scans. Subsequent fetches use LIMIT/OFFSET.
     pub fn declare_cursor(
         &self,
         cursor_id: String,
@@ -262,23 +355,67 @@ impl CursorManager {
             anyhow::bail!("Cursor '{}' already exists", cursor_id);
         }
 
-        info!(cursor_id = %cursor_id, sql = %&sql[..sql.len().min(100)], "Declaring cursor");
+        let batch_size = max_cursor_batch_size();
+        info!(
+            cursor_id = %cursor_id, 
+            sql = %&sql[..sql.len().min(100)], 
+            batch_size = batch_size,
+            "Declaring cursor with streaming pagination"
+        );
 
-        // Execute query and collect batches, rolling back on error
-        let execute_result = (|| -> Result<(Arc<Schema>, Vec<RecordBatch>)> {
-            let mut stmt = connection.prepare(sql)?;
+        // Wrap query with LIMIT for initial batch to prevent OOM
+        // We fetch batch_size + 1 to detect if there are more rows
+        let initial_sql = format!(
+            "SELECT * FROM ({}) AS __cursor_subquery LIMIT {}",
+            sql.trim().trim_end_matches(';'),
+            batch_size + 1
+        );
+
+        // Execute initial query with LIMIT, rolling back on error
+        let execute_result = (|| -> Result<(Arc<Schema>, Vec<RecordBatch>, bool)> {
+            let mut stmt = connection.prepare(&initial_sql)?;
             let arrow_result = stmt.query_arrow(params![])?;
             
             // Get schema before consuming iterator
             let schema = arrow_result.get_schema();
 
-            // Collect all batches (DuckDB streams internally with streaming_buffer_size)
-            let batches: Vec<RecordBatch> = arrow_result.collect();
-            Ok((schema, batches))
+            // Collect initial batches (limited by LIMIT clause)
+            let mut batches: Vec<RecordBatch> = Vec::new();
+            let mut total_rows = 0;
+            
+            for batch in arrow_result {
+                total_rows += batch.num_rows();
+                batches.push(batch);
+                
+                // Stop if we've collected enough for initial batch
+                if total_rows >= batch_size + 1 {
+                    break;
+                }
+            }
+            
+            // Check if we got more than batch_size (indicates more data available)
+            let has_more = total_rows > batch_size;
+            
+            // If we got batch_size + 1, trim to batch_size
+            if has_more && !batches.is_empty() {
+                // Trim the last batch if needed
+                let excess = total_rows - batch_size;
+                if excess > 0 && !batches.is_empty() {
+                    let last_batch = batches.last().unwrap();
+                    if last_batch.num_rows() <= excess {
+                        // Remove entire last batch
+                        batches.pop();
+                    }
+                    // Note: We don't perfectly trim here, accepting slightly more rows
+                    // This is acceptable as it's still bounded
+                }
+            }
+            
+            Ok((schema, batches, !has_more))
         })();
 
         // Rollback on error to clear transaction state for next query on this connection
-        let (schema, batches) = match execute_result {
+        let (schema, batches, initially_exhausted) = match execute_result {
             Ok(result) => result,
             Err(e) => {
                 debug!("Cursor query failed, rolling back to clear transaction state");
@@ -287,23 +424,101 @@ impl CursorManager {
             }
         };
 
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let buffered_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         info!(
             cursor_id = %cursor_id,
             batches = batches.len(),
-            total_rows = total_rows,
-            "Cursor declared with buffered results"
+            buffered_rows = buffered_rows,
+            exhausted = initially_exhausted,
+            "Cursor declared with initial batch (streaming-friendly)"
         );
 
         let cursor = Arc::new(ActiveCursor::new(
             cursor_id.clone(),
-            sql.to_string(),
-            &schema,
+            sql.to_string(), // Store original SQL for pagination
+            schema,
             batches,
+            initially_exhausted,
         ));
 
         self.cursors.insert(cursor_id, cursor.clone());
         Ok(cursor)
+    }
+    
+    /// Fetch more data for a cursor using LIMIT/OFFSET pagination
+    /// This is called when the cursor buffer is exhausted but more data exists
+    pub fn fetch_more_for_cursor(
+        &self,
+        cursor_id: &str,
+        connection: &Connection,
+    ) -> Result<bool> {
+        let cursor = self
+            .cursors
+            .get(cursor_id)
+            .ok_or_else(|| anyhow::anyhow!("Cursor '{}' not found", cursor_id))?;
+        
+        if cursor.is_exhausted() {
+            return Ok(false);
+        }
+        
+        let batch_size = max_cursor_batch_size();
+        let offset = cursor.current_offset();
+        
+        // Build paginated query
+        let paginated_sql = format!(
+            "SELECT * FROM ({}) AS __cursor_subquery LIMIT {} OFFSET {}",
+            cursor.sql.trim().trim_end_matches(';'),
+            batch_size + 1,
+            offset
+        );
+        
+        debug!(
+            cursor_id = %cursor_id,
+            offset = offset,
+            batch_size = batch_size,
+            "Fetching more cursor data with LIMIT/OFFSET"
+        );
+        
+        // Execute paginated query
+        let execute_result = (|| -> Result<(Vec<RecordBatch>, bool)> {
+            let mut stmt = connection.prepare(&paginated_sql)?;
+            let arrow_result = stmt.query_arrow(params![])?;
+            
+            let mut batches: Vec<RecordBatch> = Vec::new();
+            let mut total_rows = 0;
+            
+            for batch in arrow_result {
+                total_rows += batch.num_rows();
+                batches.push(batch);
+                
+                if total_rows >= batch_size + 1 {
+                    break;
+                }
+            }
+            
+            let has_more = total_rows > batch_size;
+            Ok((batches, !has_more))
+        })();
+        
+        match execute_result {
+            Ok((batches, exhausted)) => {
+                let new_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                debug!(
+                    cursor_id = %cursor_id,
+                    new_rows = new_rows,
+                    exhausted = exhausted,
+                    "Fetched more cursor data"
+                );
+                
+                cursor.replace_buffer(batches, exhausted);
+                Ok(true)
+            }
+            Err(e) => {
+                warn!(cursor_id = %cursor_id, error = %e, "Failed to fetch more cursor data");
+                let _ = connection.execute("ROLLBACK", params![]);
+                Err(e)
+            }
+        }
     }
 
     /// Get a cursor by ID
