@@ -6,20 +6,45 @@
 use crate::cursor_manager::{CursorManager, CursorManagerConfig};
 use crate::executor::{DuckDbExecutor, ExecutorConfig};
 use arrow_ipc::writer::FileWriter;
+use dashmap::DashMap;
 use duckdb::arrow::array::Array;
 use duckdb::arrow::util::display::ArrayFormatter;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tavana_common::proto;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, instrument, warn};
 
-/// Query service implementation with cursor support
+/// Cancellation token for a running query
+pub struct QueryCancellationToken {
+    cancelled: AtomicBool,
+}
+
+impl QueryCancellationToken {
+    pub fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+        }
+    }
+    
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+    
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+/// Query service implementation with cursor support and query cancellation
 pub struct QueryServiceImpl {
     executor: Arc<DuckDbExecutor>,
     cursor_manager: Arc<CursorManager>,
     worker_id: String,
+    /// Active queries with their cancellation tokens
+    active_queries: Arc<DashMap<String, Arc<QueryCancellationToken>>>,
 }
 
 impl QueryServiceImpl {
@@ -40,6 +65,7 @@ impl QueryServiceImpl {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
+            ..Default::default()
         };
         
         let max_cursors = cursor_config.max_cursors;
@@ -55,13 +81,14 @@ impl QueryServiceImpl {
         info!(
             worker_id = %worker_id,
             max_cursors = max_cursors,
-            "QueryService initialized with cursor support"
+            "QueryService initialized with cursor support and query cancellation"
         );
         
         Ok(Self { 
             executor,
             cursor_manager,
             worker_id,
+            active_queries: Arc::new(DashMap::new()),
         })
     }
     
@@ -75,6 +102,24 @@ impl QueryServiceImpl {
     #[allow(dead_code)]
     pub fn cursor_stats(&self) -> crate::cursor_manager::CursorManagerStats {
         self.cursor_manager.stats()
+    }
+    
+    /// Register a query for cancellation tracking
+    fn register_query(&self, query_id: &str) -> Arc<QueryCancellationToken> {
+        let token = Arc::new(QueryCancellationToken::new());
+        self.active_queries.insert(query_id.to_string(), token.clone());
+        token
+    }
+    
+    /// Unregister a query after completion
+    fn unregister_query(&self, query_id: &str) {
+        self.active_queries.remove(query_id);
+    }
+    
+    /// Get active query count
+    #[allow(dead_code)]
+    pub fn active_query_count(&self) -> usize {
+        self.active_queries.len()
     }
 }
 
@@ -94,6 +139,11 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
         let executor = self.executor.clone();
         let sql = req.sql.clone();
         let query_id = req.query_id.clone();
+        
+        // Register query for cancellation support
+        let cancellation_token = self.register_query(&query_id);
+        let active_queries = self.active_queries.clone();
+        let query_id_for_cleanup = query_id.clone();
 
         // Spawn query execution in background with TRUE STREAMING
         // This never loads all results into memory - streams as DuckDB produces them
@@ -101,6 +151,7 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
             let start = std::time::Instant::now();
             let tx_clone = tx.clone();
             let query_id_clone = query_id.clone();
+            let cancel_token = cancellation_token.clone();
             
             let mut metadata_sent = false;
             let mut total_rows: u64 = 0;
@@ -109,6 +160,12 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
 
             // Use the streaming API - batches are sent as they're produced
             let result = executor.execute_query_streaming(&sql, |batch| {
+                // Check for cancellation before processing each batch
+                if cancel_token.is_cancelled() {
+                    info!(query_id = %query_id_clone, "Query cancelled by client");
+                    return Err(anyhow::anyhow!("Query cancelled"));
+                }
+                
                 // On first batch, send metadata
                 if !metadata_sent {
                     let schema = batch.schema();
@@ -164,6 +221,9 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
 
                 Ok(())
             });
+            
+            // Unregister query after completion
+            active_queries.remove(&query_id_for_cleanup);
 
             // Handle result
             match result {
@@ -234,13 +294,21 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
         let req = request.into_inner();
         info!(query_id = %req.query_id, "Cancelling query");
 
-        // NOTE: Query cancellation requires tracking active query handles per query_id
-        // This is a v1.1+ feature - for now we return success but don't actually cancel
-        warn!(query_id = %req.query_id, "Query cancellation not yet implemented - returning success");
-        Ok(Response::new(proto::CancelQueryResponse {
-            success: false,
-            message: "Query cancellation not implemented in this version".to_string(),
-        }))
+        // Look up the query and cancel it
+        if let Some(token) = self.active_queries.get(&req.query_id) {
+            token.cancel();
+            info!(query_id = %req.query_id, "Query cancellation signal sent");
+            Ok(Response::new(proto::CancelQueryResponse {
+                success: true,
+                message: format!("Query {} cancellation requested", req.query_id),
+            }))
+        } else {
+            warn!(query_id = %req.query_id, "Query not found for cancellation (may have completed)");
+            Ok(Response::new(proto::CancelQueryResponse {
+                success: false,
+                message: format!("Query {} not found (may have already completed)", req.query_id),
+            }))
+        }
     }
 
     async fn get_query_status(
