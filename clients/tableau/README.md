@@ -55,7 +55,7 @@ Tavana uses a **stateless architecture** where queries are distributed across mu
 - Session variables don't persist across queries
 - Transaction state isn't maintained
 
-The TDC file tells Tableau to avoid these session-dependent features:
+The TDC file tells Tableau to avoid session-dependent features and enables streaming:
 
 | Capability | Setting | Reason |
 |------------|---------|--------|
@@ -63,6 +63,17 @@ The TDC file tells Tableau to avoid these session-dependent features:
 | `CAP_SELECT_INTO` | no | Creates tables (session-dependent) |
 | `CAP_SET_QUERY_BANDING` | no | Session variables don't persist |
 | `CAP_ISOLATION_LEVEL_*` | no | Transaction isolation is per-query |
+| `CAP_JDBC_QUERY_DISABLE_AUTO_COMMIT` | **yes** | Enables server-side cursor streaming |
+| `CAP_JDBC_USE_ADAPTIVE_FETCH_SIZE` | **yes** | Automatic batch sizing for large results |
+
+### Large Result Sets
+
+The TDC file includes settings to prevent memory issues with large Delta tables:
+
+- **Autocommit disabled**: Enables JDBC server-side cursors
+- **Adaptive fetch size**: Streams results in batches instead of loading all at once
+
+This prevents "out of memory" errors when querying tables with millions of rows.
 
 ## Troubleshooting
 

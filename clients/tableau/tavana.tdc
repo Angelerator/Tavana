@@ -17,6 +17,13 @@
     <!-- CRITICAL: Force text protocol - Tavana/DuckDB doesn't support binary transfer -->
     <customization name='odbc-connect-string-extras' value='UseDeclareFetch=0;BinaryTransfer=0;TextAsLongVarchar=1' />
     
+    <!-- CRITICAL: Disable autocommit for JDBC cursor streaming (Tableau 2020.4+) -->
+    <!-- This enables server-side cursors for large result sets, preventing OOM -->
+    <customization name='CAP_JDBC_QUERY_DISABLE_AUTO_COMMIT' value='yes' />
+    
+    <!-- Set default fetchSize for streaming (rows per batch) -->
+    <customization name='CAP_JDBC_USE_ADAPTIVE_FETCH_SIZE' value='yes' />
+    
     <!-- Disable temp table creation - Tavana workers are stateless -->
     <customization name='CAP_CREATE_TEMP_TABLES' value='no' />
     
