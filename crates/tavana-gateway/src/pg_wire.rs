@@ -1410,8 +1410,17 @@ async fn run_query_loop(
 
 /// Portal state for Extended Query Protocol cursor support
 /// This enables JDBC setFetchSize() streaming by maintaining row state between Execute calls
+/// 
+/// ARCHITECTURE NOTE: Currently buffers all rows for simplicity. For true PostgreSQL-like
+/// streaming, this should hold a Stream instead of Vec<Vec<String>>. However, this requires:
+/// 1. Changing execute_query_get_rows to return a Stream
+/// 2. Storing the Stream across async boundaries (Pin<Box<dyn Stream>>)
+/// 3. Handling Stream lifetime with the worker gRPC connection
+/// 
+/// The current approach works for datasets under ~1M rows per batch. For larger datasets,
+/// use Simple Query Protocol (preferQueryMode=simple) or DECLARE CURSOR / FETCH.
 struct PortalState {
-    /// Buffered rows from query execution
+    /// Buffered rows from query execution (TODO: Replace with Stream for true streaming)
     rows: Vec<Vec<String>>,
     /// Current row offset (for resumption)
     offset: usize,

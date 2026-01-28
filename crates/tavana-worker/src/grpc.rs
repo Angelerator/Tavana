@@ -157,6 +157,10 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
             let mut total_rows: u64 = 0;
             let mut columns: Vec<String> = vec![];
             let mut column_types: Vec<String> = vec![];
+            let mut first_batch_time: Option<std::time::Duration> = None;
+            let mut last_progress_log = std::time::Instant::now();
+
+            info!(query_id = %query_id_clone, sql_preview = %&sql[..sql.len().min(100)], "Starting query execution");
 
             // Use the streaming API - batches are sent as they're produced
             let result = executor.execute_query_streaming(&sql, |batch| {
@@ -166,8 +170,16 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                     return Err(anyhow::anyhow!("Query cancelled"));
                 }
                 
-                // On first batch, send metadata
+                // On first batch, send metadata and log timing
                 if !metadata_sent {
+                    first_batch_time = Some(start.elapsed());
+                    info!(
+                        query_id = %query_id_clone,
+                        first_batch_ms = first_batch_time.unwrap().as_millis(),
+                        batch_rows = batch.num_rows(),
+                        "First batch received from DuckDB"
+                    );
+                    
                     let schema = batch.schema();
                     columns = schema.fields().iter().map(|f| f.name().clone()).collect();
                     column_types = schema.fields().iter().map(|f| format!("{:?}", f.data_type())).collect();
@@ -214,9 +226,15 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                     })).await;
                 });
 
-                // Log progress for very large queries
-                if total_rows % 100_000 == 0 {
-                    debug!("Streaming: {} rows sent to client", total_rows);
+                // Log progress every 10 seconds for visibility
+                if last_progress_log.elapsed().as_secs() >= 10 {
+                    info!(
+                        query_id = %query_id_clone,
+                        rows_streamed = total_rows,
+                        elapsed_secs = start.elapsed().as_secs(),
+                        "Streaming progress"
+                    );
+                    last_progress_log = std::time::Instant::now();
                 }
 
                 Ok(())
