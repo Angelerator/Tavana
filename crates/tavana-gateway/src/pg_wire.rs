@@ -1081,7 +1081,12 @@ async fn run_query_loop(
     config: &PgWireConfig,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; 4];
-    let ready = [b'Z', 0, 0, 0, 5, b'I'];
+    // Transaction status for ReadyForQuery: 'I' = Idle, 'T' = In Transaction, 'E' = Error
+    // This is CRITICAL for JDBC cursor-based streaming - JDBC only uses server-side cursors
+    // when it thinks we're in a transaction (status 'T')
+    let mut transaction_status: u8 = TRANSACTION_STATUS_IDLE;
+    // ReadyForQuery message - updated when transaction status changes
+    let mut ready = [b'Z', 0, 0, 0, 5, transaction_status];
     let mut prepared_query: Option<String> = None;
     // Track whether Describe sent RowDescription (true) or NoData (false)
     let mut describe_sent_row_description = false;
@@ -1089,6 +1094,22 @@ async fn run_query_loop(
     let mut __describe_column_count: usize = 0;
     // Server-side cursor storage for this connection
     let mut cursors = ConnectionCursors::new();
+    
+    // Helper macro to update ready message when transaction status changes
+    macro_rules! update_transaction_status {
+        ($new_status:expr) => {{
+            transaction_status = $new_status;
+            ready[5] = transaction_status;
+            debug!("Transaction status changed to: {}", 
+                match transaction_status {
+                    TRANSACTION_STATUS_IDLE => "Idle",
+                    TRANSACTION_STATUS_IN_TRANSACTION => "In Transaction",
+                    TRANSACTION_STATUS_ERROR => "Error",
+                    _ => "Unknown"
+                }
+            );
+        }};
+    }
 
     loop {
         let mut msg_type = [0u8; 1];
@@ -1117,6 +1138,20 @@ async fn run_query_loop(
                 // Check for cursor commands first (require connection-level state)
                 let query_upper = query.to_uppercase();
                 let query_trimmed = query_upper.trim();
+                
+                // CRITICAL: Check for transaction state changes (BEGIN/COMMIT/ROLLBACK)
+                // This MUST be done BEFORE processing the query to ensure JDBC gets correct
+                // transaction status in ReadyForQuery - required for server-side cursors!
+                let (new_tx_status, is_tx_cmd) = get_transaction_state_change(&query, transaction_status);
+                if is_tx_cmd {
+                    info!(
+                        query = %query_trimmed,
+                        old_status = match transaction_status { b'I' => "Idle", b'T' => "InTx", b'E' => "Err", _ => "?" },
+                        new_status = match new_tx_status { b'I' => "Idle", b'T' => "InTx", b'E' => "Err", _ => "?" },
+                        "Transaction command detected (non-TLS) - updating status"
+                    );
+                    update_transaction_status!(new_tx_status);
+                }
                 
                 // Handle DECLARE CURSOR
                 if query_trimmed.starts_with("DECLARE ") && query_trimmed.contains(" CURSOR ") {
@@ -1401,7 +1436,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut buf = [0u8; 4];
-    let ready = [b'Z', 0, 0, 0, 5, b'I'];
+    // Transaction status for ReadyForQuery: 'I' = Idle, 'T' = In Transaction, 'E' = Error
+    // CRITICAL: JDBC only uses server-side cursors when status is 'T' (in transaction)
+    let mut transaction_status: u8 = TRANSACTION_STATUS_IDLE;
+    // ReadyForQuery message - updated when transaction status changes
+    let mut ready = [b'Z', 0, 0, 0, 5, transaction_status];
     let mut prepared_query: Option<String> = None;
     // Track whether Describe sent RowDescription (true) or NoData (false)
     // This ensures Execute phase is consistent with Describe phase
@@ -1414,6 +1453,22 @@ where
     // Portal state for Extended Query Protocol cursor streaming
     // Stores buffered rows and offset for resumption after PortalSuspended
     let mut portal_state: Option<PortalState> = None;
+    
+    // Helper macro to update ready message when transaction status changes
+    macro_rules! update_transaction_status {
+        ($new_status:expr) => {{
+            transaction_status = $new_status;
+            ready[5] = transaction_status;
+            debug!("Transaction status changed to: {}", 
+                match transaction_status {
+                    TRANSACTION_STATUS_IDLE => "Idle",
+                    TRANSACTION_STATUS_IN_TRANSACTION => "In Transaction",
+                    TRANSACTION_STATUS_ERROR => "Error",
+                    _ => "Unknown"
+                }
+            );
+        }};
+    }
 
     loop {
         let mut msg_type = [0u8; 1];
@@ -1447,6 +1502,20 @@ where
                 // Check for cursor commands first (require connection-level state)
                 let query_upper = query.to_uppercase();
                 let query_trimmed = query_upper.trim();
+                
+                // CRITICAL: Check for transaction state changes (BEGIN/COMMIT/ROLLBACK)
+                // This MUST be done BEFORE processing the query to ensure JDBC gets correct
+                // transaction status in ReadyForQuery - required for server-side cursors!
+                let (new_tx_status, is_tx_cmd) = get_transaction_state_change(&query, transaction_status);
+                if is_tx_cmd {
+                    info!(
+                        query = %query_trimmed,
+                        old_status = match transaction_status { b'I' => "Idle", b'T' => "InTx", b'E' => "Err", _ => "?" },
+                        new_status = match new_tx_status { b'I' => "Idle", b'T' => "InTx", b'E' => "Err", _ => "?" },
+                        "Transaction command detected - updating status"
+                    );
+                    update_transaction_status!(new_tx_status);
+                }
                 
                 // Log query at INFO level for debugging cursor issues
                 if query_trimmed.contains("CURSOR") || query_trimmed.starts_with("DECLARE") || query_trimmed.starts_with("FETCH") {
@@ -3244,6 +3313,36 @@ fn extract_copy_inner_query(sql: &str) -> Option<String> {
     }
 }
 
+/// Transaction status constants for PostgreSQL wire protocol
+/// These are sent in the ReadyForQuery message to tell the client the transaction state
+/// CRITICAL: JDBC uses this to decide whether to use server-side cursors for streaming!
+pub const TRANSACTION_STATUS_IDLE: u8 = b'I';
+pub const TRANSACTION_STATUS_IN_TRANSACTION: u8 = b'T';
+pub const TRANSACTION_STATUS_ERROR: u8 = b'E';
+
+/// Check if a SQL command changes transaction state
+/// Returns (new_transaction_status, is_transaction_command)
+/// This is essential for JDBC cursor-based streaming to work!
+fn get_transaction_state_change(sql: &str, current_status: u8) -> (u8, bool) {
+    let sql_upper = sql.to_uppercase();
+    let sql_trimmed = sql_upper.trim();
+    
+    if sql_trimmed == "BEGIN" || sql_trimmed.starts_with("BEGIN ") 
+        || sql_trimmed.starts_with("START TRANSACTION") {
+        // BEGIN starts a transaction - status becomes 'T'
+        (TRANSACTION_STATUS_IN_TRANSACTION, true)
+    } else if sql_trimmed == "COMMIT" || sql_trimmed == "END" {
+        // COMMIT ends a transaction - status becomes 'I'
+        (TRANSACTION_STATUS_IDLE, true)
+    } else if sql_trimmed == "ROLLBACK" || sql_trimmed == "ABORT" {
+        // ROLLBACK ends a transaction - status becomes 'I'
+        (TRANSACTION_STATUS_IDLE, true)
+    } else {
+        // No transaction state change
+        (current_status, false)
+    }
+}
+
 fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
     let sql_upper = sql.to_uppercase();
     let sql_trimmed = sql_upper.trim();
@@ -3283,7 +3382,8 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
         });
     }
 
-    if sql_trimmed == "BEGIN" || sql_trimmed.starts_with("BEGIN ") {
+    if sql_trimmed == "BEGIN" || sql_trimmed.starts_with("BEGIN ") 
+        || sql_trimmed.starts_with("START TRANSACTION") {
         return Some(QueryExecutionResult {
             columns: vec![],
             rows: vec![],
@@ -3292,7 +3392,7 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
         });
     }
 
-    if sql_trimmed == "COMMIT" {
+    if sql_trimmed == "COMMIT" || sql_trimmed == "END" {
         return Some(QueryExecutionResult {
             columns: vec![],
             rows: vec![],
@@ -3301,7 +3401,7 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
         });
     }
 
-    if sql_trimmed == "ROLLBACK" {
+    if sql_trimmed == "ROLLBACK" || sql_trimmed == "ABORT" {
         return Some(QueryExecutionResult {
             columns: vec![],
             rows: vec![],
