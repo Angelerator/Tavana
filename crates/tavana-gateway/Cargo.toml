@@ -105,3 +105,6 @@ socket2 = { version = "0.5", features = ["all"] }
 md5 = "0.7"
 rand = "0.8"
 
+# Base64 encoding for Flight SQL auth
+base64 = "0.22"
+

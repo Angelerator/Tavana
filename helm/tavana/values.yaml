@@ -51,7 +51,13 @@ gateway:
     #   service.beta.kubernetes.io/azure-load-balancer-internal: "true"
     #   service.beta.kubernetes.io/azure-load-balancer-internal-subnet: "subnet-name"
   
-  # Arrow Flight SQL configuration (high-performance binary protocol)
+  # Arrow Flight SQL configuration (ADBC-compatible, high-performance binary protocol)
+  # Enables Arrow-native database connectivity for analytics clients
+  # Supported clients:
+  #   - Python: adbc_driver_flightsql, pyarrow.flight
+  #   - Go: github.com/apache/arrow-adbc/go/adbc/driver/flightsql
+  #   - Java: org.apache.arrow.adbc:adbc-driver-flight-sql
+  #   - JDBC: jdbc:arrow-flight-sql://host:port
   flightSql:
     enabled: true
     port: 9091         # Arrow Flight gRPC port (9091 allowed by Azure Policy)

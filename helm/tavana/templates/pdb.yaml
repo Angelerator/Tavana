@@ -11,7 +11,7 @@ spec:
   minAvailable: {{ .Values.pdb.gateway.minAvailable | default 1 }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: tavana-gateway
+      app: tavana-gateway
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -24,6 +24,6 @@ spec:
   minAvailable: {{ .Values.pdb.worker.minAvailable | default 2 }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: tavana-worker
+      app: tavana-worker
 {{- end }}
 

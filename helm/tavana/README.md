@@ -17,8 +17,54 @@ helm install tavana ./helm/tavana
 This chart bootstraps a Tavana deployment on a Kubernetes cluster using the Helm package manager.
 
 Tavana consists of:
-- **Gateway**: Accepts PostgreSQL wire protocol connections, manages query queuing and routing
+- **Gateway**: Accepts PostgreSQL wire protocol and Arrow Flight SQL (ADBC) connections, manages query queuing and routing
 - **Workers**: Execute DuckDB queries against cloud storage (S3, ADLS, GCS)
+
+## Client Connectivity
+
+Tavana supports multiple connection protocols:
+
+### PostgreSQL Wire Protocol (Port 5432)
+Standard PostgreSQL-compatible clients:
+```bash
+psql -h tavana-gateway -p 5432 -U user -c "SELECT * FROM delta_scan('s3://bucket/table')"
+```
+
+### Arrow Flight SQL / ADBC (Port 9091)
+High-performance Arrow-native connectivity for analytics applications:
+
+**Python (ADBC)**:
+```python
+import adbc_driver_flightsql.dbapi
+
+with adbc_driver_flightsql.dbapi.connect("grpc://tavana-gateway:9091") as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM delta_scan('s3://bucket/table')")
+        table = cur.fetch_arrow_table()  # Zero-copy Arrow data
+```
+
+**Python (pyarrow.flight)**:
+```python
+import pyarrow.flight as flight
+
+client = flight.connect("grpc://tavana-gateway:9091")
+info = client.get_flight_info(flight.FlightDescriptor.for_command(b"SELECT 1"))
+reader = client.do_get(info.endpoints[0].ticket)
+table = reader.read_all()
+```
+
+**Go (ADBC)**:
+```go
+import "github.com/apache/arrow-adbc/go/adbc/driver/flightsql"
+
+driver := flightsql.NewDriver()
+db, _ := driver.Open("grpc://tavana-gateway:9091")
+```
+
+**JDBC**:
+```
+jdbc:arrow-flight-sql://tavana-gateway:9091/?useEncryption=false
+```
 
 ## Prerequisites
 
@@ -71,8 +117,12 @@ helm uninstall tavana -n tavana
 | `gateway.resources.requests.memory` | Memory request | `1Gi` |
 | `gateway.resources.limits.memory` | Memory limit | `4Gi` |
 | `gateway.service.pgPort` | PostgreSQL port (internal) | `5432` |
+| `gateway.flightSql.enabled` | Enable Arrow Flight SQL (ADBC) | `true` |
+| `gateway.flightSql.port` | Flight SQL gRPC port | `9091` |
 | `gateway.loadBalancer.enabled` | Enable external LoadBalancer | `false` |
 | `gateway.loadBalancer.externalPort` | External PostgreSQL port | `5432` |
+| `gateway.loadBalancer.exposeFlight` | Expose Flight SQL externally | `false` |
+| `gateway.loadBalancer.flightExternalPort` | External Flight SQL port | `9091` |
 | `gateway.loadBalancer.annotations` | LoadBalancer annotations | `{}` |
 
 ### Worker
