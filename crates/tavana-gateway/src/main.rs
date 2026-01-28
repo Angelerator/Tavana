@@ -246,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Start Arrow Flight SQL server if enabled (high-performance binary protocol)
+    // Start Arrow Flight SQL server if enabled (ADBC-compatible, high-performance binary protocol)
     let flight_handle = if args.flight_sql_enabled {
         let flight_port = args.flight_sql_port;
         let flight_worker_addr = args.worker_addr.clone();
@@ -259,12 +259,18 @@ async fn main() -> anyhow::Result<()> {
                 .parse()
                 .expect("Invalid Flight SQL address");
 
+            // Create ADBC-compatible Flight SQL service
             let flight_service = TavanaFlightSqlService::new(flight_worker_addr);
             let svc = FlightServiceServer::new(flight_service);
 
-            info!("Arrow Flight SQL server listening on {}", addr);
-            info!("  - Python: pyarrow.flight.connect('grpc://{}:{}')", "host", flight_port);
-            info!("  - JDBC: jdbc:arrow-flight-sql://host:{}/?useEncryption=false", flight_port);
+            info!("Arrow Flight SQL server (ADBC-compatible) listening on {}", addr);
+            info!("  ADBC clients:");
+            info!("    - Python: adbc_driver_flightsql.dbapi.connect('grpc://host:{}')", flight_port);
+            info!("    - Go: flightsql.NewDriver().Open(\"grpc://host:{}\")", flight_port);
+            info!("    - Java: AdbcDriver.open(\"grpc://host:{}\")", flight_port);
+            info!("  Other clients:");
+            info!("    - pyarrow: pyarrow.flight.connect('grpc://host:{}')", flight_port);
+            info!("    - JDBC: jdbc:arrow-flight-sql://host:{}/?useEncryption=false", flight_port);
 
             if let Err(e) = Server::builder()
                 .add_service(svc)
