@@ -92,11 +92,13 @@ impl DuckDbExecutor {
         let memory_per_conn = config.max_memory / pool_size as u64;
         let threads_per_conn = (config.threads / pool_size as u32).max(1);
 
+        // For I/O-bound remote workloads, use more threads regardless of CPU
+        let threads_for_display = threads_per_conn.max(8);
         info!(
-            "Initializing DuckDB connection pool: {} connections, {}MB each, {} threads each",
+            "Initializing DuckDB connection pool: {} connections, {}MB each, {} threads each (optimized for Azure I/O)",
             pool_size,
             memory_per_conn / 1024 / 1024,
-            threads_per_conn
+            threads_for_display
         );
 
         let mut connections = Vec::with_capacity(pool_size);
@@ -361,13 +363,33 @@ impl DuckDbExecutor {
             tracing::warn!("Could not set max_temp_directory_size: {}", e);
         }
 
-        // Increase threads for remote file parallelism (helps with S3)
-        // DuckDB uses synchronous I/O for remote files, so more threads = better parallelism
-        let threads_for_remote = threads * 2;
+        // Increase threads for remote file parallelism (Azure/S3)
+        // DuckDB uses synchronous I/O for remote files, so more threads = better I/O parallelism
+        // For I/O-bound workloads (Azure Storage), threads don't need to match CPU cores
+        // Use at least 8 threads per connection for good parallel HTTP requests
+        let threads_for_remote = threads.max(8);
         if let Err(e) =
             connection.execute(&format!("SET threads = {}", threads_for_remote), params![])
         {
             tracing::warn!("Could not increase threads for remote: {}", e);
+        }
+        
+        // Enable HTTP keep-alive for faster repeated requests to Azure
+        if let Err(e) = connection.execute("SET http_keep_alive = true", params![]) {
+            tracing::warn!("Could not enable http_keep_alive: {}", e);
+        }
+        
+        // Set larger HTTP retry settings for Azure reliability
+        if let Err(e) = connection.execute("SET http_retries = 5", params![]) {
+            tracing::warn!("Could not set http_retries: {}", e);
+        }
+        if let Err(e) = connection.execute("SET http_retry_wait_ms = 500", params![]) {
+            tracing::warn!("Could not set http_retry_wait_ms: {}", e);
+        }
+        
+        // Enable prefetching for Parquet files (improves sequential reads)
+        if let Err(e) = connection.execute("SET enable_http_file_cache = true", params![]) {
+            tracing::debug!("enable_http_file_cache not available: {}", e);
         }
 
         // Configure Azure authentication from environment variables
