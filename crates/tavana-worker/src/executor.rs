@@ -15,9 +15,10 @@ use tracing::{debug, info, instrument};
 pub struct ExecutorConfig {
     /// Maximum memory for DuckDB (in bytes)
     pub max_memory: u64,
-    /// Number of threads for query execution
+    /// Number of threads for query execution (overridden by DUCKDB_REMOTE_THREADS for I/O workloads)
     pub threads: u32,
-    /// Enable profiling
+    /// Enable profiling (reserved for future use)
+    #[allow(dead_code)]
     pub enable_profiling: bool,
     /// Number of parallel connections (pool size)
     pub pool_size: usize,
@@ -46,7 +47,8 @@ pub struct PooledConnection {
 struct AzureTokenState {
     /// Time when the token expires
     expires_at: std::time::Instant,
-    /// Account name for recreating secrets
+    /// Account name for recreating secrets (reserved for future use)
+    #[allow(dead_code)]
     account_name: String,
     /// Flag to stop background refresh thread
     stop_flag: std::sync::atomic::AtomicBool,
@@ -285,12 +287,12 @@ impl DuckDbExecutor {
     }
 
     /// Create a single DuckDB connection
-    fn create_connection(max_memory: u64, threads: u32) -> Result<Connection> {
+    fn create_connection(max_memory: u64, _threads: u32) -> Result<Connection> {
         let connection = Connection::open_in_memory()?;
 
         // Dynamic settings that depend on pod resources
         connection.execute(&format!("SET memory_limit = '{}B'", max_memory), params![])?;
-        connection.execute(&format!("SET threads = {}", threads), params![])?;
+        // Note: threads are set later with aggressive I/O parallelism settings
 
         // Load .duckdbrc if present (created at Docker build time)
         // This applies static settings without hardcoding them in Rust
