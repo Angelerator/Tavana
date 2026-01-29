@@ -1651,6 +1651,15 @@ where
                                     exec_ms = duration_ms,
                                     "Query completed (TLS streaming)"
                                 );
+                                
+                                // Warn about large result sets that may cause client-side issues
+                                if row_count > 100_000 {
+                                    warn!(
+                                        query_id = %query_id,
+                                        rows = row_count,
+                                        "Large result set streamed. If client crashes, use LIMIT/OFFSET or DECLARE CURSOR"
+                                    );
+                                }
                                 QueryOutcome::Success {
                                     rows: row_count as u64,
                                     bytes: 0,
