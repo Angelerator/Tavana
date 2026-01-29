@@ -387,9 +387,33 @@ impl DuckDbExecutor {
             tracing::warn!("Could not set http_retry_wait_ms: {}", e);
         }
         
-        // Enable prefetching for Parquet files (improves sequential reads)
-        if let Err(e) = connection.execute("SET enable_http_file_cache = true", params![]) {
-            tracing::debug!("enable_http_file_cache not available: {}", e);
+        // ============= DuckDB Performance Optimizations for Azure/Delta =============
+        // Based on DuckDB documentation: https://duckdb.org/2025/03/21/maximizing-your-delta-scan-performance.html
+        
+        // Enable Parquet metadata caching - reduces Azure HTTP calls for repeated file access
+        if let Err(e) = connection.execute("SET parquet_metadata_cache = true", params![]) {
+            tracing::debug!("parquet_metadata_cache not available: {}", e);
+        }
+        
+        // Enable HTTP metadata cache - caches HTTP metadata globally
+        if let Err(e) = connection.execute("SET enable_http_metadata_cache = true", params![]) {
+            tracing::debug!("enable_http_metadata_cache not available: {}", e);
+        }
+        
+        // Enable prefetching for ALL Parquet files (not just local)
+        if let Err(e) = connection.execute("SET prefetch_all_parquet_files = true", params![]) {
+            tracing::debug!("prefetch_all_parquet_files not available: {}", e);
+        }
+        
+        // Enable external file cache (Parquet files in memory)
+        if let Err(e) = connection.execute("SET enable_external_file_cache = true", params![]) {
+            tracing::debug!("enable_external_file_cache not available: {}", e);
+        }
+        
+        // Disable preserve_insertion_order for faster query execution
+        // (only affects queries without ORDER BY)
+        if let Err(e) = connection.execute("SET preserve_insertion_order = false", params![]) {
+            tracing::debug!("preserve_insertion_order not available: {}", e);
         }
 
         // Configure Azure authentication from environment variables
