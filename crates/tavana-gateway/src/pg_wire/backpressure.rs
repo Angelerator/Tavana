@@ -253,11 +253,19 @@ impl BackpressureWriter<&mut tokio::net::TcpStream> {
 }
 
 /// Check if a TcpStream client is still connected
+/// 
+/// IMPORTANT: This uses a very short timeout on peek() because:
+/// - PostgreSQL clients don't send data while waiting for query results
+/// - A blocking peek() would deadlock: server waits for client, client waits for server
+/// - If peek doesn't return immediately, we assume connection is alive
 pub async fn is_client_connected(stream: &TcpStream) -> bool {
-    // Try to peek at the socket to check connection state
-    match stream.peek(&mut [0u8; 0]).await {
-        Ok(_) => true,
-        Err(e) => {
+    use std::time::Duration;
+    
+    // Use a 1ms timeout - if peek blocks, connection is alive (client just has no data to send)
+    // Only actual disconnection errors (which return immediately) indicate a dead connection
+    match tokio::time::timeout(Duration::from_millis(1), stream.peek(&mut [0u8; 1])).await {
+        Ok(Ok(_)) => true, // Data available or empty peek succeeded
+        Ok(Err(e)) => {
             match e.kind() {
                 // Definitely disconnected
                 ErrorKind::ConnectionReset
@@ -267,12 +275,14 @@ pub async fn is_client_connected(stream: &TcpStream) -> bool {
                     debug!("Client disconnected: {:?}", e.kind());
                     false
                 }
-                // WouldBlock is expected for non-blocking sockets
+                // WouldBlock is expected for non-blocking sockets - connection alive
                 ErrorKind::WouldBlock => true,
-                // Other errors might be transient
+                // Other errors might be transient - assume connected
                 _ => true,
             }
         }
+        // Timeout - peek blocked waiting for data, connection is alive
+        Err(_) => true,
     }
 }
 
