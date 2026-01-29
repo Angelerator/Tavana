@@ -149,7 +149,7 @@ impl Default for PgWireConfig {
             flush_timeout_secs: std::env::var("TAVANA_FLUSH_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(5), // 5 seconds - aggressive slow client detection
+                .unwrap_or(300), // 5 minutes - StarRocks-style patient waiting
         }
     }
 }
