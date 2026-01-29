@@ -251,6 +251,16 @@ fn substitute_parameters(sql: &str, params: &[Option<String>]) -> String {
 /// This prevents client OOM by limiting result size (like ClickHouse max_result_rows)
 /// 
 /// Returns (modified_sql, was_limited) where was_limited is true if LIMIT was added
+/// 
+/// Query hints to bypass the limit:
+/// - `-- TAVANA:UNLIMITED` (SQL comment)
+/// - `/*TAVANA:UNLIMITED*/` (block comment)
+/// 
+/// Example:
+/// ```sql
+/// -- TAVANA:UNLIMITED
+/// SELECT * FROM delta_scan('az://...');
+/// ```
 fn apply_result_limit(sql: &str, max_rows: usize) -> (String, bool) {
     if max_rows == 0 {
         return (sql.to_string(), false);
@@ -258,6 +268,11 @@ fn apply_result_limit(sql: &str, max_rows: usize) -> (String, bool) {
     
     let sql_upper = sql.to_uppercase();
     let sql_trimmed = sql_upper.trim();
+    
+    // Check for TAVANA:UNLIMITED hint - allows bypassing the limit
+    if sql_upper.contains("TAVANA:UNLIMITED") {
+        return (sql.to_string(), false);
+    }
     
     // Only apply to SELECT queries
     if !sql_trimmed.starts_with("SELECT") {

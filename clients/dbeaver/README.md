@@ -15,17 +15,31 @@ This guide explains how to configure DBeaver to connect to Tavana and stream lar
    - **Username**: Your email (e.g., `user@nokia.com`)
    - **Password**: Your password
 
-### 2. Configure Driver Properties (CRITICAL!)
+### 2. Configure Streaming (CRITICAL - Prevents Crashes!)
 
-Go to **Driver properties** tab and set these properties:
+#### Step A: Disable Auto-Commit
+
+1. Right-click your connection → **Edit Connection**
+2. Go to **Connection settings** → **Initialization** tab
+3. **Uncheck "Auto-commit"**
+
+Or use the toolbar: Click the **Auto-commit toggle button** to switch to "Manual commit" mode.
+
+#### Step B: Set Fetch Size
+
+1. Go to **Window → Preferences → Editors → Data Editor**
+2. Set **"Result set fetch size"** to `5000`
+
+#### Step C: Driver Properties (Optional but Recommended)
+
+Go to **Driver properties** tab and set:
 
 | Property | Value | Why |
 |----------|-------|-----|
-| `sslmode` | `prefer` | Enable SSL with fallback |
-| `defaultRowFetchSize` | `5000` | **Stream results in batches** |
-| `defaultAutoCommit` | `false` | **Enable server-side cursors** |
+| `sslmode` | `require` | Enable SSL |
+| `defaultRowFetchSize` | `5000` | Stream results in batches |
 
-**⚠️ DO NOT SET `preferQueryMode=simple`** - This disables streaming and causes memory issues!
+**⚠️ DO NOT SET `preferQueryMode=simple`** - This disables streaming!
 
 ### 3. Verify Streaming Works
 
@@ -36,80 +50,100 @@ SELECT * FROM delta_scan('az://dagster-data-pipelines/dev/bronze/...') LIMIT 100
 
 You should see results appearing progressively without memory spikes.
 
-## Understanding the Configuration
+## Understanding Why This Matters
 
-### Why These Settings Matter
+### The Problem
 
-| Setting | Effect |
-|---------|--------|
-| `defaultRowFetchSize=5000` | JDBC driver fetches 5000 rows at a time instead of all rows |
-| `defaultAutoCommit=false` | Enables PostgreSQL server-side cursors for streaming |
+By default, DBeaver loads **ALL rows into memory** before displaying. For large tables:
+- 1M rows × 1KB/row = **1 GB of memory** → DBeaver crashes
 
-With these settings, the JDBC driver:
-1. Sends `BEGIN` to start a transaction
-2. Internally uses `DECLARE CURSOR` / `FETCH` for row batching
-3. Only keeps ~5000 rows in memory at a time
+### The Solution
 
-### Memory Usage Comparison
+With proper configuration:
+- DBeaver fetches 5000 rows at a time
+- Memory usage stays at **~8 MB** regardless of table size
+- Results appear progressively as they stream
 
-| Configuration | Memory for 2M rows | Behavior |
+| Configuration | Memory for 1M rows | Behavior |
 |--------------|-------------------|----------|
-| Default (fetchSize=0) | **454 MB** | All rows buffered |
-| fetchSize=5000 | **~8 MB** | True streaming |
+| Default | **~1 GB** | All rows buffered → crash |
+| Streaming enabled | **~8 MB** | 5000 rows at a time |
+
+## Bypassing Server-Side Limits
+
+Tavana may enforce a result row limit (e.g., 100,000 rows) to protect clients from OOM.
+
+### To Get Unlimited Results
+
+Add the `TAVANA:UNLIMITED` hint to your query:
+
+```sql
+-- TAVANA:UNLIMITED
+SELECT * FROM delta_scan('az://dagster-data-pipelines/dev/bronze/...');
+```
+
+Or as a block comment:
+```sql
+/*TAVANA:UNLIMITED*/ SELECT * FROM delta_scan('az://...');
+```
+
+**⚠️ Warning**: Only use this if you've configured streaming properly (Steps A & B above), otherwise DBeaver will crash!
 
 ## Troubleshooting
 
 ### Out of Memory / DBeaver Crashes
 
-**Cause**: You're using `preferQueryMode=simple` or missing the streaming settings.
+**Cause**: Auto-commit is enabled or fetch size is 0.
 
 **Fix**: 
-1. Remove `preferQueryMode=simple` from driver properties
-2. Add `defaultRowFetchSize=5000`
-3. Add `defaultAutoCommit=false`
+1. Disable auto-commit (Step A above)
+2. Set fetch size to 5000 (Step B above)
+3. Restart DBeaver
 
 ### Query Takes Forever to Start
 
 **Cause**: Large result set without LIMIT.
 
-**Fix**: Always use LIMIT for exploratory queries:
+**Fix**: Use LIMIT for exploratory queries:
 ```sql
 SELECT * FROM delta_scan('az://...') LIMIT 1000
 ```
 
 ### "Transaction aborted" Errors
 
-**Cause**: Server-side cursor requires active transaction.
+**Cause**: A previous query failed and the transaction is in error state.
 
-**Fix**: Ensure `defaultAutoCommit=false` is set.
-
-## Large Result Sets
-
-For queries returning millions of rows, use pagination:
-
+**Fix**: Click "Rollback" in the toolbar, or run:
 ```sql
--- First page
-SELECT * FROM delta_scan('az://...') LIMIT 10000 OFFSET 0;
-
--- Second page
-SELECT * FROM delta_scan('az://...') LIMIT 10000 OFFSET 10000;
-
--- And so on...
+ROLLBACK
 ```
 
-Or use server-side cursors directly:
+## Large Result Sets Best Practices
+
+### Option 1: Pagination
+```sql
+-- First 10,000 rows
+SELECT * FROM delta_scan('az://...') LIMIT 10000 OFFSET 0;
+
+-- Next 10,000 rows
+SELECT * FROM delta_scan('az://...') LIMIT 10000 OFFSET 10000;
+```
+
+### Option 2: Export to File
+Right-click results → **Export Data** → CSV/Excel. This streams directly to file without loading into UI.
+
+### Option 3: Server-Side Cursors
 ```sql
 BEGIN;
 DECLARE my_cursor CURSOR FOR SELECT * FROM delta_scan('az://...');
 FETCH 1000 FROM my_cursor;
--- ... process results ...
+-- process results...
 FETCH 1000 FROM my_cursor;
--- ... more processing ...
 CLOSE my_cursor;
 COMMIT;
 ```
 
 ## Reference
 
-- [PostgreSQL JDBC Fetch Size Documentation](https://jdbc.postgresql.org/documentation/query/)
-- [Understanding JDBC Fetch Size](https://shaneborden.com/2025/10/14/understanding-and-setting-postgresql-jdbc-fetch-size/)
+- [PostgreSQL JDBC Fetch Size](https://jdbc.postgresql.org/documentation/query/)
+- [DBeaver Auto/Manual Commit](https://dbeaver.com/docs/dbeaver/Auto-and-Manual-Commit-Modes/)
