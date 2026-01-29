@@ -71,6 +71,11 @@ pub struct PgWireConfig {
     pub tcp_keepalive_secs: u64,
     /// Interval to check client connection health during streaming (in rows)
     pub connection_check_interval_rows: usize,
+    /// Maximum rows to return in a single query result (like ClickHouse max_result_rows)
+    /// This prevents client OOM by limiting result size. Use OFFSET for pagination.
+    /// Set to 0 for unlimited (not recommended for production).
+    /// Default: 100000 rows (protects JDBC clients from OOM)
+    pub max_result_rows: usize,
 }
 
 impl Default for PgWireConfig {
@@ -108,6 +113,10 @@ impl Default for PgWireConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1000), // Check every 1000 rows
+            max_result_rows: std::env::var("TAVANA_MAX_RESULT_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100_000), // 100k rows - protects JDBC clients from OOM
         }
     }
 }
@@ -177,6 +186,99 @@ async fn is_client_connected(stream: &tokio::net::TcpStream) -> bool {
 
 // Legacy constant for backwards compatibility (when config is not passed)
 const STREAMING_BATCH_SIZE: usize = 100;
+
+/// Apply automatic LIMIT to SELECT queries that don't have one
+/// This prevents client OOM by limiting result size (like ClickHouse max_result_rows)
+/// 
+/// Returns (modified_sql, was_limited) where was_limited is true if LIMIT was added
+fn apply_result_limit(sql: &str, max_rows: usize) -> (String, bool) {
+    if max_rows == 0 {
+        return (sql.to_string(), false);
+    }
+    
+    let sql_upper = sql.to_uppercase();
+    let sql_trimmed = sql_upper.trim();
+    
+    // Only apply to SELECT queries
+    if !sql_trimmed.starts_with("SELECT") {
+        return (sql.to_string(), false);
+    }
+    
+    // Skip if query is a cursor operation (DECLARE, FETCH, etc.)
+    if sql_trimmed.contains("CURSOR") {
+        return (sql.to_string(), false);
+    }
+    
+    // Skip if query already has LIMIT
+    // Check for LIMIT followed by a number (to avoid matching "LIMIT" in column names)
+    if sql_upper.contains(" LIMIT ") {
+        return (sql.to_string(), false);
+    }
+    
+    // Skip if query has OFFSET without LIMIT (invalid, let it fail naturally)
+    // Skip common subquery patterns (we want to limit only the outer query)
+    
+    // Add LIMIT to the end of the query
+    // Handle trailing semicolon
+    let sql_trimmed_orig = sql.trim();
+    let (base_sql, has_semicolon) = if sql_trimmed_orig.ends_with(';') {
+        (&sql_trimmed_orig[..sql_trimmed_orig.len()-1], true)
+    } else {
+        (sql_trimmed_orig, false)
+    };
+    
+    let limited_sql = if has_semicolon {
+        format!("{} LIMIT {};", base_sql, max_rows)
+    } else {
+        format!("{} LIMIT {}", base_sql, max_rows)
+    };
+    
+    (limited_sql, true)
+}
+
+/// Send a PostgreSQL NOTICE message to inform client about automatic limiting
+async fn send_notice_message<S: AsyncWrite + Unpin>(
+    socket: &mut S,
+    message: &str,
+) -> std::io::Result<()> {
+    // PostgreSQL NoticeResponse format:
+    // 'N' (1 byte) + length (4 bytes) + fields
+    // Fields: severity 'S' + "NOTICE\0" + message 'M' + message\0 + code 'C' + "01000\0" + \0
+    
+    let severity = b"NOTICE";
+    let code = b"01000"; // Warning code
+    
+    // Calculate message length
+    let msg_len = 4  // length field
+        + 1 + severity.len() + 1  // 'S' + severity + null
+        + 1 + code.len() + 1      // 'C' + code + null  
+        + 1 + message.len() + 1   // 'M' + message + null
+        + 1;                       // final null terminator
+    
+    let mut buf = Vec::with_capacity(1 + msg_len);
+    buf.push(b'N'); // NoticeResponse
+    buf.extend_from_slice(&(msg_len as u32).to_be_bytes());
+    
+    // Severity field
+    buf.push(b'S');
+    buf.extend_from_slice(severity);
+    buf.push(0);
+    
+    // SQLSTATE code field
+    buf.push(b'C');
+    buf.extend_from_slice(code);
+    buf.push(0);
+    
+    // Message field
+    buf.push(b'M');
+    buf.extend_from_slice(message.as_bytes());
+    buf.push(0);
+    
+    // Terminator
+    buf.push(0);
+    
+    socket.write_all(&buf).await
+}
 
 /// Result of streaming query execution (for metrics tracking)
 #[derive(Debug, Default)]
@@ -1232,8 +1334,28 @@ async fn run_query_loop(
                     continue;
                 }
 
+                // CRITICAL: Apply automatic LIMIT to prevent client OOM
+                // Like ClickHouse's max_result_rows with result_overflow_mode=break
+                let (limited_query, was_limited) = apply_result_limit(&query, config.max_result_rows);
+                if was_limited {
+                    info!(
+                        max_rows = config.max_result_rows,
+                        "Query automatically limited to {} rows (non-TLS).",
+                        config.max_result_rows
+                    );
+                    // Send NOTICE to inform client about the limit
+                    let notice_msg = format!(
+                        "Results limited to {} rows. Use LIMIT/OFFSET for pagination.",
+                        config.max_result_rows
+                    );
+                    if let Err(e) = send_notice_message(socket, &notice_msg).await {
+                        debug!("Failed to send NOTICE: {}", e);
+                    }
+                }
+                let query_to_execute = if was_limited { &limited_query } else { &query };
+
                 let query_id = uuid::Uuid::new_v4().to_string();
-                let estimate = query_router.route(&query).await;
+                let estimate = query_router.route(query_to_execute).await;
                 let estimated_data_mb = estimate.data_size_mb;
 
                 let enqueue_result = query_queue
@@ -1252,7 +1374,7 @@ async fn run_query_loop(
                                 socket,
                                 worker_client,
                                 query_router,
-                                &query,
+                                query_to_execute,
                                 user_id,
                                 smart_scaler,
                             )
@@ -1612,9 +1734,30 @@ where
                     continue;
                 }
 
+                // CRITICAL: Apply automatic LIMIT to prevent client OOM
+                // Like ClickHouse's max_result_rows with result_overflow_mode=break
+                // This protects JDBC clients (DBeaver, Tableau) that buffer all rows in memory
+                let (limited_query, was_limited) = apply_result_limit(&query, config.max_result_rows);
+                if was_limited {
+                    info!(
+                        max_rows = config.max_result_rows,
+                        "Query automatically limited to {} rows. Use LIMIT/OFFSET for pagination.",
+                        config.max_result_rows
+                    );
+                    // Send NOTICE to inform client about the limit
+                    let notice_msg = format!(
+                        "Results limited to {} rows. Use LIMIT/OFFSET for pagination, or set TAVANA_MAX_RESULT_ROWS=0 to disable.",
+                        config.max_result_rows
+                    );
+                    if let Err(e) = send_notice_message(socket, &notice_msg).await {
+                        debug!("Failed to send NOTICE: {}", e);
+                    }
+                }
+                let query_to_execute = if was_limited { &limited_query } else { &query };
+
                 // For TLS connections, execute queries directly using a simpler path
                 let query_id = uuid::Uuid::new_v4().to_string();
-                let estimate = query_router.route(&query).await;
+                let estimate = query_router.route(query_to_execute).await;
                 let estimated_data_mb = estimate.data_size_mb;
 
                 let enqueue_result = query_queue
@@ -1634,7 +1777,7 @@ where
                                 socket,
                                 worker_client,
                                 query_router,
-                                &query,
+                                query_to_execute,
                                 user_id,
                                 smart_scaler,
                             )

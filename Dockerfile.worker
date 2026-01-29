@@ -122,15 +122,9 @@ EOF
 
 # Pre-load extensions at build time as the tavana user
 # This ensures extension cache and metadata are in the correct location
-# Benefits:
-# 1. Validates all extensions are correctly downloaded
-# 2. Creates extension metadata cache in ~/.duckdb
-# 3. JIT compilation cached for faster subsequent loads
-# 4. Eliminates "extension not found" errors on first query
-RUN set -eux && \
-    echo "Pre-loading DuckDB extensions at build time (as tavana user)..." && \
-    duckdb -c "SET home_directory = '/home/tavana'; SET extension_directory = '/home/tavana/.duckdb/extensions'; LOAD parquet; LOAD json; LOAD httpfs; LOAD azure; LOAD aws; LOAD delta; LOAD iceberg; LOAD icu; LOAD fts; LOAD inet; SELECT extension_name, loaded FROM duckdb_extensions() WHERE loaded = true ORDER BY extension_name;" && \
-    echo "✓ Extensions pre-loaded and verified"
+# Note: Extension pre-loading step removed because it fails under QEMU emulation
+# when cross-compiling from ARM to x86. Extensions are loaded dynamically at runtime
+# from the pre-downloaded files in /home/tavana/.duckdb/extensions
 
 # Pre-create temp directory structure (avoid mkdir at runtime)
 RUN mkdir -p /tmp/duckdb/swap /tmp/duckdb/cache && \
