@@ -249,11 +249,18 @@ impl WorkerClient {
         let response = client.execute_query(request).await?;
         let mut stream = response.into_inner();
 
-        // Create a channel for streaming results
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        // Create a SMALL bounded channel for streaming results
+        // This is critical for backpressure: when the client can't consume data fast enough,
+        // the channel fills up, which causes tx.send() to block, which back-pressures the
+        // gRPC stream reader, which back-pressures the worker via gRPC flow control.
+        //
+        // Channel size of 4 means at most 4 batches buffered between gRPC and client socket.
+        // Each batch is typically 100-1000 rows, so this limits buffering to 400-4000 rows.
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
 
         // Spawn a task to read from gRPC stream and forward to channel
         // TRUE STREAMING with Arrow IPC: 10-100x faster data transfer
+        // NOTE: tx.send() will block when channel is full, providing backpressure
         tokio::spawn(async move {
             while let Ok(Some(batch)) = stream.message().await {
                 let result = match batch.result {

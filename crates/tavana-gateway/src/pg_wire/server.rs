@@ -23,6 +23,11 @@
 use crate::auth::{AuthService, AuthGateway, AuthContext, AuthenticatedPrincipal};
 use crate::metrics;
 use crate::pg_compat;
+use crate::pg_wire::backpressure::{
+    BackpressureConfig, BackpressureWriter,
+    build_row_description, build_command_complete, build_data_row,
+    is_disconnect_error,
+};
 use crate::query_queue::{QueryOutcome, QueryQueue};
 use crate::query_router::{QueryRouter, QueryTarget};
 use crate::redis_queue::{RedisQueue, RedisQueueConfig};
@@ -52,11 +57,13 @@ use crate::cursors::{self, ConnectionCursors, CursorResult};
 #[derive(Debug, Clone)]
 pub struct PgWireConfig {
     /// Maximum rows to buffer before flushing to client (backpressure control)
+    /// DEPRECATED: Use flush_threshold_rows for bytes-aware backpressure
     pub streaming_batch_size: usize,
     /// Query timeout in seconds (prevents runaway queries)
     pub query_timeout_secs: u64,
-    /// Socket write buffer size in bytes (future: BufWriter optimization)
-    #[allow(dead_code)]
+    /// Socket write buffer size in bytes for BufWriter
+    /// Smaller = more backpressure, higher latency
+    /// Larger = less backpressure, risk of overwhelming client
     pub write_buffer_size: usize,
     /// Maximum message size for gRPC (1GB default)
     #[allow(dead_code)]
@@ -76,6 +83,18 @@ pub struct PgWireConfig {
     /// Set to 0 for unlimited (not recommended for production).
     /// Default: 100000 rows (protects JDBC clients from OOM)
     pub max_result_rows: usize,
+
+    // === Backpressure Settings ===
+    
+    /// Bytes to buffer before forcing a flush (default: 64KB)
+    /// This is the primary backpressure threshold, matching TCP window sizes
+    pub flush_threshold_bytes: usize,
+    /// Maximum rows before forcing a flush regardless of bytes (default: 100)
+    /// Acts as a safety net for rows with very small data
+    pub flush_threshold_rows: usize,
+    /// Timeout for flush operations in seconds (default: 5s)
+    /// If flush takes longer, client is likely overwhelmed
+    pub flush_timeout_secs: u64,
 }
 
 impl Default for PgWireConfig {
@@ -92,7 +111,7 @@ impl Default for PgWireConfig {
             write_buffer_size: std::env::var("TAVANA_WRITE_BUFFER_SIZE")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(64 * 1024), // 64KB
+                .unwrap_or(32 * 1024), // 32KB - smaller for better backpressure
             max_grpc_message_size: std::env::var("TAVANA_MAX_GRPC_MESSAGE_SIZE")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -112,11 +131,25 @@ impl Default for PgWireConfig {
             connection_check_interval_rows: std::env::var("TAVANA_CONNECTION_CHECK_INTERVAL_ROWS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(1000), // Check every 1000 rows
+                .unwrap_or(500), // Check more frequently for better disconnect detection
             max_result_rows: std::env::var("TAVANA_MAX_RESULT_ROWS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100_000), // 100k rows - protects JDBC clients from OOM
+
+            // Backpressure settings
+            flush_threshold_bytes: std::env::var("TAVANA_FLUSH_THRESHOLD_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64 * 1024), // 64KB - matches typical TCP window
+            flush_threshold_rows: std::env::var("TAVANA_FLUSH_THRESHOLD_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100), // Safety net for small rows
+            flush_timeout_secs: std::env::var("TAVANA_FLUSH_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5), // 5 seconds - aggressive slow client detection
         }
     }
 }
@@ -3255,6 +3288,11 @@ async fn execute_query_streaming_to_worker(
 }
 
 /// Stream query results - internal implementation with skip_row_description flag
+/// 
+/// Uses BackpressureWriter for proper flow control:
+/// - Bytes-based flushing (not just row count)
+/// - Short flush timeouts to detect slow clients
+/// - TCP-level backpressure via bounded BufWriter
 #[allow(dead_code)]
 async fn execute_query_streaming_to_worker_impl(
     socket: &mut tokio::net::TcpStream,
@@ -3263,14 +3301,17 @@ async fn execute_query_streaming_to_worker_impl(
     user_id: &str,
     skip_row_description: bool,
 ) -> anyhow::Result<usize> {
-    use tokio::io::AsyncWriteExt;
-    use std::io::ErrorKind;
-
     info!("Streaming query to worker: {}", worker_addr);
 
-    // Load config for connection check interval
+    // Load backpressure config
     let config = PgWireConfig::default();
-    let connection_check_interval = config.connection_check_interval_rows;
+    let bp_config = BackpressureConfig {
+        flush_threshold_bytes: config.flush_threshold_bytes,
+        flush_threshold_rows: config.flush_threshold_rows,
+        flush_timeout_secs: config.flush_timeout_secs,
+        connection_check_interval_rows: config.connection_check_interval_rows,
+        write_buffer_size: config.write_buffer_size,
+    };
 
     // Connect to worker with large buffer settings for big result sets
     const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB per gRPC message
@@ -3313,16 +3354,19 @@ async fn execute_query_streaming_to_worker_impl(
     let response = client.execute_query(request).await?;
     let mut stream = response.into_inner();
 
+    // Create backpressure-aware writer
+    // This wraps the socket in BufWriter with small buffer for TCP backpressure
+    // Use reborrow so we can still use socket for connection checks
+    let mut writer = BackpressureWriter::new(&mut *socket, bp_config);
     let mut columns_sent = false;
-    let mut total_rows: usize = 0;
-    let mut batch_rows: usize = 0;
 
     while let Some(batch) = stream.message().await? {
         match batch.result {
             Some(proto::query_result_batch::Result::Metadata(meta)) => {
                 // Send RowDescription once (unless in Extended Protocol where Describe already sent it)
                 if !columns_sent && !skip_row_description {
-                    send_row_description(socket, &meta.columns, &meta.column_types).await?;
+                    let row_desc = build_row_description(&meta.columns, &meta.column_types);
+                    writer.write_bytes(&row_desc).await?;
                 }
                 columns_sent = true;
             }
@@ -3330,64 +3374,61 @@ async fn execute_query_streaming_to_worker_impl(
                 if !batch.data.is_empty() {
                     if let Ok(rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
                         for row in rows {
-                            // Check for client disconnect during streaming
-                            // This catches broken pipe errors early
-                            match send_data_row(socket, &row).await {
+                            // Build and write DataRow with backpressure tracking
+                            let data_row = build_data_row(&row);
+                            
+                            match writer.write_bytes(&data_row).await {
                                 Ok(_) => {}
-                                Err(e) => {
-                                    // Check if this is a connection error
-                                    let is_disconnect = e.to_string().contains("Broken pipe")
-                                        || e.to_string().contains("Connection reset")
-                                        || e.to_string().contains("connection reset");
-                                    if is_disconnect {
-                                        warn!("Client disconnected during streaming after {} rows", total_rows);
+                                Err(e) if is_disconnect_error(&e) => {
+                                    let stats = writer.stats();
+                                    warn!("Client disconnected during streaming after {} rows, {} bytes", 
+                                        stats.rows_sent, stats.bytes_sent);
+                                    return Err(anyhow::anyhow!("Client disconnected"));
+                                }
+                                Err(e) => return Err(e.into()),
+                            }
+                            writer.row_sent();
+
+                            // Check if we should flush (based on bytes AND rows)
+                            if writer.should_flush() {
+                                match writer.flush_with_backpressure().await {
+                                    Ok(true) => {} // Normal flush
+                                    Ok(false) => {
+                                        // Slow client detected - continue but log
+                                        let stats = writer.stats();
+                                        debug!("Slow client detected after {} rows", stats.rows_sent);
+                                    }
+                                    Err(e) if is_disconnect_error(&e) => {
+                                        let stats = writer.stats();
+                                        warn!("Client disconnected during flush after {} rows", stats.rows_sent);
                                         return Err(anyhow::anyhow!("Client disconnected"));
                                     }
-                                    return Err(e);
-                                }
-                            }
-                            total_rows += 1;
-                            batch_rows += 1;
-
-                            // Flush every STREAMING_BATCH_SIZE rows for backpressure
-                            if batch_rows >= STREAMING_BATCH_SIZE {
-                                // Flush with timeout to detect slow/dead clients
-                                match tokio::time::timeout(
-                                    Duration::from_secs(30),
-                                    socket.flush()
-                                ).await {
-                                    Ok(Ok(_)) => {}
-                                    Ok(Err(e)) => {
-                                        // Check for broken pipe on flush
-                                        if e.kind() == ErrorKind::BrokenPipe 
-                                            || e.kind() == ErrorKind::ConnectionReset {
-                                            warn!("Client disconnected during flush after {} rows", total_rows);
-                                            return Err(anyhow::anyhow!("Client disconnected"));
-                                        }
-                                        return Err(e.into());
-                                    }
-                                    Err(_) => {
-                                        warn!("Flush timeout - client may be unresponsive after {} rows", total_rows);
-                                        // Continue but log the issue
+                                    Err(e) => {
+                                        // Timeout or other error - client too slow
+                                        warn!("Flush failed: {} - client may be overwhelmed", e);
+                                        return Err(anyhow::anyhow!("Client too slow: {}", e));
                                     }
                                 }
-                                batch_rows = 0;
                             }
 
                             // Periodically check if client is still connected
-                            if total_rows % connection_check_interval == 0 {
-                                if !is_client_connected(socket).await {
-                                    warn!("Client disconnected during streaming after {} rows", total_rows);
+                            if writer.should_check_connection() {
+                                if !writer.is_connected().await {
+                                    let stats = writer.stats();
+                                    warn!("Client disconnected during streaming after {} rows", stats.rows_sent);
                                     return Err(anyhow::anyhow!("Client disconnected"));
                                 }
                                 
-                                // Log progress for large queries
-                                debug!("Streaming progress: {} rows sent, client still connected", total_rows);
+                                let stats = writer.stats();
+                                debug!("Streaming progress: {} rows, {} bytes, {} flushes", 
+                                    stats.rows_sent, stats.bytes_sent, stats.flush_count);
                             }
 
                             // Log progress for very large queries
-                            if total_rows % 1_000_000 == 0 {
-                                info!("Streaming progress: {} rows sent", total_rows);
+                            let stats = writer.stats();
+                            if stats.rows_sent % 1_000_000 == 0 && stats.rows_sent > 0 {
+                                info!("Streaming progress: {} rows, {} MB sent", 
+                                    stats.rows_sent, stats.bytes_sent / (1024 * 1024));
                             }
                         }
                     }
@@ -3402,14 +3443,27 @@ async fn execute_query_streaming_to_worker_impl(
 
     // If no columns were sent (empty result) and not in extended protocol, send empty row description
     if !columns_sent && !skip_row_description {
-        send_row_description(socket, &[], &[]).await?;
+        let row_desc = build_row_description(&[], &[]);
+        writer.write_bytes(&row_desc).await?;
     }
 
     // Send CommandComplete
-    let tag = format!("SELECT {}", total_rows);
-    send_command_complete(socket, &tag).await?;
+    let stats = writer.stats();
+    let tag = format!("SELECT {}", stats.rows_sent);
+    let cmd_complete = build_command_complete(&tag);
+    writer.write_bytes(&cmd_complete).await?;
 
-    Ok(total_rows)
+    // Final flush to ensure all data is sent
+    writer.force_flush().await?;
+
+    let final_stats = writer.stats();
+    info!(
+        "Streaming complete: {} rows, {} bytes, {} flushes ({} slow)",
+        final_stats.rows_sent, final_stats.bytes_sent, 
+        final_stats.flush_count, final_stats.slow_flush_count
+    );
+
+    Ok(final_stats.rows_sent)
 }
 
 /// Stream query results using the default worker client
@@ -3424,6 +3478,8 @@ async fn execute_query_streaming_default(
 }
 
 /// Stream query results using the default worker client - internal implementation
+/// 
+/// Uses BackpressureWriter for proper flow control to prevent client overwhelm.
 #[allow(dead_code)]
 async fn execute_query_streaming_default_impl(
     socket: &mut tokio::net::TcpStream,
@@ -3432,20 +3488,23 @@ async fn execute_query_streaming_default_impl(
     user_id: &str,
     skip_row_description: bool,
 ) -> anyhow::Result<usize> {
-    use tokio::io::AsyncWriteExt;
-    use std::io::ErrorKind;
-
-    // Load config for connection check interval
+    // Load backpressure config
     let config = PgWireConfig::default();
-    let connection_check_interval = config.connection_check_interval_rows;
+    let bp_config = BackpressureConfig {
+        flush_threshold_bytes: config.flush_threshold_bytes,
+        flush_threshold_rows: config.flush_threshold_rows,
+        flush_timeout_secs: config.flush_timeout_secs,
+        connection_check_interval_rows: config.connection_check_interval_rows,
+        write_buffer_size: config.write_buffer_size,
+    };
 
     // For the default path, we still need to use the existing client
     // but we'll stream the results to the client as they come
     match worker_client.execute_query_streaming(sql, user_id).await {
         Ok(mut stream) => {
+            // Create backpressure-aware writer with reborrow
+            let mut writer = BackpressureWriter::new(&mut *socket, bp_config);
             let mut columns_sent = false;
-            let mut total_rows: usize = 0;
-            let mut batch_rows: usize = 0;
 
             while let Some(batch) = stream.next().await {
                 match batch? {
@@ -3455,54 +3514,53 @@ async fn execute_query_streaming_default_impl(
                     } => {
                         // Send RowDescription once (unless in Extended Protocol where Describe already sent it)
                         if !columns_sent && !skip_row_description {
-                            send_row_description(socket, &columns, &column_types).await?;
+                            let row_desc = build_row_description(&columns, &column_types);
+                            writer.write_bytes(&row_desc).await?;
                         }
                         columns_sent = true;
                     }
                     StreamingBatch::Rows(rows) => {
                         for row in rows {
-                            // Check for client disconnect during streaming
-                            match send_data_row(socket, &row).await {
+                            // Build and write DataRow with backpressure tracking
+                            let data_row = build_data_row(&row);
+                            
+                            match writer.write_bytes(&data_row).await {
                                 Ok(_) => {}
-                                Err(e) => {
-                                    let is_disconnect = e.to_string().contains("Broken pipe")
-                                        || e.to_string().contains("Connection reset");
-                                    if is_disconnect {
-                                        warn!("Client disconnected during streaming after {} rows", total_rows);
+                                Err(e) if is_disconnect_error(&e) => {
+                                    let stats = writer.stats();
+                                    warn!("Client disconnected during streaming after {} rows", stats.rows_sent);
+                                    return Err(anyhow::anyhow!("Client disconnected"));
+                                }
+                                Err(e) => return Err(e.into()),
+                            }
+                            writer.row_sent();
+
+                            // Check if we should flush (based on bytes AND rows)
+                            if writer.should_flush() {
+                                match writer.flush_with_backpressure().await {
+                                    Ok(true) => {} // Normal flush
+                                    Ok(false) => {
+                                        // Slow client - continue but log
+                                        let stats = writer.stats();
+                                        debug!("Slow client detected after {} rows", stats.rows_sent);
+                                    }
+                                    Err(e) if is_disconnect_error(&e) => {
+                                        let stats = writer.stats();
+                                        warn!("Client disconnected during flush after {} rows", stats.rows_sent);
                                         return Err(anyhow::anyhow!("Client disconnected"));
                                     }
-                                    return Err(e);
-                                }
-                            }
-                            total_rows += 1;
-                            batch_rows += 1;
-
-                            if batch_rows >= STREAMING_BATCH_SIZE {
-                                // Flush with timeout to detect slow/dead clients
-                                match tokio::time::timeout(
-                                    Duration::from_secs(30),
-                                    socket.flush()
-                                ).await {
-                                    Ok(Ok(_)) => {}
-                                    Ok(Err(e)) => {
-                                        if e.kind() == ErrorKind::BrokenPipe 
-                                            || e.kind() == ErrorKind::ConnectionReset {
-                                            warn!("Client disconnected during flush after {} rows", total_rows);
-                                            return Err(anyhow::anyhow!("Client disconnected"));
-                                        }
-                                        return Err(e.into());
-                                    }
-                                    Err(_) => {
-                                        warn!("Flush timeout after {} rows", total_rows);
+                                    Err(e) => {
+                                        warn!("Flush failed: {} - client may be overwhelmed", e);
+                                        return Err(anyhow::anyhow!("Client too slow: {}", e));
                                     }
                                 }
-                                batch_rows = 0;
                             }
 
                             // Periodically check if client is still connected
-                            if total_rows % connection_check_interval == 0 {
-                                if !is_client_connected(socket).await {
-                                    warn!("Client disconnected during streaming after {} rows", total_rows);
+                            if writer.should_check_connection() {
+                                if !writer.is_connected().await {
+                                    let stats = writer.stats();
+                                    warn!("Client disconnected during streaming after {} rows", stats.rows_sent);
                                     return Err(anyhow::anyhow!("Client disconnected"));
                                 }
                             }
@@ -3516,13 +3574,25 @@ async fn execute_query_streaming_default_impl(
 
             // If no columns were sent and not in extended protocol, send empty row description
             if !columns_sent && !skip_row_description {
-                send_row_description(socket, &[], &[]).await?;
+                let row_desc = build_row_description(&[], &[]);
+                writer.write_bytes(&row_desc).await?;
             }
 
-            let tag = format!("SELECT {}", total_rows);
-            send_command_complete(socket, &tag).await?;
+            let stats = writer.stats();
+            let tag = format!("SELECT {}", stats.rows_sent);
+            let cmd_complete = build_command_complete(&tag);
+            writer.write_bytes(&cmd_complete).await?;
 
-            Ok(total_rows)
+            // Final flush
+            writer.force_flush().await?;
+
+            let final_stats = writer.stats();
+            debug!(
+                "Streaming complete: {} rows, {} bytes, {} flushes",
+                final_stats.rows_sent, final_stats.bytes_sent, final_stats.flush_count
+            );
+
+            Ok(final_stats.rows_sent)
         }
         Err(e) => {
             // Fallback to non-streaming for compatibility
