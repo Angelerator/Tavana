@@ -2061,12 +2061,47 @@ where
                         // We can't execute parameterized queries during Describe because we don't have
                         // the parameter values yet (they come in Bind message)
                         let has_parameters = sql.contains("$1") || sql.contains("$2") || sql.contains("$3");
+                        let sql_upper = sql.to_uppercase();
                         
                         if has_parameters {
-                            // For parameterized queries, we can't execute to get schema
-                            // Send NoData for now - the actual execution will happen in Execute phase
-                            debug!("Extended Protocol - Describe: parameterized query detected, deferring to Execute");
-                            socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                            // For pg_catalog parameterized queries (common in JDBC metadata),
+                            // return appropriate column schemas without executing
+                            if sql_upper.contains("PG_CATALOG") || sql_upper.contains("PG_TYPE") 
+                                || sql_upper.contains("PG_CLASS") || sql_upper.contains("PG_NAMESPACE")
+                                || sql_upper.contains("PG_ATTRIBUTE") || sql_upper.contains("PG_PROC") {
+                                // Return empty result with appropriate schema for pg_catalog queries
+                                // Most JDBC drivers query these for type information
+                                let columns = if sql_upper.contains("PG_TYPE") {
+                                    vec![
+                                        ("oid".to_string(), "int4".to_string()),
+                                        ("typname".to_string(), "text".to_string()),
+                                        ("typnamespace".to_string(), "int4".to_string()),
+                                        ("typlen".to_string(), "int2".to_string()),
+                                        ("typtype".to_string(), "text".to_string()),
+                                    ]
+                                } else if sql_upper.contains("PG_CLASS") {
+                                    vec![
+                                        ("oid".to_string(), "int4".to_string()),
+                                        ("relname".to_string(), "text".to_string()),
+                                        ("relnamespace".to_string(), "int4".to_string()),
+                                        ("relkind".to_string(), "text".to_string()),
+                                    ]
+                                } else {
+                                    vec![
+                                        ("oid".to_string(), "int4".to_string()),
+                                        ("name".to_string(), "text".to_string()),
+                                    ]
+                                };
+                                info!("Extended Protocol - Describe: pg_catalog parameterized query, returning {} column schema", columns.len());
+                                __describe_column_count = columns.len();
+                                send_row_description_generic(socket, &columns).await?;
+                                describe_sent_row_description = true;
+                            } else {
+                                // For other parameterized queries, we can't execute to get schema
+                                // Send NoData - the actual execution will happen in Execute phase
+                                debug!("Extended Protocol - Describe: parameterized query detected, deferring to Execute");
+                                socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                            }
                         } else {
                             // Non-parameterized query - safe to execute to get column info
                             match worker_client.execute_query(sql, user_id).await {
