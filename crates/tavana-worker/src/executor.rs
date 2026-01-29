@@ -92,13 +92,16 @@ impl DuckDbExecutor {
         let memory_per_conn = config.max_memory / pool_size as u64;
         let threads_per_conn = (config.threads / pool_size as u32).max(1);
 
-        // For I/O-bound remote workloads, use more threads regardless of CPU
-        let threads_for_display = threads_per_conn.max(8);
+        // For I/O-bound remote workloads, use 4× CPU cores for aggressive parallelism
+        let remote_threads = std::env::var("DUCKDB_REMOTE_THREADS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or_else(|| (num_cpus::get() as u32 * 4).max(32));
         info!(
-            "Initializing DuckDB connection pool: {} connections, {}MB each, {} threads each (optimized for Azure I/O)",
+            "Initializing DuckDB connection pool: {} connections, {}MB each, {} threads each (4× CPU for Azure I/O)",
             pool_size,
             memory_per_conn / 1024 / 1024,
-            threads_for_display
+            remote_threads
         );
 
         let mut connections = Vec::with_capacity(pool_size);
@@ -363,28 +366,48 @@ impl DuckDbExecutor {
             tracing::warn!("Could not set max_temp_directory_size: {}", e);
         }
 
-        // Increase threads for remote file parallelism (Azure/S3)
-        // DuckDB uses synchronous I/O for remote files, so more threads = better I/O parallelism
-        // For I/O-bound workloads (Azure Storage), threads don't need to match CPU cores
-        // Use at least 8 threads per connection for good parallel HTTP requests
-        let threads_for_remote = threads.max(8);
-        if let Err(e) =
-            connection.execute(&format!("SET threads = {}", threads_for_remote), params![])
-        {
-            tracing::warn!("Could not increase threads for remote: {}", e);
-        }
+        // ============= AGGRESSIVE I/O PARALLELISM FOR AZURE/REMOTE FILES =============
+        // DuckDB documentation recommends 2-5× CPU cores for remote file workloads
+        // because DuckDB uses synchronous I/O and each thread makes one HTTP request at a time.
+        // https://duckdb.org/docs/stable/guides/performance/how_to_tune_workloads#querying-remote-files
+        //
+        // For 218s -> 10s (22× improvement), we need maximum parallelism:
+        // - Current: 8 threads = 8 concurrent HTTP requests
+        // - Target: 64 threads = 64 concurrent HTTP requests (8× more parallelism)
+        let threads_for_remote = std::env::var("DUCKDB_REMOTE_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                // Use 4× CPU cores for remote I/O, minimum 32 threads
+                let cpu_cores = num_cpus::get() as u32;
+                (cpu_cores * 4).max(32)
+            });
         
-        // Enable HTTP keep-alive for faster repeated requests to Azure
+        if let Err(e) = connection.execute(&format!("SET threads = {}", threads_for_remote), params![]) {
+            tracing::warn!("Could not set threads for remote: {}", e);
+        }
+        tracing::info!("DuckDB threads set to {} for Azure I/O parallelism", threads_for_remote);
+        
+        // Enable HTTP keep-alive for connection reuse (reduces latency)
         if let Err(e) = connection.execute("SET http_keep_alive = true", params![]) {
             tracing::warn!("Could not enable http_keep_alive: {}", e);
         }
         
-        // Set larger HTTP retry settings for Azure reliability
+        // Increase HTTP timeout for large Azure operations (default 30s may be too short)
+        if let Err(e) = connection.execute("SET http_timeout = 120", params![]) {
+            tracing::warn!("Could not set http_timeout: {}", e);
+        }
+        
+        // Aggressive retry settings for Azure reliability
         if let Err(e) = connection.execute("SET http_retries = 5", params![]) {
             tracing::warn!("Could not set http_retries: {}", e);
         }
-        if let Err(e) = connection.execute("SET http_retry_wait_ms = 500", params![]) {
+        if let Err(e) = connection.execute("SET http_retry_wait_ms = 200", params![]) {
             tracing::warn!("Could not set http_retry_wait_ms: {}", e);
+        }
+        // Reduce backoff factor for faster retries
+        if let Err(e) = connection.execute("SET http_retry_backoff = 2", params![]) {
+            tracing::debug!("Could not set http_retry_backoff: {}", e);
         }
         
         // ============= DuckDB Performance Optimizations for Azure/Delta =============
@@ -414,6 +437,16 @@ impl DuckDbExecutor {
         // (only affects queries without ORDER BY)
         if let Err(e) = connection.execute("SET preserve_insertion_order = false", params![]) {
             tracing::debug!("preserve_insertion_order not available: {}", e);
+        }
+        
+        // Allow external threads (for background I/O operations)
+        if let Err(e) = connection.execute("SET external_threads = 4", params![]) {
+            tracing::debug!("external_threads not available: {}", e);
+        }
+        
+        // Enable allocator background threads for better memory management
+        if let Err(e) = connection.execute("SET allocator_background_threads = true", params![]) {
+            tracing::debug!("allocator_background_threads not available: {}", e);
         }
 
         // Configure Azure authentication from environment variables
