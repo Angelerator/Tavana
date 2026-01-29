@@ -187,6 +187,33 @@ async fn is_client_connected(stream: &tokio::net::TcpStream) -> bool {
 // Legacy constant for backwards compatibility (when config is not passed)
 const STREAMING_BATCH_SIZE: usize = 100;
 
+/// Substitute $1, $2, etc. parameters in SQL with actual values
+/// This converts PostgreSQL-style parameterized queries to literal SQL
+fn substitute_parameters(sql: &str, params: &[Option<String>]) -> String {
+    let mut result = sql.to_string();
+    
+    // Replace parameters in reverse order to avoid $1 matching $10, $11, etc.
+    for (i, param) in params.iter().enumerate().rev() {
+        let placeholder = format!("${}", i + 1);
+        let replacement = match param {
+            Some(value) => {
+                // Escape single quotes in the value
+                let escaped = value.replace('\'', "''");
+                // Check if it's a number (don't quote numbers)
+                if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {
+                    escaped
+                } else {
+                    format!("'{}'", escaped)
+                }
+            }
+            None => "NULL".to_string(),
+        };
+        result = result.replace(&placeholder, &replacement);
+    }
+    
+    result
+}
+
 /// Apply automatic LIMIT to SELECT queries that don't have one
 /// This prevents client OOM by limiting result size (like ClickHouse max_result_rows)
 /// 
@@ -1584,6 +1611,8 @@ where
     // Portal state for Extended Query Protocol cursor streaming
     // Stores buffered rows and offset for resumption after PortalSuspended
     let mut portal_state: Option<PortalState> = None;
+    // Bound parameter values from Bind message (for parameterized queries)
+    let mut bound_parameters: Vec<Option<String>> = Vec::new();
     
     // Helper macro to update ready message when transaction status changes
     macro_rules! update_transaction_status {
@@ -1900,24 +1929,63 @@ where
                 while offset < data.len() && data[offset] != 0 { offset += 1; }
                 offset += 1;
                 
-                // Skip parameter format codes
+                // Parse parameter format codes (text=0, binary=1)
+                let mut param_formats: Vec<i16> = Vec::new();
                 if offset + 2 <= data.len() {
                     let param_format_count = i16::from_be_bytes([data[offset], data[offset+1]]) as usize;
-                    offset += 2 + param_format_count * 2;
+                    offset += 2;
+                    for _ in 0..param_format_count {
+                        if offset + 2 <= data.len() {
+                            param_formats.push(i16::from_be_bytes([data[offset], data[offset+1]]));
+                            offset += 2;
+                        }
+                    }
                 }
                 
-                // Skip parameter values
+                // Extract parameter values and store them
+                bound_parameters.clear();
                 if offset + 2 <= data.len() {
                     let param_count = i16::from_be_bytes([data[offset], data[offset+1]]) as usize;
                     offset += 2;
-                    for _ in 0..param_count {
+                    for i in 0..param_count {
                         if offset + 4 <= data.len() {
                             let param_len = i32::from_be_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
                             offset += 4;
-                            if param_len > 0 {
+                            if param_len < 0 {
+                                // NULL parameter
+                                bound_parameters.push(None);
+                            } else if param_len == 0 {
+                                // Empty string
+                                bound_parameters.push(Some(String::new()));
+                            } else if offset + param_len as usize <= data.len() {
+                                // Check format - binary (1) or text (0)
+                                let is_binary = param_formats.get(i).copied().unwrap_or(
+                                    param_formats.first().copied().unwrap_or(0)
+                                ) == 1;
+                                
+                                if is_binary {
+                                    // Binary format - convert based on type (for now, assume int4/int8)
+                                    let bytes = &data[offset..offset + param_len as usize];
+                                    let value = match param_len {
+                                        4 => i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).to_string(),
+                                        8 => i64::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]).to_string(),
+                                        _ => {
+                                            // Unknown binary format, try as text
+                                            String::from_utf8_lossy(bytes).to_string()
+                                        }
+                                    };
+                                    bound_parameters.push(Some(value));
+                                } else {
+                                    // Text format
+                                    let value = String::from_utf8_lossy(&data[offset..offset + param_len as usize]).to_string();
+                                    bound_parameters.push(Some(value));
+                                }
                                 offset += param_len as usize;
                             }
                         }
+                    }
+                    if !bound_parameters.is_empty() {
+                        debug!("Bind: extracted {} parameters: {:?}", bound_parameters.len(), bound_parameters);
                     }
                 }
                 
@@ -1989,28 +2057,40 @@ where
                             describe_sent_row_description = true;
                         }
                     } else {
-                        // Execute query to get column info
-                        match worker_client.execute_query(sql, user_id).await {
-                            Ok(result) => {
-                                let columns: Vec<(String, String)> = result.columns.iter()
-                                    .map(|c| (c.name.clone(), c.type_name.clone()))
-                                    .collect();
-                                if columns.is_empty() {
-                                    debug!("Extended Protocol - Describe: query returns no columns");
-                                    socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
-                                } else {
-                                    info!("Extended Protocol - Describe: query returns {} columns: {:?}", 
-                                        columns.len(), 
-                                        columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
-                                    );
-                                    __describe_column_count = columns.len();
-                                    send_row_description_generic(socket, &columns).await?;
-                                    describe_sent_row_description = true;
+                        // Check if query has parameters ($1, $2, etc.)
+                        // We can't execute parameterized queries during Describe because we don't have
+                        // the parameter values yet (they come in Bind message)
+                        let has_parameters = sql.contains("$1") || sql.contains("$2") || sql.contains("$3");
+                        
+                        if has_parameters {
+                            // For parameterized queries, we can't execute to get schema
+                            // Send NoData for now - the actual execution will happen in Execute phase
+                            debug!("Extended Protocol - Describe: parameterized query detected, deferring to Execute");
+                            socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                        } else {
+                            // Non-parameterized query - safe to execute to get column info
+                            match worker_client.execute_query(sql, user_id).await {
+                                Ok(result) => {
+                                    let columns: Vec<(String, String)> = result.columns.iter()
+                                        .map(|c| (c.name.clone(), c.type_name.clone()))
+                                        .collect();
+                                    if columns.is_empty() {
+                                        debug!("Extended Protocol - Describe: query returns no columns");
+                                        socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                                    } else {
+                                        info!("Extended Protocol - Describe: query returns {} columns: {:?}", 
+                                            columns.len(), 
+                                            columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+                                        );
+                                        __describe_column_count = columns.len();
+                                        send_row_description_generic(socket, &columns).await?;
+                                        describe_sent_row_description = true;
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                warn!("Extended Protocol - Describe: query failed: {}, sending NoData", e);
-                                socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                                Err(e) => {
+                                    warn!("Extended Protocol - Describe: query failed: {}, sending NoData", e);
+                                    socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                                }
                             }
                         }
                     }
@@ -2068,6 +2148,7 @@ where
                         prepared_query = None;
                         describe_sent_row_description = false;
                         __describe_column_count = 0;
+                        bound_parameters.clear();
                     } else {
                         // More rows available
                         socket.write_all(&[b's', 0, 0, 0, 4]).await?; // PortalSuspended
@@ -2076,9 +2157,19 @@ where
                     }
                 } else if let Some(ref sql) = prepared_query {
                     // First Execute - need to run query
+                    // Substitute parameters if any were bound
+                    let final_sql = if !bound_parameters.is_empty() && sql.contains('$') {
+                        let substituted = substitute_parameters(sql, &bound_parameters);
+                        debug!("Extended Protocol - Execute: substituted parameters, SQL: {}", 
+                            &substituted[..substituted.len().min(200)]);
+                        substituted
+                    } else {
+                        sql.clone()
+                    };
+                    
                     // CRITICAL: If Describe sent NoData, we MUST NOT send DataRows
                     if !describe_sent_row_description {
-                        let cmd_tag = if let Some(result) = handle_pg_specific_command(sql) {
+                        let cmd_tag = if let Some(result) = handle_pg_specific_command(&final_sql) {
                             result.command_tag.unwrap_or_else(|| "SELECT 0".to_string())
                         } else {
                             "SELECT 0".to_string()
@@ -2089,7 +2180,7 @@ where
                     } else {
                         // FIRST: Check if this is an intercepted command (like Tableau temp table SELECT)
                         // If so, return the fake rows instead of executing against worker
-                        if let Some(result) = handle_pg_specific_command(sql) {
+                        if let Some(result) = handle_pg_specific_command(&final_sql) {
                             if !result.rows.is_empty() {
                                 info!("Extended Protocol - Execute: Intercepted command returns {} rows", result.rows.len());
                                 for row in &result.rows {
@@ -2102,6 +2193,7 @@ where
                                 prepared_query = None;
                                 describe_sent_row_description = false;
                                 __describe_column_count = 0;
+                                bound_parameters.clear();
                                 continue;
                             }
                         }
@@ -2115,7 +2207,7 @@ where
                         let timeout_duration = Duration::from_secs(config.query_timeout_secs);
                         let query_result = tokio::time::timeout(
                             timeout_duration,
-                            execute_query_get_rows(worker_client, query_router, sql, user_id, smart_scaler)
+                            execute_query_get_rows(worker_client, query_router, &final_sql, user_id, smart_scaler)
                         ).await;
                         
                         match query_result {
@@ -2200,6 +2292,7 @@ where
                     prepared_query = None;
                     describe_sent_row_description = false;
                     __describe_column_count = 0;
+                    bound_parameters.clear();
                 } else {
                     // No prepared statement - send empty CommandComplete
                     debug!("Extended Protocol - Execute: no prepared query");
@@ -2221,6 +2314,7 @@ where
                 describe_sent_row_description = false;
                 __describe_column_count = 0;
                 portal_state = None; // Clear buffered rows
+                bound_parameters.clear();
                 
                 // Send CloseComplete
                 socket.write_all(&[b'3', 0, 0, 0, 4]).await?;
