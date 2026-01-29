@@ -68,12 +68,13 @@ impl Default for BackpressureConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100),
 
-            // 5 seconds - aggressive timeout to detect slow clients
-            // This is much shorter than the previous 30 seconds
+            // 300 seconds (5 minutes) - StarRocks-style patient waiting for slow clients
+            // Key insight: Don't disconnect slow clients, wait for TCP backpressure to work
+            // This matches StarRocks' Channels.writeBlocking() which blocks indefinitely
             flush_timeout_secs: std::env::var("TAVANA_FLUSH_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(5),
+                .unwrap_or(300),
 
             // Check connection every 500 rows
             connection_check_interval_rows: std::env::var("TAVANA_CONNECTION_CHECK_INTERVAL_ROWS")
@@ -153,12 +154,16 @@ impl<W: AsyncWrite + Unpin> BackpressureWriter<W> {
             && self.stats.rows_sent > 0
     }
 
-    /// Perform a backpressure-aware flush
+    /// Perform a backpressure-aware flush with StarRocks-style retry behavior
+    ///
+    /// This implements the key insight from StarRocks: NEVER disconnect slow clients.
+    /// StarRocks uses `Channels.writeBlocking()` which blocks indefinitely.
+    /// We implement this by retrying flushes that timeout instead of failing.
     ///
     /// Returns:
     /// - Ok(true) if flush succeeded normally
     /// - Ok(false) if flush succeeded but was slow (client may be overwhelmed)
-    /// - Err if client disconnected or flush failed
+    /// - Err ONLY if client actually disconnected (BrokenPipe, ConnectionReset, etc.)
     pub async fn flush_with_backpressure(&mut self) -> Result<bool, std::io::Error> {
         if self.bytes_since_flush == 0 {
             return Ok(true);
@@ -166,50 +171,73 @@ impl<W: AsyncWrite + Unpin> BackpressureWriter<W> {
 
         let timeout = Duration::from_secs(self.config.flush_timeout_secs);
         let flush_start = std::time::Instant::now();
+        let mut retry_count = 0;
+        const MAX_RETRIES: u32 = 100; // Safety limit - 100 * 300s = 8+ hours max wait
 
-        match tokio::time::timeout(timeout, self.writer.flush()).await {
-            Ok(Ok(())) => {
-                let elapsed = flush_start.elapsed();
-                self.stats.flush_count += 1;
-                self.bytes_since_flush = 0;
-                self.rows_since_flush = 0;
+        loop {
+            match tokio::time::timeout(timeout, self.writer.flush()).await {
+                Ok(Ok(())) => {
+                    let elapsed = flush_start.elapsed();
+                    self.stats.flush_count += 1;
+                    self.bytes_since_flush = 0;
+                    self.rows_since_flush = 0;
 
-                // If flush took more than 1 second, client is getting slow
-                if elapsed.as_secs() >= 1 {
-                    self.stats.slow_flush_count += 1;
-                    debug!(
-                        "Slow flush detected: {}ms for {} bytes ({} rows)",
-                        elapsed.as_millis(),
-                        self.bytes_since_flush,
-                        self.rows_since_flush
-                    );
-                    return Ok(false);
+                    // If flush took more than 10 seconds, client is getting slow
+                    if elapsed.as_secs() >= 10 {
+                        self.stats.slow_flush_count += 1;
+                        debug!(
+                            "Slow flush completed: {}ms for {} bytes after {} retries",
+                            elapsed.as_millis(),
+                            self.stats.bytes_sent,
+                            retry_count
+                        );
+                        return Ok(false);
+                    }
+
+                    return Ok(true);
                 }
-
-                Ok(true)
-            }
-            Ok(Err(e)) => {
-                // Check for connection errors
-                if is_disconnect_error(&e) {
-                    warn!(
-                        "Client disconnected during flush after {} rows, {} bytes",
-                        self.stats.rows_sent, self.stats.bytes_sent
-                    );
+                Ok(Err(e)) => {
+                    // Check for actual connection errors - only these are fatal
+                    if is_disconnect_error(&e) {
+                        warn!(
+                            "Client disconnected during flush after {} rows, {} bytes",
+                            self.stats.rows_sent, self.stats.bytes_sent
+                        );
+                        return Err(e);
+                    }
+                    // For other errors, return them as-is
+                    return Err(e);
                 }
-                Err(e)
-            }
-            Err(_) => {
-                // Timeout - client is too slow
-                warn!(
-                    "Flush timeout after {}s - client overwhelmed after {} rows, {} bytes",
-                    self.config.flush_timeout_secs,
-                    self.stats.rows_sent,
-                    self.stats.bytes_sent
-                );
-                Err(std::io::Error::new(
-                    ErrorKind::TimedOut,
-                    "Client too slow - flush timeout",
-                ))
+                Err(_) => {
+                    // Timeout - StarRocks-style: DON'T fail, just keep waiting
+                    // This is the key difference from before: we retry instead of failing
+                    retry_count += 1;
+                    
+                    if retry_count >= MAX_RETRIES {
+                        warn!(
+                            "Flush exceeded max retries ({}) after {} rows - giving up",
+                            MAX_RETRIES, self.stats.rows_sent
+                        );
+                        return Err(std::io::Error::new(
+                            ErrorKind::TimedOut,
+                            format!("Client too slow - exceeded {} flush retries", MAX_RETRIES),
+                        ));
+                    }
+                    
+                    // Log progress but keep trying
+                    if retry_count == 1 || retry_count % 10 == 0 {
+                        warn!(
+                            "Flush timeout #{} after {}s - client slow, waiting (StarRocks-style). {} rows sent so far",
+                            retry_count,
+                            self.config.flush_timeout_secs,
+                            self.stats.rows_sent
+                        );
+                    }
+                    
+                    // Small delay before retry to avoid tight loop
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    // Continue the loop to retry
+                }
             }
         }
     }
