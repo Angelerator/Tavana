@@ -23,6 +23,7 @@
 
 // Utility modules (new modular structure)
 pub mod auth;
+pub mod backpressure;
 pub mod config;
 pub mod connection;
 pub mod protocol;
