@@ -242,6 +242,31 @@ impl TavanaFlightSqlService {
             .map(|result| result.map_err(|e| Status::internal(format!("Encoding error: {}", e))));
         Box::pin(flight_data_stream)
     }
+
+    /// Get the schema of a query by executing it with LIMIT 0
+    /// 
+    /// This is the recommended approach per the Arrow Flight SQL specification
+    /// to determine the result schema without fetching actual data.
+    async fn get_query_schema(&self, sql: &str) -> Result<SchemaRef, Status> {
+        // Wrap the query with LIMIT 0 to get schema without data
+        // Use a subquery to handle all SQL types correctly
+        let schema_query = format!("SELECT * FROM ({}) AS _schema_query LIMIT 0", sql.trim_end_matches(';'));
+        
+        debug!("Determining schema with query: {}", &schema_query[..schema_query.len().min(100)]);
+        
+        let result = self
+            .worker_client
+            .execute_query(&schema_query, "schema-detection")
+            .await
+            .map_err(|e| Status::internal(format!("Schema detection failed: {}", e)))?;
+
+        // Build Arrow schema from columns
+        let fields: Vec<Field> = result.columns.iter()
+            .map(|c| Field::new(&c.name, DataType::Utf8, true))
+            .collect();
+        
+        Ok(Arc::new(Schema::new(fields)))
+    }
 }
 
 type BoxedFlightStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -615,6 +640,10 @@ impl FlightSqlService for TavanaFlightSqlService {
     }
 
     /// Create prepared statement
+    /// 
+    /// Per the Arrow Flight SQL spec, the dataset_schema is optional but if provided,
+    /// should represent the schema of the result set. We execute the query with LIMIT 0
+    /// to determine the actual schema without fetching data.
     async fn do_action_create_prepared_statement(
         &self,
         query: ActionCreatePreparedStatementRequest,
@@ -625,11 +654,13 @@ impl FlightSqlService for TavanaFlightSqlService {
 
         let handle = Self::generate_handle();
         
-        // For prepared statements, we'll use a placeholder schema
-        // Real schema would be determined at execution time
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("result", DataType::Utf8, true),
-        ]));
+        // Determine the actual schema by executing the query with LIMIT 0
+        // This follows the Flight SQL spec which states the schema should be accurate
+        // See: https://arrow.apache.org/docs/format/FlightSql.html
+        let schema = self.get_query_schema(&sql).await.unwrap_or_else(|e| {
+            warn!("Failed to determine schema for prepared statement, using empty schema: {}", e);
+            Arc::new(Schema::empty())
+        });
         
         self.prepared_statements.insert(
             handle.clone(),
@@ -640,11 +671,16 @@ impl FlightSqlService for TavanaFlightSqlService {
             },
         );
 
-        // Serialize schema for the response
-        let message = arrow_flight::SchemaAsIpc::new(&schema, &IpcWriteOptions::default())
-            .try_into()
-            .map_err(|e: arrow_schema::ArrowError| Status::internal(format!("Unable to serialize schema: {}", e)))?;
-        let arrow_flight::IpcMessage(schema_bytes) = message;
+        // Serialize schema for the response (empty if we couldn't determine it)
+        let schema_bytes = if schema.fields().is_empty() {
+            Bytes::new()
+        } else {
+            let message = arrow_flight::SchemaAsIpc::new(&schema, &IpcWriteOptions::default())
+                .try_into()
+                .map_err(|e: arrow_schema::ArrowError| Status::internal(format!("Unable to serialize schema: {}", e)))?;
+            let arrow_flight::IpcMessage(bytes) = message;
+            bytes
+        };
 
         Ok(ActionCreatePreparedStatementResult {
             prepared_statement_handle: handle.into_bytes().into(),
@@ -693,6 +729,9 @@ impl FlightSqlService for TavanaFlightSqlService {
     }
 
     /// Execute prepared statement and stream results
+    /// 
+    /// Uses the schema stored during prepared statement creation for consistency
+    /// with get_flight_info_prepared_statement, as required by Flight SQL spec.
     async fn do_get_prepared_statement(
         &self,
         cmd: CommandPreparedStatementQuery,
@@ -701,15 +740,20 @@ impl FlightSqlService for TavanaFlightSqlService {
         let handle = String::from_utf8_lossy(&cmd.prepared_statement_handle).to_string();
         let user = self.extract_user(&request);
         
-        let sql = self.prepared_statements
+        let (sql, stored_schema) = self.prepared_statements
             .get(&handle)
-            .map(|ps| ps.sql.clone())
+            .map(|ps| (ps.sql.clone(), ps.schema.clone()))
             .ok_or_else(|| Status::not_found(format!("Prepared statement {} not found", handle)))?;
 
         info!("Flight SQL do_get_prepared_statement: executing {}", handle);
 
         let batches = self.execute_query(&sql, &user).await?;
-        let schema = if batches.is_empty() {
+        
+        // Use stored schema if available, otherwise use schema from results
+        // This ensures consistency with get_flight_info_prepared_statement
+        let schema = if !stored_schema.fields().is_empty() {
+            stored_schema
+        } else if batches.is_empty() {
             Arc::new(Schema::empty())
         } else {
             batches[0].schema()

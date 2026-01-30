@@ -138,6 +138,73 @@ where
     Ok(())
 }
 
+/// Send a rich ErrorResponse with SQLSTATE code, message, hint, and detail
+/// This follows the PostgreSQL wire protocol ErrorResponse format:
+/// - 'S' Severity: ERROR
+/// - 'V' Severity (non-localized): ERROR  
+/// - 'C' SQLSTATE code
+/// - 'M' Message (primary human-readable message)
+/// - 'D' Detail (optional secondary message)
+/// - 'H' Hint (optional suggestion)
+pub async fn send_classified_error<S>(
+    socket: &mut S,
+    error: &crate::errors::ClassifiedError,
+) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut buf = Vec::new();
+    buf.push(b'E'); // ErrorResponse
+
+    let mut fields = Vec::new();
+    
+    // Severity (localized)
+    fields.push(b'S');
+    fields.extend_from_slice(b"ERROR");
+    fields.push(0);
+    
+    // Severity (non-localized, for programmatic use)
+    fields.push(b'V');
+    fields.extend_from_slice(b"ERROR");
+    fields.push(0);
+    
+    // SQLSTATE code
+    fields.push(b'C');
+    fields.extend_from_slice(error.sqlstate.as_bytes());
+    fields.push(0);
+    
+    // Primary message
+    fields.push(b'M');
+    fields.extend_from_slice(error.message.as_bytes());
+    fields.push(0);
+    
+    // Detail (if present)
+    if let Some(ref detail) = error.detail {
+        if !detail.is_empty() {
+            fields.push(b'D');
+            fields.extend_from_slice(detail.as_bytes());
+            fields.push(0);
+        }
+    }
+    
+    // Hint (if present)
+    if let Some(ref hint) = error.hint {
+        fields.push(b'H');
+        fields.extend_from_slice(hint.as_bytes());
+        fields.push(0);
+    }
+    
+    // Terminator
+    fields.push(0);
+
+    let len = (4 + fields.len()) as u32;
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(&fields);
+
+    socket.write_all(&buf).await?;
+    Ok(())
+}
+
 /// Send RowDescription message
 pub async fn send_row_description<S>(
     socket: &mut S,

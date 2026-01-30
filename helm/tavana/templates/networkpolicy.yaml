@@ -34,6 +34,11 @@ spec:
           port: {{ .Values.gateway.service.pgPort }}
         - protocol: TCP
           port: {{ .Values.gateway.service.httpPort }}
+        {{- if .Values.gateway.flightSql.enabled }}
+        # Arrow Flight SQL / ADBC port
+        - protocol: TCP
+          port: {{ .Values.gateway.flightSql.port }}
+        {{- end }}
 ---
 # Allow gateway to worker communication
 apiVersion: networking.k8s.io/v1
