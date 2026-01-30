@@ -204,24 +204,11 @@ pub fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
         });
     }
 
-    // Only intercept specific pg_catalog queries that DuckDB doesn't support:
-    if sql_upper.contains("PG_CATALOG.PG_CLASS")
-        || sql_upper.contains("PG_CATALOG.PG_NAMESPACE")
-        || sql_upper.contains("PG_CATALOG.PG_ATTRIBUTE")
-        || sql_upper.contains("PG_CATALOG.PG_TYPE")
-        || sql_upper.contains("PG_CATALOG.PG_PROC")
-    {
-        // Return empty for PostgreSQL-specific catalog queries
-        return Some(QueryExecutionResult {
-            columns: vec![
-                ("oid".to_string(), "int4".to_string()),
-                ("name".to_string(), "text".to_string()),
-            ],
-            rows: vec![],
-            row_count: 0,
-            command_tag: None,
-        });
-    }
+    // IMPORTANT: Do NOT intercept pg_catalog queries!
+    // DuckDB has full native pg_catalog support with real metadata:
+    // - pg_class, pg_namespace, pg_type, pg_attribute, pg_proc, pg_settings, etc.
+    // Let all pg_catalog queries pass through to DuckDB for proper client compatibility.
+    // Previously this returned empty results which broke DBeaver and other clients.
 
     None
 }

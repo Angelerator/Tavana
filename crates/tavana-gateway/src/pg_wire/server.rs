@@ -980,6 +980,31 @@ async fn handle_connection_with_tls(
                     config,
                 ).await;
             }
+            80877102 => {
+                // CancelRequest - client wants to cancel a running query
+                // The message format is: length (4) + code (4) + pid (4) + secret (4)
+                // We've already read the code, now we need pid and secret
+                let backend_pid = if startup_msg.len() >= 8 {
+                    u32::from_be_bytes([startup_msg[4], startup_msg[5], startup_msg[6], startup_msg[7]])
+                } else {
+                    0
+                };
+                let cancel_secret = if startup_msg.len() >= 12 {
+                    u32::from_be_bytes([startup_msg[8], startup_msg[9], startup_msg[10], startup_msg[11]])
+                } else {
+                    0
+                };
+                
+                warn!(
+                    backend_pid = backend_pid,
+                    "CancelRequest received. Query cancellation not yet fully implemented. \
+                     The query will continue running. Use LIMIT clause for large queries."
+                );
+                
+                // CancelRequest connections are closed immediately without response
+                // (per PostgreSQL protocol specification)
+                return Ok(());
+            }
             _ => {
                 // Normal startup message, process directly
             }
@@ -1054,6 +1079,11 @@ async fn handle_connection(
                     socket.write_all(&[b'N']).await?;
                     socket.flush().await?;
                     continue;
+                }
+                80877102 => {
+                    // CancelRequest - log and close
+                    warn!("CancelRequest received (query cancellation not fully implemented)");
+                    return Ok(());
                 }
                 _ => {}
                 }
@@ -1205,6 +1235,11 @@ where
                     socket.write_all(&[b'N']).await?;
                     socket.flush().await?;
                     continue;
+                }
+                80877102 => {
+                    // CancelRequest - log and close
+                    warn!("CancelRequest received via TLS (query cancellation not fully implemented)");
+                    return Ok(());
                 }
                 _ => {}
             }
@@ -1663,6 +1698,12 @@ where
     // Bound parameter values from Bind message (for parameterized queries)
     let mut bound_parameters: Vec<Option<String>> = Vec::new();
     
+    // Skip-till-sync flag for error recovery (PostgreSQL Extended Protocol pattern)
+    // When an error occurs during extended query protocol (Parse/Bind/Describe/Execute),
+    // we set this flag and skip all messages until we receive a Sync ('S') message.
+    // This prevents protocol desynchronization and allows clients to recover gracefully.
+    let mut ignore_till_sync = false;
+    
     // Helper macro to update ready message when transaction status changes
     macro_rules! update_transaction_status {
         ($new_status:expr) => {{
@@ -1684,6 +1725,21 @@ where
         if socket.read_exact(&mut msg_type).await.is_err() {
             debug!("Client disconnected (TLS)");
             break;
+        }
+
+        // Skip-till-sync: Skip all messages except Sync and Terminate when in error state
+        // This is the PostgreSQL protocol pattern for error recovery in extended query protocol.
+        // After an error, clients send Sync to resynchronize, and we skip everything until then.
+        if ignore_till_sync && msg_type[0] != b'S' && msg_type[0] != b'X' {
+            // Read and discard the message
+            socket.read_exact(&mut buf).await?;
+            let len = u32::from_be_bytes(buf) as usize - 4;
+            if len > 0 {
+                let mut skip_buf = vec![0u8; len];
+                socket.read_exact(&mut skip_buf).await?;
+            }
+            debug!("Skip-till-sync: Skipped message type '{}'", msg_type[0] as char);
+            continue;
         }
 
         match msg_type[0] {
@@ -2113,43 +2169,44 @@ where
                         let sql_upper = sql.to_uppercase();
                         
                         if has_parameters {
-                            // For pg_catalog parameterized queries (common in JDBC metadata),
-                            // return appropriate column schemas without executing
-                            if sql_upper.contains("PG_CATALOG") || sql_upper.contains("PG_TYPE") 
-                                || sql_upper.contains("PG_CLASS") || sql_upper.contains("PG_NAMESPACE")
-                                || sql_upper.contains("PG_ATTRIBUTE") || sql_upper.contains("PG_PROC") {
-                                // Return empty result with appropriate schema for pg_catalog queries
-                                // Most JDBC drivers query these for type information
-                                let columns = if sql_upper.contains("PG_TYPE") {
-                                    vec![
-                                        ("oid".to_string(), "int4".to_string()),
-                                        ("typname".to_string(), "text".to_string()),
-                                        ("typnamespace".to_string(), "int4".to_string()),
-                                        ("typlen".to_string(), "int2".to_string()),
-                                        ("typtype".to_string(), "text".to_string()),
-                                    ]
-                                } else if sql_upper.contains("PG_CLASS") {
-                                    vec![
-                                        ("oid".to_string(), "int4".to_string()),
-                                        ("relname".to_string(), "text".to_string()),
-                                        ("relnamespace".to_string(), "int4".to_string()),
-                                        ("relkind".to_string(), "text".to_string()),
-                                    ]
-                                } else {
-                                    vec![
-                                        ("oid".to_string(), "int4".to_string()),
-                                        ("name".to_string(), "text".to_string()),
-                                    ]
-                                };
-                                info!("Extended Protocol - Describe: pg_catalog parameterized query, returning {} column schema", columns.len());
-                                __describe_column_count = columns.len();
-                                send_row_description_generic(socket, &columns).await?;
-                                describe_sent_row_description = true;
-                            } else {
-                                // For other parameterized queries, we can't execute to get schema
-                                // Send NoData - the actual execution will happen in Execute phase
-                                debug!("Extended Protocol - Describe: parameterized query detected, deferring to Execute");
-                                socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                            // For parameterized queries, try to get schema by replacing params with NULL
+                            // This works for most queries including pg_catalog
+                            // DuckDB has full native pg_catalog support, so we get real schemas
+                            let schema_sql = sql
+                                .replace("$1", "NULL")
+                                .replace("$2", "NULL")
+                                .replace("$3", "NULL")
+                                .replace("$4", "NULL")
+                                .replace("$5", "NULL")
+                                .replace("$6", "NULL")
+                                .replace("$7", "NULL")
+                                .replace("$8", "NULL")
+                                .replace("$9", "NULL");
+                            
+                            // Wrap in LIMIT 0 to avoid fetching data
+                            let schema_query = format!("SELECT * FROM ({}) AS _schema_query LIMIT 0", 
+                                schema_sql.trim_end_matches(';'));
+                            
+                            match worker_client.execute_query(&schema_query, user_id).await {
+                                Ok(result) => {
+                                    let columns: Vec<(String, String)> = result.columns.iter()
+                                        .map(|c| (c.name.clone(), c.type_name.clone()))
+                                        .collect();
+                                    if columns.is_empty() {
+                                        debug!("Extended Protocol - Describe: parameterized query returns no columns");
+                                        socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                                    } else {
+                                        info!("Extended Protocol - Describe: parameterized query returns {} columns", columns.len());
+                                        __describe_column_count = columns.len();
+                                        send_row_description_generic(socket, &columns).await?;
+                                        describe_sent_row_description = true;
+                                    }
+                                }
+                                Err(e) => {
+                                    // Schema detection failed, send NoData (valid protocol response)
+                                    debug!("Extended Protocol - Describe: schema detection failed: {}, sending NoData", e);
+                                    socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                                }
                             }
                         } else {
                             // Non-parameterized query - safe to execute to get column info
@@ -2359,6 +2416,10 @@ where
                             Ok(Err(e)) => {
                                 error!("Extended Protocol - Execute: query failed: {}", e);
                                 send_error_generic(socket, &e.to_string()).await?;
+                                // Set skip-till-sync for error recovery (PostgreSQL protocol)
+                                // Don't send ReadyForQuery yet - wait for client to send Sync
+                                ignore_till_sync = true;
+                                update_transaction_status!(TRANSACTION_STATUS_ERROR);
                             }
                             Err(_elapsed) => {
                                 // Timeout expired
@@ -2368,6 +2429,9 @@ where
                                 );
                                 error!("Extended Protocol - Execute: query timed out after {}s", config.query_timeout_secs);
                                 send_error_generic(socket, &error_msg).await?;
+                                // Set skip-till-sync for error recovery
+                                ignore_till_sync = true;
+                                update_transaction_status!(TRANSACTION_STATUS_ERROR);
                             }
                         }
                     }
@@ -2407,9 +2471,30 @@ where
             b'S' => {
                 // Sync message has length field (4 bytes with value 4)
                 socket.read_exact(&mut buf).await?;
-                info!("Extended Protocol - Sync: sending ReadyForQuery");
+                
+                // Reset skip-till-sync state (error recovery complete)
+                if ignore_till_sync {
+                    info!("Extended Protocol - Sync: Error recovery complete, resuming normal operation");
+                    ignore_till_sync = false;
+                    // Keep transaction_status as 'E' so client knows there was an error
+                    // Client will typically send ROLLBACK after seeing error status
+                }
+                
+                info!("Extended Protocol - Sync: sending ReadyForQuery (status={})", 
+                    match transaction_status {
+                        TRANSACTION_STATUS_IDLE => "Idle",
+                        TRANSACTION_STATUS_IN_TRANSACTION => "InTransaction",
+                        TRANSACTION_STATUS_ERROR => "Error",
+                        _ => "Unknown"
+                    }
+                );
                 socket.write_all(&ready).await?;
                 socket.flush().await?;
+                
+                // After Sync with error status, reset to Idle for next command batch
+                if transaction_status == TRANSACTION_STATUS_ERROR {
+                    update_transaction_status!(TRANSACTION_STATUS_IDLE);
+                }
             }
             _ => {
                 debug!("Unknown protocol message type: 0x{:02x}", msg_type[0]);
@@ -3928,28 +4013,17 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
         });
     }
 
-    // NOTE: information_schema queries are NO LONGER intercepted here.
-    // DuckDB has proper information_schema views that should be used.
-    // This allows Tableau and other BI tools to discover tables/views
-    // created via Initial SQL.
+    // NOTE: Both information_schema AND pg_catalog queries pass through to DuckDB.
+    // DuckDB has full native support for:
+    // - information_schema views (tables, columns, schemata, etc.)
+    // - pg_catalog tables (pg_class, pg_type, pg_namespace, pg_attribute, pg_proc, pg_settings, etc.)
+    // 
+    // This allows BI tools like DBeaver, Tableau, and PowerBI to:
+    // - Discover tables/views created via Initial SQL
+    // - Query metadata with proper PostgreSQL compatibility
+    // - Use parameterized metadata queries (JDBC drivers)
     //
-    // Only intercept specific pg_catalog queries that DuckDB doesn't support:
-    if sql_upper.contains("PG_CATALOG.PG_CLASS") 
-        || sql_upper.contains("PG_CATALOG.PG_NAMESPACE")
-        || sql_upper.contains("PG_CATALOG.PG_ATTRIBUTE")
-        || sql_upper.contains("PG_CATALOG.PG_TYPE")
-        || sql_upper.contains("PG_CATALOG.PG_PROC") {
-        // Return empty for PostgreSQL-specific catalog queries
-        return Some(QueryExecutionResult {
-            columns: vec![
-                ("oid".to_string(), "int4".to_string()),
-                ("name".to_string(), "text".to_string()),
-            ],
-            rows: vec![],
-            row_count: 0,
-            command_tag: None,
-        });
-    }
+    // IMPORTANT: Do NOT intercept pg_catalog queries - DuckDB returns real metadata!
 
     None
 }
