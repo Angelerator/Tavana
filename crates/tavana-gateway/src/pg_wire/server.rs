@@ -1698,6 +1698,15 @@ where
     // Bound parameter values from Bind message (for parameterized queries)
     let mut bound_parameters: Vec<Option<String>> = Vec::new();
     
+    // Schema cache for parameterized queries - avoids re-executing LIMIT 0 queries
+    // Key: SQL template (with $1, $2 placeholders), Value: column schemas
+    // This dramatically reduces latency for repeated pg_catalog queries from JDBC drivers
+    let mut schema_cache: std::collections::HashMap<String, Vec<(String, String)>> = std::collections::HashMap::new();
+    
+    // Cached columns from Describe phase - reused in Execute to avoid double-query
+    // This is cleared after each Execute completes
+    let mut cached_describe_columns: Option<Vec<(String, String)>> = None;
+    
     // Skip-till-sync flag for error recovery (PostgreSQL Extended Protocol pattern)
     // When an error occurs during extended query protocol (Parse/Bind/Describe/Execute),
     // we set this flag and skip all messages until we receive a Sync ('S') message.
@@ -2169,48 +2178,75 @@ where
                         let sql_upper = sql.to_uppercase();
                         
                         if has_parameters {
-                            // For parameterized queries, try to get schema by replacing params with NULL
-                            // This works for most queries including pg_catalog
-                            // DuckDB has full native pg_catalog support, so we get real schemas
-                            let schema_sql = sql
-                                .replace("$1", "NULL")
-                                .replace("$2", "NULL")
-                                .replace("$3", "NULL")
-                                .replace("$4", "NULL")
-                                .replace("$5", "NULL")
-                                .replace("$6", "NULL")
-                                .replace("$7", "NULL")
-                                .replace("$8", "NULL")
-                                .replace("$9", "NULL");
-                            
-                            // Wrap in LIMIT 0 to avoid fetching data
-                            let schema_query = format!("SELECT * FROM ({}) AS _schema_query LIMIT 0", 
-                                schema_sql.trim_end_matches(';'));
-                            
-                            match worker_client.execute_query(&schema_query, user_id).await {
-                                Ok(result) => {
-                                    let columns: Vec<(String, String)> = result.columns.iter()
-                                        .map(|c| (c.name.clone(), c.type_name.clone()))
-                                        .collect();
-                                    if columns.is_empty() {
-                                        debug!("Extended Protocol - Describe: parameterized query returns no columns");
-                                        socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
-                                    } else {
-                                        info!("Extended Protocol - Describe: parameterized query returns {} columns", columns.len());
-                                        __describe_column_count = columns.len();
-                                        send_row_description_generic(socket, &columns).await?;
-                                        describe_sent_row_description = true;
+                            // Check schema cache first - avoids expensive LIMIT 0 query for repeated queries
+                            // This is critical for JDBC drivers that send the same pg_catalog queries repeatedly
+                            if let Some(cached_columns) = schema_cache.get(sql) {
+                                debug!("Extended Protocol - Describe: using cached schema for parameterized query ({} columns)", cached_columns.len());
+                                __describe_column_count = cached_columns.len();
+                                cached_describe_columns = Some(cached_columns.clone());
+                                send_row_description_generic(socket, cached_columns).await?;
+                                describe_sent_row_description = true;
+                            } else {
+                                // For parameterized queries, try to get schema by replacing params with NULL
+                                // This works for most queries including pg_catalog
+                                // DuckDB has full native pg_catalog support, so we get real schemas
+                                let schema_sql = sql
+                                    .replace("$1", "NULL")
+                                    .replace("$2", "NULL")
+                                    .replace("$3", "NULL")
+                                    .replace("$4", "NULL")
+                                    .replace("$5", "NULL")
+                                    .replace("$6", "NULL")
+                                    .replace("$7", "NULL")
+                                    .replace("$8", "NULL")
+                                    .replace("$9", "NULL");
+                                
+                                // CRITICAL: Apply pg_compat rewriting BEFORE executing schema query
+                                // This fixes DBeaver crashes from ::regclass, ::regtype etc. types
+                                let schema_sql_rewritten = pg_compat::rewrite_pg_to_duckdb(&schema_sql);
+                                
+                                // Wrap in LIMIT 0 to avoid fetching data
+                                let schema_query = format!("SELECT * FROM ({}) AS _schema_query LIMIT 0", 
+                                    schema_sql_rewritten.trim_end_matches(';'));
+                                
+                                match worker_client.execute_query(&schema_query, user_id).await {
+                                    Ok(result) => {
+                                        let columns: Vec<(String, String)> = result.columns.iter()
+                                            .map(|c| (c.name.clone(), c.type_name.clone()))
+                                            .collect();
+                                        if columns.is_empty() {
+                                            debug!("Extended Protocol - Describe: parameterized query returns no columns");
+                                            socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                                        } else {
+                                            info!("Extended Protocol - Describe: parameterized query returns {} columns", columns.len());
+                                            __describe_column_count = columns.len();
+                                            // Cache the schema for future use
+                                            schema_cache.insert(sql.clone(), columns.clone());
+                                            cached_describe_columns = Some(columns.clone());
+                                            send_row_description_generic(socket, &columns).await?;
+                                            describe_sent_row_description = true;
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    // Schema detection failed, send NoData (valid protocol response)
-                                    debug!("Extended Protocol - Describe: schema detection failed: {}, sending NoData", e);
-                                    socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                                    Err(e) => {
+                                        // Schema detection failed, send NoData (valid protocol response)
+                                        debug!("Extended Protocol - Describe: schema detection failed: {}, sending NoData", e);
+                                        socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
+                                    }
                                 }
                             }
                         } else {
-                            // Non-parameterized query - safe to execute to get column info
-                            match worker_client.execute_query(sql, user_id).await {
+                            // Non-parameterized query - use LIMIT 0 to get schema without fetching data
+                            // This FIXES the doubled latency issue: previously we executed the full query
+                            // in Describe, then again in Execute. Now Describe only gets schema.
+                            
+                            // Apply pg_compat rewriting for PostgreSQL compatibility
+                            let sql_rewritten = pg_compat::rewrite_pg_to_duckdb(sql);
+                            
+                            // Use LIMIT 0 to get schema without fetching any rows
+                            let schema_query = format!("SELECT * FROM ({}) AS _schema_query LIMIT 0", 
+                                sql_rewritten.trim_end_matches(';'));
+                            
+                            match worker_client.execute_query(&schema_query, user_id).await {
                                 Ok(result) => {
                                     let columns: Vec<(String, String)> = result.columns.iter()
                                         .map(|c| (c.name.clone(), c.type_name.clone()))
@@ -2224,12 +2260,14 @@ where
                                             columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
                                         );
                                         __describe_column_count = columns.len();
+                                        // Cache columns for potential reuse
+                                        cached_describe_columns = Some(columns.clone());
                                         send_row_description_generic(socket, &columns).await?;
                                         describe_sent_row_description = true;
                                     }
                                 }
                                 Err(e) => {
-                                    warn!("Extended Protocol - Describe: query failed: {}, sending NoData", e);
+                                    warn!("Extended Protocol - Describe: schema query failed: {}, sending NoData", e);
                                     socket.write_all(&[b'n', 0, 0, 0, 4]).await?; // NoData
                                 }
                             }
@@ -2290,6 +2328,7 @@ where
                         describe_sent_row_description = false;
                         __describe_column_count = 0;
                         bound_parameters.clear();
+                        cached_describe_columns = None;
                     } else {
                         // More rows available
                         socket.write_all(&[b's', 0, 0, 0, 4]).await?; // PortalSuspended
@@ -2335,6 +2374,7 @@ where
                                 describe_sent_row_description = false;
                                 __describe_column_count = 0;
                                 bound_parameters.clear();
+                                cached_describe_columns = None;
                                 continue;
                             }
                         }
@@ -2441,6 +2481,7 @@ where
                     describe_sent_row_description = false;
                     __describe_column_count = 0;
                     bound_parameters.clear();
+                    cached_describe_columns = None;
                 } else {
                     // No prepared statement - send empty CommandComplete
                     debug!("Extended Protocol - Execute: no prepared query");
@@ -2463,6 +2504,7 @@ where
                 __describe_column_count = 0;
                 portal_state = None; // Clear buffered rows
                 bound_parameters.clear();
+                cached_describe_columns = None;
                 
                 // Send CloseComplete
                 socket.write_all(&[b'3', 0, 0, 0, 4]).await?;
@@ -4768,8 +4810,33 @@ async fn handle_describe(
                 return Ok((true, col_count));
             }
         } else {
-            // Execute query to get column metadata
-            match worker_client.execute_query(sql, user_id).await {
+            // Check if query has parameters ($1, $2, etc.)
+            let has_parameters = sql.contains("$1") || sql.contains("$2") || sql.contains("$3");
+            
+            // For parameterized queries, replace params with NULL
+            let schema_sql = if has_parameters {
+                sql.replace("$1", "NULL")
+                    .replace("$2", "NULL")
+                    .replace("$3", "NULL")
+                    .replace("$4", "NULL")
+                    .replace("$5", "NULL")
+                    .replace("$6", "NULL")
+                    .replace("$7", "NULL")
+                    .replace("$8", "NULL")
+                    .replace("$9", "NULL")
+            } else {
+                sql.to_string()
+            };
+            
+            // CRITICAL: Apply pg_compat rewriting BEFORE executing schema query
+            // This fixes DBeaver crashes from ::regclass, ::regtype etc. types
+            let schema_sql_rewritten = pg_compat::rewrite_pg_to_duckdb(&schema_sql);
+            
+            // Use LIMIT 0 to get schema without fetching any rows (fixes doubled latency)
+            let schema_query = format!("SELECT * FROM ({}) AS _schema_query LIMIT 0", 
+                schema_sql_rewritten.trim_end_matches(';'));
+            
+            match worker_client.execute_query(&schema_query, user_id).await {
                 Ok(result) => {
                     // Send ParameterDescription (no parameters)
                     socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?; // 0 parameters
