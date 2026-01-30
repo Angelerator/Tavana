@@ -96,6 +96,10 @@ pub struct PgWireConfig {
     /// Timeout for flush operations in seconds (default: 5s)
     /// If flush takes longer, client is likely overwhelmed
     pub flush_timeout_secs: u64,
+    /// Maximum rows to buffer in portal state (default: 50000)
+    /// Prevents gateway OOM for large result sets with JDBC scrolling
+    /// If result exceeds this, client must use DECLARE CURSOR / FETCH
+    pub max_portal_buffer_rows: usize,
 }
 
 impl Default for PgWireConfig {
@@ -151,6 +155,10 @@ impl Default for PgWireConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300), // 5 minutes - StarRocks-style patient waiting
+            max_portal_buffer_rows: std::env::var("TAVANA_MAX_PORTAL_BUFFER_ROWS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50_000), // 50k rows max in portal buffer
         }
     }
 }
@@ -2311,11 +2319,42 @@ where
                     let end = state.offset + rows_to_send;
                     debug!("Extended Protocol - Execute: Resuming from offset {}, sending {} rows", state.offset, rows_to_send);
                     
-                    // Send rows from offset to end
+                    // Send rows with backpressure awareness
+                    let mut bytes_since_flush = 0usize;
+                    let mut rows_since_flush = 0usize;
+                    let mut client_disconnected = false;
+                    
                     for row in &state.rows[state.offset..end] {
-                        send_data_row_generic(socket, row, state.column_count).await?;
+                        let data_row = build_data_row(row);
+                        bytes_since_flush += data_row.len();
+                        rows_since_flush += 1;
+                        socket.write_all(&data_row).await?;
+                        
+                        // Backpressure check
+                        if bytes_since_flush >= config.flush_threshold_bytes 
+                            || rows_since_flush >= config.flush_threshold_rows {
+                            if let Err(e) = socket.flush().await {
+                                if is_disconnect_error(&e) {
+                                    warn!("Client disconnected during portal resume after {} rows", rows_since_flush);
+                                    client_disconnected = true;
+                                    break;
+                                }
+                                return Err(e.into());
+                            }
+                            bytes_since_flush = 0;
+                            rows_since_flush = 0;
+                        }
                     }
-                    socket.flush().await?;
+                    
+                    if !client_disconnected {
+                        socket.flush().await?;
+                    }
+                    
+                    if client_disconnected {
+                        info!("Client disconnected during portal resume, cleaning up");
+                        portal_state = None;
+                        break;
+                    }
                     
                     state.offset = end;
                     
@@ -2428,20 +2467,82 @@ where
                                     total_rows
                                 };
                                 
-                                // Send first batch of rows
-                                for row in &rows[..rows_to_send] {
-                                    send_data_row_generic(socket, row, __describe_column_count).await?;
+                                // Check if remaining rows exceed portal buffer limit
+                                let remaining_rows = total_rows - rows_to_send;
+                                if remaining_rows > config.max_portal_buffer_rows {
+                                    // Too many rows to buffer - reject to prevent OOM
+                                    // Client should use DECLARE CURSOR / FETCH or LIMIT clause
+                                    let error_msg = format!(
+                                        "Result set too large for portal buffer: {} rows exceed {} limit. \
+                                        Use LIMIT clause, DECLARE CURSOR / FETCH, or increase max_rows in Execute.",
+                                        remaining_rows, config.max_portal_buffer_rows
+                                    );
+                                    warn!("Extended Protocol - Execute: {}", error_msg);
+                                    send_error_generic(socket, &error_msg).await?;
+                                    ignore_till_sync = true;
+                                    update_transaction_status!(TRANSACTION_STATUS_ERROR);
+                                    continue;
                                 }
-                                socket.flush().await?;
+                                
+                                // Send rows with backpressure awareness (StarRocks-style)
+                                // Flush every N rows to prevent overwhelming slow clients
+                                let mut bytes_since_flush = 0usize;
+                                let mut rows_since_flush = 0usize;
+                                let mut client_disconnected = false;
+                                
+                                for row in &rows[..rows_to_send] {
+                                    // Build and send DataRow
+                                    let data_row = build_data_row(row);
+                                    bytes_since_flush += data_row.len();
+                                    rows_since_flush += 1;
+                                    socket.write_all(&data_row).await?;
+                                    
+                                    // Backpressure check: flush based on bytes or row count
+                                    if bytes_since_flush >= config.flush_threshold_bytes 
+                                        || rows_since_flush >= config.flush_threshold_rows {
+                                        // Flush and check for slow client
+                                        let flush_start = std::time::Instant::now();
+                                        if let Err(e) = socket.flush().await {
+                                            if is_disconnect_error(&e) {
+                                                warn!("Client disconnected during streaming after {} rows", rows_since_flush);
+                                                client_disconnected = true;
+                                                break;
+                                            }
+                                            return Err(e.into());
+                                        }
+                                        let flush_time = flush_start.elapsed();
+                                        if flush_time.as_secs() >= 5 {
+                                            debug!("Slow client detected: flush took {}ms", flush_time.as_millis());
+                                        }
+                                        bytes_since_flush = 0;
+                                        rows_since_flush = 0;
+                                    }
+                                }
+                                
+                                // Final flush
+                                if !client_disconnected {
+                                    socket.flush().await?;
+                                }
+                                
+                                if client_disconnected {
+                                    // Client gone, clean up
+                                    info!("Client disconnected during Execute, cleaning up");
+                                    break;
+                                }
                                 
                                 if rows_to_send < total_rows {
                                     // More rows - store state and send PortalSuspended
+                                    // Only buffer what we need (rows after offset)
+                                    let rows_to_buffer: Vec<Vec<String>> = rows.into_iter()
+                                        .skip(rows_to_send)
+                                        .collect();
                                     portal_state = Some(PortalState {
-                                        rows,
-                                        offset: rows_to_send,
+                                        rows: rows_to_buffer,
+                                        offset: 0, // Reset offset since we truncated the Vec
                                         column_count: __describe_column_count,
                                     });
-                                    debug!("Extended Protocol - Execute: {} rows sent, {} remaining, sending PortalSuspended", rows_to_send, total_rows - rows_to_send);
+                                    debug!("Extended Protocol - Execute: {} rows sent, {} buffered for portal, sending PortalSuspended", 
+                                        rows_to_send, total_rows - rows_to_send);
                                     socket.write_all(&[b's', 0, 0, 0, 4]).await?; // PortalSuspended
                                     socket.flush().await?;
                                     continue; // Don't clear state
