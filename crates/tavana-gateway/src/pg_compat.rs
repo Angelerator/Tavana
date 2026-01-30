@@ -100,6 +100,12 @@ static AGE_SINGLE_ARG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bage\s*\(\s*([^,)]+)\s*\)").unwrap()
 });
 
+/// PostgreSQL-specific type casts that need rewriting
+/// regclass, regtype, regproc, etc. are PostgreSQL OID types
+static REGCLASS_CAST_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)::reg(class|type|proc|oper|namespace|role)").unwrap()
+});
+
 /// Convert PostgreSQL date format to strftime format
 fn pg_format_to_strftime(pg_format: &str) -> String {
     let mut result = pg_format.to_string();
@@ -207,6 +213,16 @@ pub fn rewrite_pg_to_duckdb(sql: &str) -> String {
         modified = true;
     }
 
+    // ::regclass, ::regtype, etc. → ::VARCHAR
+    // These are PostgreSQL OID reference types that DuckDB doesn't support
+    // Used heavily in pg_catalog queries by JDBC drivers like DBeaver
+    if REGCLASS_CAST_REGEX.is_match(&result) {
+        result = REGCLASS_CAST_REGEX
+            .replace_all(&result, "::VARCHAR")
+            .to_string();
+        modified = true;
+    }
+
     if modified {
         debug!(
             original = sql,
@@ -227,6 +243,12 @@ pub fn needs_rewrite(sql: &str) -> bool {
         || sql_upper.contains("TO_NUMBER")
         || sql_upper.contains("REGEXP_MATCHES")
         || (sql_upper.contains("AGE(") && !sql_upper.contains("AGE(,"))
+        || sql_upper.contains("::REGCLASS")
+        || sql_upper.contains("::REGTYPE")
+        || sql_upper.contains("::REGPROC")
+        || sql_upper.contains("::REGOPER")
+        || sql_upper.contains("::REGNAMESPACE")
+        || sql_upper.contains("::REGROLE")
 }
 
 #[cfg(test)]
@@ -311,6 +333,28 @@ mod tests {
         assert!(needs_rewrite("SELECT TO_DATE('2024', 'YYYY')"));
         assert!(!needs_rewrite("SELECT * FROM users"));
         assert!(!needs_rewrite("SELECT name::text FROM items"));
+    }
+
+    #[test]
+    fn test_regclass_rewrite() {
+        let input = "SELECT 'pg_class'::regclass";
+        let output = rewrite_pg_to_duckdb(input);
+        assert!(output.contains("::VARCHAR"));
+        assert!(!output.contains("regclass"));
+    }
+
+    #[test]
+    fn test_regtype_rewrite() {
+        let input = "SELECT typname::regtype FROM pg_type";
+        let output = rewrite_pg_to_duckdb(input);
+        assert!(output.contains("::VARCHAR"));
+        assert!(!output.contains("regtype"));
+    }
+
+    #[test]
+    fn test_needs_rewrite_regclass() {
+        assert!(needs_rewrite("SELECT 'foo'::regclass"));
+        assert!(needs_rewrite("SELECT typname::regtype FROM pg_type"));
     }
 }
 
