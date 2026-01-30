@@ -21,6 +21,7 @@
 //! - Config-driven tuning (no magic hardcoded values)
 
 use crate::auth::{AuthService, AuthGateway, AuthContext, AuthenticatedPrincipal};
+use crate::errors::classify_error;
 use crate::metrics;
 use crate::pg_compat;
 use crate::pg_wire::backpressure::{
@@ -2439,43 +2440,80 @@ where
     Ok(())
 }
 
-/// Send error message for generic streams
+/// Send error message for generic streams (legacy - simple message only)
 async fn send_error_generic<S>(socket: &mut S, message: &str) -> anyhow::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    // PostgreSQL Error Response format:
-    // 'E' - error message type
-    // int32 - length
-    // fields: each field is a single byte field identifier followed by null-terminated string
-    // Fields end with a zero byte
+    // Use the new classified error system for better error messages
+    send_classified_error_generic(socket, message).await
+}
+
+/// Send a classified error with proper SQLSTATE code, message, hint, and detail
+/// This provides much better error messages to clients like Tableau, DBeaver, etc.
+async fn send_classified_error_generic<S>(socket: &mut S, raw_message: &str) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let classified = classify_error(raw_message);
     
-    // We need to send: S (severity), C (code), M (message), then null terminator
-    let severity = b"ERROR\0";
-    let code = b"42000\0"; // Syntax error or access rule violation
-    let msg_bytes = message.as_bytes();
+    // Log with full context for debugging
+    debug!(
+        category = %classified.category,
+        sqlstate = %classified.sqlstate,
+        message = %classified.message,
+        raw = %classified.raw_error,
+        "Sending classified error to client"
+    );
     
-    // Calculate length: 4 (len) + S + severity + C + code + M + message + null + final null
-    let total_len = 4 + 1 + severity.len() + 1 + code.len() + 1 + msg_bytes.len() + 1 + 1;
+    // Build PostgreSQL Error Response with all fields
+    // Fields: S (severity), V (severity non-localized), C (code), M (message), D (detail), H (hint)
+    let mut fields = Vec::new();
     
-    let mut error_msg = vec![b'E'];
-    error_msg.extend_from_slice(&(total_len as u32).to_be_bytes());
+    // Severity (localized)
+    fields.push(b'S');
+    fields.extend_from_slice(b"ERROR");
+    fields.push(0);
     
-    // Severity field
-    error_msg.push(b'S');
-    error_msg.extend_from_slice(severity);
+    // Severity (non-localized for programmatic use)
+    fields.push(b'V');
+    fields.extend_from_slice(b"ERROR");
+    fields.push(0);
     
-    // SQL State code field
-    error_msg.push(b'C');
-    error_msg.extend_from_slice(code);
+    // SQLSTATE code
+    fields.push(b'C');
+    fields.extend_from_slice(classified.sqlstate.as_bytes());
+    fields.push(0);
     
-    // Message field
-    error_msg.push(b'M');
-    error_msg.extend_from_slice(msg_bytes);
-    error_msg.push(0);
+    // Primary message
+    fields.push(b'M');
+    fields.extend_from_slice(classified.message.as_bytes());
+    fields.push(0);
+    
+    // Detail (if present)
+    if let Some(ref detail) = classified.detail {
+        if !detail.is_empty() {
+            fields.push(b'D');
+            fields.extend_from_slice(detail.as_bytes());
+            fields.push(0);
+        }
+    }
+    
+    // Hint (if present)
+    if let Some(ref hint) = classified.hint {
+        fields.push(b'H');
+        fields.extend_from_slice(hint.as_bytes());
+        fields.push(0);
+    }
     
     // Terminator
-    error_msg.push(0);
+    fields.push(0);
+    
+    // Build the message
+    let total_len = 4 + fields.len();
+    let mut error_msg = vec![b'E'];
+    error_msg.extend_from_slice(&(total_len as u32).to_be_bytes());
+    error_msg.extend_from_slice(&fields);
     
     socket.write_all(&error_msg).await?;
     socket.flush().await?;
@@ -4119,10 +4157,77 @@ async fn send_command_complete(
 }
 
 async fn send_error(socket: &mut tokio::net::TcpStream, message: &str) -> anyhow::Result<()> {
-    send_error_response(socket, "42000", message).await
+    // Use the new classified error system
+    send_classified_error_tcp(socket, message).await
 }
 
-/// Send error response with specific SQLSTATE code
+/// Send a classified error to a TcpStream with proper SQLSTATE, hint, and detail
+async fn send_classified_error_tcp(socket: &mut tokio::net::TcpStream, raw_message: &str) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    
+    let classified = classify_error(raw_message);
+    
+    // Log with full context
+    debug!(
+        category = %classified.category,
+        sqlstate = %classified.sqlstate,
+        message = %classified.message,
+        "Sending classified error to client (TCP)"
+    );
+    
+    let mut fields = Vec::new();
+    
+    // Severity
+    fields.push(b'S');
+    fields.extend_from_slice(b"ERROR");
+    fields.push(0);
+    
+    // Severity (non-localized)
+    fields.push(b'V');
+    fields.extend_from_slice(b"ERROR");
+    fields.push(0);
+    
+    // SQLSTATE code
+    fields.push(b'C');
+    fields.extend_from_slice(classified.sqlstate.as_bytes());
+    fields.push(0);
+    
+    // Message
+    fields.push(b'M');
+    fields.extend_from_slice(classified.message.as_bytes());
+    fields.push(0);
+    
+    // Detail
+    if let Some(ref detail) = classified.detail {
+        if !detail.is_empty() {
+            fields.push(b'D');
+            fields.extend_from_slice(detail.as_bytes());
+            fields.push(0);
+        }
+    }
+    
+    // Hint
+    if let Some(ref hint) = classified.hint {
+        fields.push(b'H');
+        fields.extend_from_slice(hint.as_bytes());
+        fields.push(0);
+    }
+    
+    // Terminator
+    fields.push(0);
+    
+    let mut msg = Vec::new();
+    msg.push(b'E');
+    let len = 4 + fields.len();
+    msg.extend_from_slice(&(len as u32).to_be_bytes());
+    msg.extend_from_slice(&fields);
+    socket.write_all(&msg).await?;
+    socket.flush().await?;
+    Ok(())
+}
+
+/// Send error response with specific SQLSTATE code (legacy - for specific cases)
+#[allow(dead_code)]
 async fn send_error_response(socket: &mut tokio::net::TcpStream, code: &str, message: &str) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
 

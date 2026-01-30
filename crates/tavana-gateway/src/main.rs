@@ -14,6 +14,7 @@
 mod auth;
 mod cursors;
 mod data_sizer;
+mod errors;
 mod flight_sql;
 mod metrics;
 mod pg_wire;
