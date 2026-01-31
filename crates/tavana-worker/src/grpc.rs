@@ -245,13 +245,24 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
 
             // Handle result
             match result {
-                Ok((_schema, rows)) => {
-                    // If no batches were produced (empty result), send empty metadata
+                Ok((schema, rows)) => {
+                    // If no batches were produced (empty result like LIMIT 0),
+                    // we still need to send the schema for schema detection to work
                     if !metadata_sent {
+                        // Extract column info from the schema - this is critical for LIMIT 0 queries!
+                        let schema_columns: Vec<String> = schema.fields().iter()
+                            .map(|f| f.name().clone())
+                            .collect();
+                        let schema_types: Vec<String> = schema.fields().iter()
+                            .map(|f| format!("{:?}", f.data_type()))
+                            .collect();
+                        
+                        debug!("Empty result set, sending schema with {} columns from schema", schema_columns.len());
+                        
                         let metadata = proto::QueryMetadata {
                             query_id: query_id.clone(),
-                            columns: vec![],
-                            column_types: vec![],
+                            columns: schema_columns,
+                            column_types: schema_types,
                             total_rows: 0,
                             total_bytes: 0,
                         };
