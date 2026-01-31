@@ -22,7 +22,6 @@ mod query_queue;
 mod query_router;
 #[path = "redis_queue_stub.rs"]
 mod redis_queue; // Stub for removed Redis functionality
-mod result_spooler;
 mod smart_scaler;
 mod telemetry;
 mod tls_config;
