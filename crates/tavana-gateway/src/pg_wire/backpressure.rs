@@ -98,6 +98,38 @@ pub struct StreamingStats {
     pub bytes_sent: usize,
     pub flush_count: usize,
     pub slow_flush_count: usize,
+    /// Last threshold (in GB) at which we warned about large transfer
+    /// First warning at 16GB, then every 2GB after (18, 20, 22, ...)
+    last_warning_gb: usize,
+}
+
+impl StreamingStats {
+    /// Check if we should warn about large data transfer
+    /// Returns Some(current_gb) if warning should be sent, None otherwise
+    /// First warning at 16GB, then every 2GB (18GB, 20GB, ...)
+    pub fn should_warn_large_transfer(&mut self) -> Option<usize> {
+        const FIRST_WARNING_GB: usize = 16;
+        const WARNING_INTERVAL_GB: usize = 2;
+        
+        let current_gb = self.bytes_sent / (1024 * 1024 * 1024);
+        
+        if current_gb >= FIRST_WARNING_GB {
+            // Calculate which threshold we should be at
+            let expected_threshold = if current_gb == FIRST_WARNING_GB {
+                FIRST_WARNING_GB
+            } else {
+                // After 16GB, warn at 18, 20, 22, etc.
+                FIRST_WARNING_GB + ((current_gb - FIRST_WARNING_GB) / WARNING_INTERVAL_GB) * WARNING_INTERVAL_GB
+            };
+            
+            if expected_threshold > self.last_warning_gb {
+                self.last_warning_gb = expected_threshold;
+                return Some(current_gb);
+            }
+        }
+        
+        None
+    }
 }
 
 /// Backpressure-aware writer wrapper
@@ -218,6 +250,11 @@ impl<W: AsyncWrite + Unpin> BackpressureWriter<W> {
     /// Get current streaming statistics
     pub fn stats(&self) -> &StreamingStats {
         &self.stats
+    }
+
+    /// Get mutable streaming statistics (for warning threshold updates)
+    pub fn stats_mut(&mut self) -> &mut StreamingStats {
+        &mut self.stats
     }
 
     /// Get mutable reference to inner writer for direct writes

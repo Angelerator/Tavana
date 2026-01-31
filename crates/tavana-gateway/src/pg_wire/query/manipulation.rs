@@ -35,6 +35,10 @@ pub fn substitute_parameters(sql: &str, params: &[Option<String>]) -> String {
 /// This prevents client OOM by limiting result size (like ClickHouse max_result_rows)
 ///
 /// Returns (modified_sql, was_limited) where was_limited is true if LIMIT was added
+///
+/// NOTE: This function is no longer used by default. Users manage their own LIMIT.
+/// Large transfer warnings are sent at 16GB+ during streaming instead.
+#[allow(dead_code)]
 pub fn apply_result_limit(sql: &str, max_rows: usize) -> (String, bool) {
     if max_rows == 0 {
         return (sql.to_string(), false);

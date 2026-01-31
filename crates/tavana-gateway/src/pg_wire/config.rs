@@ -41,13 +41,8 @@ pub struct PgWireConfig {
     pub tcp_keepalive_secs: u64,
     /// Interval to check client connection health during streaming (in rows)
     pub connection_check_interval_rows: usize,
-    /// Maximum rows to return in a single query result (like ClickHouse max_result_rows)
-    /// This prevents client OOM by limiting result size. Use OFFSET for pagination.
-    /// Set to 0 for unlimited (not recommended for production).
-    /// Default: 100000 rows (protects JDBC clients from OOM)
-    pub max_result_rows: usize,
 
-    // === Backpressure Settings (new) ===
+    // === Backpressure Settings ===
 
     /// Bytes to buffer before forcing a flush (default: 64KB)
     /// This is the primary backpressure threshold, matching TCP window sizes
@@ -95,10 +90,6 @@ impl Default for PgWireConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(500), // Check more frequently
-            max_result_rows: std::env::var("TAVANA_MAX_RESULT_ROWS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100_000),
 
             // Backpressure settings
             flush_threshold_bytes: std::env::var("TAVANA_FLUSH_THRESHOLD_BYTES")
@@ -121,11 +112,10 @@ impl PgWireConfig {
     /// Log configuration on startup
     pub fn log_config(&self) {
         info!(
-            "PgWireServer config: batch_size={}, timeout={}s, buffer={}KB, max_result_rows={}, flush_bytes={}KB, flush_rows={}, flush_timeout={}s",
+            "PgWireServer config: batch_size={}, timeout={}s, buffer={}KB, flush_bytes={}KB, flush_rows={}, flush_timeout={}s (no result limit, warnings at 16GB+)",
             self.streaming_batch_size,
             self.query_timeout_secs,
             self.write_buffer_size / 1024,
-            self.max_result_rows,
             self.flush_threshold_bytes / 1024,
             self.flush_threshold_rows,
             self.flush_timeout_secs,
