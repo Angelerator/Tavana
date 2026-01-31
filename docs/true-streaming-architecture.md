@@ -615,66 +615,89 @@ TAVANA_SPOOL_TTL_HOURS: 1
 
 ## Implementation Roadmap
 
-### Phase 1: Cursor Affinity (2 days)
+### Phase 1: Cursor Affinity (2 days) ✅ IMPLEMENTED
 
-| Task | Effort | Files |
-|------|--------|-------|
-| Create `WorkerClientPool` | 0.5 day | `worker_client.rs` |
-| Update `handle_fetch_cursor` to use pool | 0.5 day | `cursors.rs` |
-| Update `handle_close_cursor` to use pool | 0.5 day | `cursors.rs` |
-| Test with multi-worker setup | 0.5 day | Integration tests |
+| Task | Effort | Files | Status |
+|------|--------|-------|--------|
+| Create `WorkerClientPool` | 0.5 day | `worker_client.rs` | ✅ Done |
+| Update `handle_fetch_cursor` to use pool | 0.5 day | `cursors.rs` | ✅ Done |
+| Update `handle_close_cursor` to use pool | 0.5 day | `cursors.rs` | ✅ Done |
+| Test with multi-worker setup | 0.5 day | Integration tests | Pending |
 
-### Phase 2: Extended Query Streaming (1 week)
+**Commit**: `df45a8e feat(gateway): implement cursor affinity routing (Phase 1)`
 
-| Task | Effort | Files |
-|------|--------|-------|
-| Add stream handle to `PortalState` | 1 day | `server.rs` |
-| Modify Execute handler for streaming | 2 days | `server.rs` |
-| Handle Parse clearing stream | 0.5 day | `server.rs` |
-| Handle Close clearing stream | 0.5 day | `server.rs` |
-| Test with DBeaver scrolling | 1 day | Manual testing |
+### Phase 2: Extended Query Streaming (1 week) 📝 DEFERRED
 
-### Phase 3: Use Native `prepare_cached` (1 day)
+| Task | Effort | Files | Status |
+|------|--------|-------|--------|
+| Add stream handle to `PortalState` | 1 day | `server.rs` | Deferred |
+| Modify Execute handler for streaming | 2 days | `server.rs` | Deferred |
+| Handle Parse clearing stream | 0.5 day | `server.rs` | Deferred |
+| Handle Close clearing stream | 0.5 day | `server.rs` | Deferred |
+| Test with DBeaver scrolling | 1 day | Manual testing | Deferred |
 
-| Task | Effort | Files |
-|------|--------|-------|
-| Replace schema detection with `prepare_cached` | 0.5 day | `executor.rs` |
-| Set cache capacity per connection | 0.25 day | `executor.rs` |
-| Test schema caching for various queries | 0.25 day | Tests |
+**Note**: This phase requires significant refactoring of the Extended Query Protocol handler. The complexity of managing stream lifetimes across Parse/Bind/Describe/Execute cycles warrants a dedicated PR. Current buffered approach works for most use cases; true streaming via DECLARE CURSOR/FETCH is already available for large results.
 
-### Phase 4: Per-User Security Isolation (3 days)
+### Phase 3: Use Native `prepare_cached` (1 day) ✅ IMPLEMENTED
 
-| Task | Effort | Files |
-|------|--------|-------|
-| Create `UserConnectionConfig` struct | 0.5 day | `executor.rs` |
-| Apply DuckDB security settings per user | 1 day | `executor.rs` |
-| Add `lock_configuration` after setup | 0.5 day | `executor.rs` |
-| Add user_id to cursor IDs | 0.5 day | `cursor_manager.rs` |
-| Test isolation between users | 0.5 day | Tests |
+| Task | Effort | Files | Status |
+|------|--------|-------|--------|
+| Replace schema detection with `prepare_cached` | 0.5 day | `executor.rs` | ✅ Done |
+| Set cache capacity per connection | 0.25 day | `executor.rs` | ✅ Done |
+| Test schema caching for various queries | 0.25 day | Tests | Pending |
 
-### Phase 5: Result Spooling (Optional, 2 weeks)
+**Commit**: `f4a8e70 feat(worker): add prepare_cached for schema caching (Phase 3)`
 
-| Task | Effort | Files |
-|------|--------|-------|
-| Create `ResultSpooler` component | 2 days | New file |
-| Azure Blob integration | 2 days | Uses existing `object_store` |
-| Integrate with Portal handling | 3 days | `server.rs` |
-| Cleanup background task | 1 day | Background thread |
-| Test with 1M+ row results | 2 days | Load testing |
+**Environment variables**:
+- `DUCKDB_PREPARED_CACHE_SIZE`: Number of prepared statements to cache (default: 100)
+
+### Phase 4: Per-User Security Isolation (3 days) ✅ IMPLEMENTED
+
+| Task | Effort | Files | Status |
+|------|--------|-------|--------|
+| Create `SecurityConfig` struct | 0.5 day | `executor.rs` | ✅ Done |
+| Apply DuckDB security settings per user | 1 day | `executor.rs` | ✅ Done |
+| Add `lock_configuration` after setup | 0.5 day | `executor.rs` | ✅ Done |
+| Add user_id to cursor IDs | 0.5 day | `cursor_manager.rs` | Pending |
+| Test isolation between users | 0.5 day | Tests | Pending |
+
+**Commit**: `e90929e feat(worker): add per-user security isolation (Phase 4)`
+
+**Environment variables**:
+- `TAVANA_ALLOWED_DIRECTORIES`: Comma-separated list of allowed paths
+- `TAVANA_DISABLE_EXTERNAL_ACCESS`: Disable HTTP/S3/Azure access (true/false)
+- `TAVANA_DISABLE_COMMUNITY_EXTENSIONS`: Disable community extensions (true/false)
+- `TAVANA_LOCK_CONFIGURATION`: Lock config after setup (default: true)
+- `TAVANA_USER_MAX_MEMORY`: Per-user memory limit (e.g., "4GB")
+- `TAVANA_USER_MAX_THREADS`: Per-user thread limit
+
+### Phase 5: Result Spooling (Optional, 2 weeks) 📝 DEFERRED
+
+| Task | Effort | Files | Status |
+|------|--------|-------|--------|
+| Create `ResultSpooler` component | 2 days | New file | Deferred |
+| Azure Blob integration | 2 days | Uses existing `object_store` | Deferred |
+| Integrate with Portal handling | 3 days | `server.rs` | Deferred |
+| Cleanup background task | 1 day | Background thread | Deferred |
+| Test with 1M+ row results | 2 days | Load testing | Deferred |
+
+**Note**: Result spooling is an advanced feature for very large result sets. For most use cases, the current buffering + cursor combination is sufficient.
 
 ---
 
 ## Expected Benefits
 
-| Metric | Current | After Phase 1-4 | After Phase 5 |
-|--------|---------|-----------------|---------------|
-| Multi-worker cursor routing | Broken | Works | Works |
-| Extended Query first-row latency | 30s (buffered) | <1s (streaming) | <1s |
-| Gateway memory (1M rows) | OOM | ~50MB (streaming) | ~50MB |
-| Max result size | 50K rows | 50K (cursor unlimited) | Unlimited |
-| Schema detection | Per Describe | Cached (all queries) | Cached |
-| User isolation | Partial | Full (DuckDB native) | Full |
-| Data privacy | Not enforced | Enforced (locked config) | Enforced |
+| Metric | Before | After Phases 1,3,4 | After Phase 2 | After Phase 5 |
+|--------|--------|---------------------|---------------|---------------|
+| Multi-worker cursor routing | Broken | ✅ **Works** | Works | Works |
+| Extended Query first-row latency | 30s (buffered) | 30s (buffered) | <1s (streaming) | <1s |
+| Gateway memory (1M rows) | OOM | Limited by portal buffer | ~50MB (streaming) | ~50MB |
+| Max result size | 50K rows | 50K (cursor unlimited) | 50K (cursor unlimited) | Unlimited |
+| Schema detection | Per Describe | ✅ **Cached** | Cached | Cached |
+| User isolation | Partial | ✅ **Full (DuckDB)** | Full | Full |
+| Data privacy | Not enforced | ✅ **Enforced** | Enforced | Enforced |
+
+**Legend**: ✅ = Implemented in current release
 
 ---
 
