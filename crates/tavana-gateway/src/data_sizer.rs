@@ -200,8 +200,10 @@ impl DataSizer {
             if let Statement::Query(query) = stmt {
                 // Extract LIMIT
                 if let Some(limit_expr) = &query.limit {
-                    if let Expr::Value(sqlparser::ast::Value::Number(n, _)) = limit_expr {
-                        structure.limit = n.parse().ok();
+                    if let Expr::Value(value_with_span) = limit_expr {
+                        if let sqlparser::ast::Value::Number(n, _) = &value_with_span.value {
+                            structure.limit = n.parse().ok();
+                        }
                     }
                 }
 
@@ -273,10 +275,10 @@ impl DataSizer {
                         sqlparser::ast::FunctionArguments::List(args) => {
                             for arg in &args.args {
                                 if let sqlparser::ast::FunctionArg::Unnamed(
-                                    sqlparser::ast::FunctionArgExpr::Expr(Expr::Value(value)),
+                                    sqlparser::ast::FunctionArgExpr::Expr(Expr::Value(value_with_span)),
                                 ) = arg
                                 {
-                                    if let sqlparser::ast::Value::SingleQuotedString(path) = value {
+                                    if let sqlparser::ast::Value::SingleQuotedString(path) = &value_with_span.value {
                                         tables.push(path.clone());
                                     }
                                 }

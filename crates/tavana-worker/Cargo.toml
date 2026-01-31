@@ -70,3 +70,9 @@ dashmap = "6"
 parking_lot = "0.12"
 hex = "0.4"
 
+# Query pattern matching for Delta cache
+regex = "1.10"
+
+# Hash generation for Delta table aliases
+blake3 = { workspace = true }
+
