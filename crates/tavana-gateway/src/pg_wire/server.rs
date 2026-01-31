@@ -78,11 +78,6 @@ pub struct PgWireConfig {
     pub tcp_keepalive_secs: u64,
     /// Interval to check client connection health during streaming (in rows)
     pub connection_check_interval_rows: usize,
-    /// Maximum rows to return in a single query result (like ClickHouse max_result_rows)
-    /// This prevents client OOM by limiting result size. Use OFFSET for pagination.
-    /// Set to 0 for unlimited (not recommended for production).
-    /// Default: 100000 rows (protects JDBC clients from OOM)
-    pub max_result_rows: usize,
 
     // === Backpressure Settings ===
     
@@ -136,10 +131,6 @@ impl Default for PgWireConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(500), // Check more frequently for better disconnect detection
-            max_result_rows: std::env::var("TAVANA_MAX_RESULT_ROWS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100_000), // 100k rows - protects JDBC clients from OOM
 
             // Backpressure settings
             flush_threshold_bytes: std::env::var("TAVANA_FLUSH_THRESHOLD_BYTES")
@@ -255,80 +246,13 @@ fn substitute_parameters(sql: &str, params: &[Option<String>]) -> String {
     result
 }
 
-/// Apply automatic LIMIT to SELECT queries that don't have one
-/// This prevents client OOM by limiting result size (like ClickHouse max_result_rows)
-/// 
-/// Returns (modified_sql, was_limited) where was_limited is true if LIMIT was added
-/// 
-/// Query hints to bypass the limit:
-/// - `-- TAVANA:UNLIMITED` (SQL comment)
-/// - `/*TAVANA:UNLIMITED*/` (block comment)
-/// 
-/// Example:
-/// ```sql
-/// -- TAVANA:UNLIMITED
-/// SELECT * FROM delta_scan('az://...');
-/// ```
-fn apply_result_limit(sql: &str, max_rows: usize) -> (String, bool) {
-    if max_rows == 0 {
-        return (sql.to_string(), false);
-    }
-    
-    let sql_upper = sql.to_uppercase();
-    let sql_trimmed = sql_upper.trim();
-    
-    // Check for TAVANA:UNLIMITED hint - allows bypassing the limit
-    if sql_upper.contains("TAVANA:UNLIMITED") {
-        return (sql.to_string(), false);
-    }
-    
-    // Only apply to SELECT queries
-    if !sql_trimmed.starts_with("SELECT") {
-        return (sql.to_string(), false);
-    }
-    
-    // Skip if query is a cursor operation (DECLARE, FETCH, etc.)
-    if sql_trimmed.contains("CURSOR") {
-        return (sql.to_string(), false);
-    }
-    
-    // Skip if query already has LIMIT
-    // Check for LIMIT followed by a number (to avoid matching "LIMIT" in column names)
-    if sql_upper.contains(" LIMIT ") {
-        return (sql.to_string(), false);
-    }
-    
-    // Skip if query has OFFSET without LIMIT (invalid, let it fail naturally)
-    // Skip common subquery patterns (we want to limit only the outer query)
-    
-    // Add LIMIT to the end of the query
-    // Handle trailing semicolon
-    let sql_trimmed_orig = sql.trim();
-    let (base_sql, has_semicolon) = if sql_trimmed_orig.ends_with(';') {
-        (&sql_trimmed_orig[..sql_trimmed_orig.len()-1], true)
-    } else {
-        (sql_trimmed_orig, false)
-    };
-    
-    let limited_sql = if has_semicolon {
-        format!("{} LIMIT {};", base_sql, max_rows)
-    } else {
-        format!("{} LIMIT {}", base_sql, max_rows)
-    };
-    
-    (limited_sql, true)
-}
-
-/// Send a PostgreSQL NOTICE message to inform client about automatic limiting
-async fn send_notice_message<S: AsyncWrite + Unpin>(
-    socket: &mut S,
-    message: &str,
-) -> std::io::Result<()> {
+/// Build a PostgreSQL NOTICE message as bytes (for inline sending during streaming)
+fn build_notice_message(message: &str) -> Vec<u8> {
     // PostgreSQL NoticeResponse format:
     // 'N' (1 byte) + length (4 bytes) + fields
     // Fields: severity 'S' + "NOTICE\0" + message 'M' + message\0 + code 'C' + "01000\0" + \0
     
-    let severity = b"NOTICE";
+    let severity = b"WARNING"; // Use WARNING for large transfer notices
     let code = b"01000"; // Warning code
     
     // Calculate message length
@@ -360,7 +284,16 @@ async fn send_notice_message<S: AsyncWrite + Unpin>(
     // Terminator
     buf.push(0);
     
-    socket.write_all(&buf).await
+    buf
+}
+
+/// Send a PostgreSQL NOTICE message to inform client
+#[allow(dead_code)]
+async fn send_notice_message<S: AsyncWrite + Unpin>(
+    socket: &mut S,
+    message: &str,
+) -> std::io::Result<()> {
+    socket.write_all(&build_notice_message(message)).await
 }
 
 /// Result of streaming query execution (for metrics tracking)
@@ -1240,28 +1173,11 @@ async fn run_query_loop(
                     continue;
                 }
 
-                // CRITICAL: Apply automatic LIMIT to prevent client OOM
-                // Like ClickHouse's max_result_rows with result_overflow_mode=break
-                let (limited_query, was_limited) = apply_result_limit(&query, config.max_result_rows);
-                if was_limited {
-                    info!(
-                        max_rows = config.max_result_rows,
-                        "Query automatically limited to {} rows (non-TLS).",
-                        config.max_result_rows
-                    );
-                    // Send NOTICE to inform client about the limit
-                    let notice_msg = format!(
-                        "Results limited to {} rows. Use LIMIT/OFFSET for pagination.",
-                        config.max_result_rows
-                    );
-                    if let Err(e) = send_notice_message(socket, &notice_msg).await {
-                        debug!("Failed to send NOTICE: {}", e);
-                    }
-                }
-                let query_to_execute = if was_limited { &limited_query } else { &query };
+                // No automatic LIMIT - users manage their own limits via SQL
+                // Large transfer warnings are sent during streaming (at 16GB, then every 2GB)
 
                 let query_id = uuid::Uuid::new_v4().to_string();
-                let estimate = query_router.route(query_to_execute).await;
+                let estimate = query_router.route(&query).await;
                 let estimated_data_mb = estimate.data_size_mb;
 
                 let enqueue_result = query_queue
@@ -1280,7 +1196,7 @@ async fn run_query_loop(
                                 socket,
                                 worker_client,
                                 query_router,
-                                query_to_execute,
+                                &query,
                                 user_id,
                                 smart_scaler,
                             )
@@ -1721,30 +1637,12 @@ where
                     continue;
                 }
 
-                // CRITICAL: Apply automatic LIMIT to prevent client OOM
-                // Like ClickHouse's max_result_rows with result_overflow_mode=break
-                // This protects JDBC clients (DBeaver, Tableau) that buffer all rows in memory
-                let (limited_query, was_limited) = apply_result_limit(&query, config.max_result_rows);
-                if was_limited {
-                    info!(
-                        max_rows = config.max_result_rows,
-                        "Query automatically limited to {} rows. Use LIMIT/OFFSET for pagination.",
-                        config.max_result_rows
-                    );
-                    // Send NOTICE to inform client about the limit
-                    let notice_msg = format!(
-                        "Results limited to {} rows. Use LIMIT/OFFSET for pagination, or set TAVANA_MAX_RESULT_ROWS=0 to disable.",
-                        config.max_result_rows
-                    );
-                    if let Err(e) = send_notice_message(socket, &notice_msg).await {
-                        debug!("Failed to send NOTICE: {}", e);
-                    }
-                }
-                let query_to_execute = if was_limited { &limited_query } else { &query };
+                // No automatic LIMIT - users manage their own limits via SQL
+                // Large transfer warnings are sent during streaming (at 16GB, then every 2GB)
 
                 // For TLS connections, execute queries directly using a simpler path
                 let query_id = uuid::Uuid::new_v4().to_string();
-                let estimate = query_router.route(query_to_execute).await;
+                let estimate = query_router.route(&query).await;
                 let estimated_data_mb = estimate.data_size_mb;
 
                 let enqueue_result = query_queue
@@ -1764,7 +1662,7 @@ where
                                 socket,
                                 worker_client,
                                 query_router,
-                                query_to_execute,
+                                &query,
                                 user_id,
                                 smart_scaler,
                             )
@@ -3615,6 +3513,21 @@ async fn execute_query_streaming_to_worker_impl(
                                     stats.rows_sent, stats.bytes_sent, stats.flush_count);
                             }
 
+                            // Check for large transfer warning (16GB, then every 2GB)
+                            // Non-blocking: just sends a NOTICE, doesn't slow streaming
+                            if let Some(current_gb) = writer.stats_mut().should_warn_large_transfer() {
+                                let notice_msg = format!(
+                                    "Large data transfer: {}GB sent. Consider using LIMIT or CURSOR for very large results.",
+                                    current_gb
+                                );
+                                warn!("Large transfer warning: {}GB sent to client", current_gb);
+                                // Send notice inline - non-blocking, just adds to buffer
+                                let notice_bytes = build_notice_message(&notice_msg);
+                                if let Err(e) = writer.write_bytes(&notice_bytes).await {
+                                    debug!("Failed to send large transfer notice: {}", e);
+                                }
+                            }
+
                             // Log progress for very large queries
                             let stats = writer.stats();
                             if stats.rows_sent % 1_000_000 == 0 && stats.rows_sent > 0 {
@@ -3753,6 +3666,21 @@ async fn execute_query_streaming_default_impl(
                                     let stats = writer.stats();
                                     warn!("Client disconnected during streaming after {} rows", stats.rows_sent);
                                     return Err(anyhow::anyhow!("Client disconnected"));
+                                }
+                            }
+
+                            // Check for large transfer warning (16GB, then every 2GB)
+                            // Non-blocking: just sends a NOTICE, doesn't slow streaming
+                            if let Some(current_gb) = writer.stats_mut().should_warn_large_transfer() {
+                                let notice_msg = format!(
+                                    "Large data transfer: {}GB sent. Consider using LIMIT or CURSOR for very large results.",
+                                    current_gb
+                                );
+                                warn!("Large transfer warning: {}GB sent to client", current_gb);
+                                // Send notice inline - non-blocking, just adds to buffer
+                                let notice_bytes = build_notice_message(&notice_msg);
+                                if let Err(e) = writer.write_bytes(&notice_bytes).await {
+                                    debug!("Failed to send large transfer notice: {}", e);
                                 }
                             }
                         }
