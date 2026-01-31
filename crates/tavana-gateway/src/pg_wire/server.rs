@@ -2331,6 +2331,10 @@ where
                         sql.clone()
                     };
                     
+                    // CRITICAL: Apply pg_compat rewriting for PostgreSQL compatibility
+                    // This converts ::regclass, ::regtype, and other PG-specific syntax to DuckDB
+                    let final_sql = pg_compat::rewrite_pg_to_duckdb(&final_sql);
+                    
                     // CRITICAL: If Describe sent NoData, we MUST NOT send DataRows
                     if !describe_sent_row_description {
                         let cmd_tag = if let Some(result) = handle_pg_specific_command(&final_sql) {
