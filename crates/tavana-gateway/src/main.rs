@@ -20,8 +20,6 @@ mod metrics;
 mod pg_wire;
 mod query_queue;
 mod query_router;
-#[path = "redis_queue_stub.rs"]
-mod redis_queue; // Stub for removed Redis functionality
 mod smart_scaler;
 mod telemetry;
 mod tls_config;
