@@ -5,13 +5,171 @@
 This document analyzes Tavana's current streaming architecture against industry best
 practices from PostgreSQL, Trino, Snowflake, CockroachDB, StarRocks, and DuckDB.
 Based on deep codebase analysis, we identify what's already implemented, what gaps
-remain, and propose targeted improvements.
+remain, and propose targeted improvements with strong emphasis on **data privacy
+and tenant isolation**.
+
+---
+
+## Data Privacy and Tenant Isolation
+
+### Critical Security Principles
+
+Tavana handles queries across multiple users accessing potentially sensitive data.
+**Data isolation and privacy must be enforced at every layer.**
+
+### DuckDB Native Security Features (Recommended)
+
+DuckDB 1.4+ provides robust security controls that Tavana should leverage:
+
+#### 1. Connection-Level Isolation (CRITICAL)
+
+Each user connection MUST use an isolated DuckDB connection:
+
+```rust
+// In executor.rs - ENFORCE per-user connection isolation
+pub struct IsolatedConnection {
+    conn: Connection,
+    user_id: String,
+    allowed_paths: Vec<String>,
+}
+
+impl IsolatedConnection {
+    pub fn new(user_id: &str, user_allowed_paths: &[String]) -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        
+        // Lock down security settings for this user's session
+        conn.execute("SET enable_external_access = false", [])?;
+        conn.execute("SET allow_community_extensions = false", [])?;
+        
+        // Only allow access to user's authorized paths
+        let paths_json = serde_json::to_string(user_allowed_paths)?;
+        conn.execute(&format!("SET allowed_directories = {}", paths_json), [])?;
+        
+        // Lock configuration to prevent tampering
+        conn.execute("SET lock_configuration = true", [])?;
+        
+        Ok(Self { conn, user_id: user_id.to_string(), allowed_paths: user_allowed_paths.to_vec() })
+    }
+}
+```
+
+#### 2. File System Restrictions
+
+```sql
+-- Disable all external file access by default
+SET enable_external_access = false;
+
+-- Or restrict to specific directories per tenant
+SET allowed_directories = ['/data/tenant_123/'];
+
+-- Disable specific file systems
+SET disabled_filesystems = 'LocalFileSystem';
+```
+
+#### 3. Extension Security
+
+```sql
+-- Disable community extensions (only allow core extensions)
+SET allow_community_extensions = false;
+
+-- Disable auto-loading of extensions
+SET autoload_known_extensions = false;
+SET autoinstall_known_extensions = false;
+```
+
+#### 4. Resource Limits per Tenant
+
+```sql
+-- Limit CPU threads per query
+SET threads = 4;
+
+-- Limit memory per connection
+SET memory_limit = '2GB';
+
+-- Limit temp storage
+SET max_temp_directory_size = '10GB';
+```
+
+#### 5. Configuration Locking
+
+```sql
+-- After setting up security, lock all configuration
+SET lock_configuration = true;
+-- Any subsequent SET commands will fail
+```
+
+### Tavana-Level Isolation Requirements
+
+| Layer | Isolation Requirement | Implementation |
+|-------|----------------------|----------------|
+| **Gateway** | Per-connection state | `ConnectionState` with `user_id` |
+| **Gateway** | Cursor isolation | Cursors keyed by `(connection_id, cursor_name)` |
+| **Gateway** | Schema cache isolation | Cache keyed by `(user_id, sql_hash)` |
+| **Worker** | Per-user DuckDB connections | Pooled by user_id, not shared |
+| **Worker** | Cursor isolation | Cursor IDs include user_id prefix |
+| **Worker** | Delta cache isolation | Attach tables per-user or verify access |
+| **Secrets** | Never log credentials | Redact in all logs |
+| **Secrets** | Per-user Azure credentials | User-specific secrets in Secrets Manager |
+
+### Multi-Tenant Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              GATEWAY                                        │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Connection Handler                                                   │   │
+│  │ ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                   │   │
+│  │ │ User A Conn │  │ User B Conn │  │ User C Conn │   (isolated)      │   │
+│  │ │ - cursors   │  │ - cursors   │  │ - cursors   │                   │   │
+│  │ │ - schema $  │  │ - schema $  │  │ - schema $  │                   │   │
+│  │ │ - portal    │  │ - portal    │  │ - portal    │                   │   │
+│  │ └─────────────┘  └─────────────┘  └─────────────┘                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    │ gRPC with user_id in metadata
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              WORKER                                         │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Connection Pool (per-user isolation)                                 │   │
+│  │ ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐       │   │
+│  │ │ User A Pool     │  │ User B Pool     │  │ User C Pool     │       │   │
+│  │ │ - allowed_dirs  │  │ - allowed_dirs  │  │ - allowed_dirs  │       │   │
+│  │ │ - memory_limit  │  │ - memory_limit  │  │ - memory_limit  │       │   │
+│  │ │ - locked config │  │ - locked config │  │ - locked config │       │   │
+│  │ └─────────────────┘  └─────────────────┘  └─────────────────┘       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Cursor Manager (user-prefixed IDs)                                   │   │
+│  │ - "userA_cursor_1" → User A only                                     │   │
+│  │ - "userB_cursor_1" → User B only                                     │   │
+│  │ - Verify user_id on every FETCH/CLOSE                                │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Security Checklist
+
+- [ ] Each user has isolated DuckDB connection with locked config
+- [ ] `allowed_directories` set per user based on their data access
+- [ ] `enable_external_access = false` by default
+- [ ] `allow_community_extensions = false` always
+- [ ] Cursor IDs include user_id to prevent cross-user access
+- [ ] Schema cache keyed by user_id to prevent information leakage
+- [ ] Azure credentials per-user via Secrets Manager
+- [ ] Resource limits (memory, threads) per user
+- [ ] All security settings locked via `lock_configuration = true`
+- [ ] Prepared statements used for all user-provided values
 
 ---
 
 ## Current Tavana Implementation Analysis
 
-### What's Already Implemented ✅
+### What's Already Implemented
 
 Based on deep codebase analysis, Tavana already has significant streaming infrastructure:
 
@@ -57,8 +215,8 @@ pub struct CursorState {
     pub columns: Vec<(String, String)>,
     pub current_offset: usize,
     pub exhausted: bool,
-    pub worker_id: Option<String>,      // ✅ Stored!
-    pub worker_addr: Option<String>,    // ✅ Stored but NOT USED!
+    pub worker_id: Option<String>,      // Stored!
+    pub worker_addr: Option<String>,    // Stored but NOT USED!
     pub uses_true_streaming: bool,
 }
 ```
@@ -99,7 +257,7 @@ struct PortalState {
 - **PortalSuspended**: Sent when max_rows reached
 - **Resume support**: Subsequent Execute reads from buffer
 
-#### 6. Delta PIN_SNAPSHOT Caching (executor.rs) - NEW ✅
+#### 6. Delta PIN_SNAPSHOT Caching (executor.rs)
 
 ```rust
 pub struct DeltaTableCache {
@@ -116,73 +274,7 @@ pub struct DeltaTableCache {
 
 ---
 
-### Current Architecture Diagram
-
-```
-┌─────────┐     ┌────────────────────────────────────────────────────────────┐
-│         │     │                      GATEWAY                               │
-│         │     │                                                            │
-│ DBeaver │     │  ┌────────────────┐    ┌─────────────────────────────┐    │
-│ Tableau │────▶│  │ ConnectionState │    │ BackpressureWriter          │    │
-│ JDBC    │     │  │ - cursors       │    │ - 64KB flush threshold      │    │
-│         │     │  │ - portal_state  │    │ - 32KB write buffer         │    │
-│         │◀────│  │ - schema_cache  │    │ - slow client detection     │    │
-│         │     │  └────────────────┘    └─────────────────────────────┘    │
-│         │     │                                     │                      │
-│         │     │  ┌────────────────────────────────────────────────────┐   │
-│         │     │  │ Extended Query Protocol Handler                    │   │
-│         │     │  │ - Parse/Bind/Describe/Execute                      │   │
-│         │     │  │ - Portal state (buffered, max 50K rows)            │   │
-│         │     │  │ - PortalSuspended for pagination                   │   │
-│         │     │  └────────────────────────────────────────────────────┘   │
-│         │     │                                                            │
-│         │     │  ┌────────────────────────────────────────────────────┐   │
-│         │     │  │ DECLARE CURSOR Handler (cursors.rs)                │   │
-│         │     │  │ - True streaming via worker cursors                │   │
-│         │     │  │ - Fallback: LIMIT/OFFSET pagination                │   │
-│         │     │  │ - Worker ID/addr stored (but not routed!)          │   │
-│         │     │  └────────────────────────────────────────────────────┘   │
-└─────────┘     └────────────────────────────────────────────────────────────┘
-                                          │
-                                          │ gRPC (bounded channel, size=4)
-                                          ▼
-                ┌────────────────────────────────────────────────────────────┐
-                │                       WORKER                               │
-                │                                                            │
-                │  ┌─────────────────────────────────────────────────────┐  │
-                │  │ QueryServiceImpl                                    │  │
-                │  │ - execute_query (true streaming via callback)       │  │
-                │  │ - declare_cursor / fetch_cursor / close_cursor      │  │
-                │  │ - cancellation support                              │  │
-                │  └─────────────────────────────────────────────────────┘  │
-                │                                                            │
-                │  ┌─────────────────────────────────────────────────────┐  │
-                │  │ CursorManager                                       │  │
-                │  │ - max_cursors: 100 (configurable)                   │  │
-                │  │ - LIMIT/OFFSET pagination                           │  │
-                │  │ - TTL cleanup: 300s (5 minutes)                     │  │
-                │  │ - Bounded buffers: 10K rows per batch               │  │
-                │  └─────────────────────────────────────────────────────┘  │
-                │                                                            │
-                │  ┌─────────────────────────────────────────────────────┐  │
-                │  │ DeltaTableCache (NEW!)                              │  │
-                │  │ - ATTACH with PIN_SNAPSHOT                          │  │
-                │  │ - Auto-attach for delta_scan queries                │  │
-                │  │ - 1.47× speedup via metadata caching                │  │
-                │  └─────────────────────────────────────────────────────┘  │
-                │                                                            │
-                │  ┌─────────────────────────────────────────────────────┐  │
-                │  │ DuckDbExecutor                                      │  │
-                │  │ - Connection pool (default: 4)                      │  │
-                │  │ - True streaming via Arrow iterator                 │  │
-                │  │ - Azure token refresh (background thread)           │  │
-                │  └─────────────────────────────────────────────────────┘  │
-                └────────────────────────────────────────────────────────────┘
-```
-
----
-
-### Identified Gaps ⚠️
+### Identified Gaps
 
 #### Gap 1: Cursor Affinity Routing NOT Implemented
 
@@ -227,70 +319,117 @@ struct PortalState {
 
 ---
 
+## DuckDB Native Features to Leverage
+
+### 1. Prepared Statement Caching (Native)
+
+DuckDB's Rust API provides `prepare_cached` for automatic statement caching:
+
+```rust
+// Native DuckDB prepared statement cache
+pub fn prepare_cached(&self, sql: &str) -> Result<CachedStatement<'_>>
+```
+
+**How to use for schema caching**:
+```rust
+// In executor.rs - use prepare_cached for all queries
+pub fn get_schema(&self, sql: &str) -> Result<Schema> {
+    // prepare_cached automatically caches the prepared statement
+    // including its schema metadata
+    let stmt = self.conn.prepare_cached(&format!(
+        "SELECT * FROM ({}) AS _schema LIMIT 0", sql
+    ))?;
+    
+    // Schema is cached along with the prepared statement
+    Ok(stmt.column_count(), stmt.column_names(), stmt.column_types())
+}
+```
+
+**Benefits**:
+- Works for ALL queries, not just delta_scan
+- Native DuckDB caching (no custom implementation)
+- Automatic eviction (LRU-based)
+- Thread-safe
+
+**Configuration**:
+```rust
+// Set cache capacity per connection
+conn.set_prepared_statement_cache_capacity(100);
+
+// Flush cache when needed
+conn.flush_prepared_statement_cache();
+```
+
+### 2. Query Interruption
+
+```rust
+// Native query cancellation
+let interrupt_handle = conn.interrupt_handle();
+
+// In another thread/task
+interrupt_handle.interrupt();
+```
+
+### 3. Arrow Streaming
+
+```rust
+// Native Arrow batch streaming (already used)
+let mut stmt = conn.prepare(sql)?;
+let arrow_stream = stmt.query_arrow([])?;
+
+// Iterate batches without buffering
+for batch in arrow_stream {
+    process_batch(batch)?;
+}
+```
+
+---
+
 ## Comparison with Industry Best Practices
 
 ### PostgreSQL Extended Query Protocol
 
 | Feature | PostgreSQL | Tavana | Gap? |
 |---------|------------|--------|------|
-| Portal support | ✅ Full | ✅ Partial | Buffered, not streaming |
-| Execute(max_rows) | ✅ Streaming | ⚠️ Buffered first | Portal buffers all rows |
-| DECLARE CURSOR | ✅ Server-side | ✅ Implemented | Works! |
-| WITH HOLD cursors | ✅ Persist after txn | ❌ Not implemented | Low priority |
-
-### Trino Spooling Protocol
-
-| Feature | Trino | Tavana | Gap? |
-|---------|-------|--------|------|
-| Direct streaming | ✅ For small results | ✅ Simple Query only | Extended Query buffered |
-| Object storage spool | ✅ For large results | ❌ Not implemented | Phase 4 candidate |
-| Parallel writing | ✅ Workers → S3 | ❌ Not implemented | Complex |
-| URL-based retrieval | ✅ Client gets URLs | ❌ Not implemented | Different model |
-
-**Recommendation**: Trino's spooling is elegant but complex. For Tavana, simpler
-approaches (streaming cursors) may be more appropriate.
+| Portal support | Full | Partial | Buffered, not streaming |
+| Execute(max_rows) | Streaming | Buffered first | Portal buffers all rows |
+| DECLARE CURSOR | Server-side | Implemented | Works! |
+| WITH HOLD cursors | Persist after txn | Not implemented | Low priority |
 
 ### StarRocks Buffer Management
 
 | Feature | StarRocks | Tavana | Gap? |
 |---------|-----------|--------|------|
-| Send buffer bounds | 256KB-2MB | ✅ 32KB-64KB | Good, smaller for early backpressure |
-| Auto-flush | ✅ On buffer full | ✅ On threshold | Good |
-| Blocking I/O | ✅ writeBlocking | ✅ async flush | Good (relies on tokio) |
-| Packet splitting | ✅ >16MB | N/A | PostgreSQL max is 1GB |
+| Send buffer bounds | 256KB-2MB | 32KB-64KB | Good, smaller for early backpressure |
+| Auto-flush | On buffer full | On threshold | Good |
+| Blocking I/O | writeBlocking | async flush | Good (relies on tokio) |
+| Packet splitting | >16MB | N/A | PostgreSQL max is 1GB |
 
 **Conclusion**: Tavana's backpressure is well-implemented, similar to StarRocks.
-
-### Snowflake Streaming
-
-| Feature | Snowflake | Tavana | Gap? |
-|---------|-----------|--------|------|
-| Streaming ResultSet | ✅ streamResult=true | ⚠️ Simple Query only | Extended Query buffered |
-| Backpressure | ✅ Driver 1.6.23+ | ✅ Multi-layer | Good |
-| Batch streaming | ✅ streamRows(start,end) | ⚠️ Via cursors | Works but verbose |
-| Distributed fetch | ✅ get_result_batches() | ❌ Not applicable | Single-worker model |
 
 ### CockroachDB Cursors
 
 | Feature | CockroachDB | Tavana | Gap? |
 |---------|-------------|--------|------|
-| Cursor affinity | ✅ Routes to owner | ⚠️ Stored, not used | **Key gap** |
-| Keyset pagination | ✅ Alternative | ❌ Not implemented | Could add |
-| LIMIT/OFFSET fallback | ✅ But discouraged | ✅ Implemented | Good |
+| Cursor affinity | Routes to owner | Stored, not used | **Key gap** |
+| Keyset pagination | Alternative | Not implemented | Could add |
+| LIMIT/OFFSET fallback | But discouraged | Implemented | Good |
 
-### DuckDB Arrow Streaming
+### DuckDB Features
 
 | Feature | DuckDB | Tavana | Gap? |
 |---------|--------|--------|------|
-| Batch-at-a-time | ✅ Iterator API | ✅ Implemented | Good |
-| Zero-copy | ✅ Arrow native | ✅ JSON fallback | Arrow IPC available |
-| PIN_SNAPSHOT | ✅ ATTACH caching | ✅ NEW! Implemented | Good |
+| Batch-at-a-time | Iterator API | Implemented | Good |
+| prepare_cached | Native | **Not used** | Should use |
+| lock_configuration | Native | **Not used** | Should use for security |
+| allowed_directories | Native | **Not used** | Should use for isolation |
+| PIN_SNAPSHOT | ATTACH caching | Implemented | Good |
 
 ---
 
 ## Recommended Improvements (Prioritized)
 
-### Priority 1: Fix Cursor Affinity Routing (1-2 days)
+### Priority 1: Fix Cursor Affinity Routing (2 days)
 
 **Problem**: `worker_addr` stored but never used for routing.
 
@@ -318,25 +457,6 @@ pub async fn handle_fetch_cursor(
         match worker_client.fetch_cursor(&cursor_name, max_rows).await {
             // ...
         }
-    }
-}
-```
-
-**New component**:
-```rust
-pub struct WorkerClientPool {
-    clients: DashMap<String, WorkerClient>,
-    default_addr: String,
-}
-
-impl WorkerClientPool {
-    pub async fn get_or_create(&self, addr: &str) -> Arc<WorkerClient> {
-        if let Some(client) = self.clients.get(addr) {
-            return client.clone();
-        }
-        let client = WorkerClient::connect(addr).await?;
-        self.clients.insert(addr.to_string(), client.clone());
-        client
     }
 }
 ```
@@ -369,60 +489,89 @@ struct PortalState {
 3. Next Execute: Continue reading from same stream
 4. Close: Drop stream handle
 
-**Complexity**: Medium - requires changing Execute handler flow.
-
-### Priority 3: Schema Caching for Non-Parameterized Queries (2 days)
+### Priority 3: Use DuckDB `prepare_cached` for Schema Caching (1 day)
 
 **Problem**: LIMIT 0 schema detection runs for each Describe.
 
-**Solution**: Cache by Delta table path.
+**Solution**: Use DuckDB's native `prepare_cached`:
 
 ```rust
-// In server.rs, extend schema_cache:
-let mut schema_cache: HashMap<String, Vec<(String, String)>> = HashMap::new();
-let mut delta_schema_cache: HashMap<String, Vec<(String, String)>> = HashMap::new();
-
-// For delta_scan queries, extract path and cache:
-if sql.contains("delta_scan") {
-    if let Some(path) = extract_delta_path(sql) {
-        if let Some(schema) = delta_schema_cache.get(&path) {
-            return Ok(schema.clone());
-        }
-        // Execute LIMIT 0, cache result
-        delta_schema_cache.insert(path, schema);
+// In executor.rs - leverage native caching
+impl DuckDbExecutor {
+    pub fn get_schema_cached(&self, sql: &str, user_id: &str) -> Result<Schema> {
+        let conn = self.get_user_connection(user_id)?;
+        
+        // prepare_cached handles caching automatically
+        // Same SQL → same prepared statement → cached schema
+        let stmt = conn.prepare_cached(&format!(
+            "SELECT * FROM ({}) AS _schema LIMIT 0", sql
+        ))?;
+        
+        // Extract schema from cached prepared statement
+        let schema = Schema::new(
+            (0..stmt.column_count())
+                .map(|i| Field::new(stmt.column_name(i)?, stmt.column_type(i)?))
+                .collect()
+        );
+        
+        Ok(schema)
     }
 }
 ```
 
-**Impact**: Reduces Azure Blob metadata reads.
+**Benefits**:
+- Works for ALL queries (not just Delta)
+- Native DuckDB implementation
+- Per-connection cache (user isolation)
+- No custom cache code needed
 
-### Priority 4: Result Spooling (Phase 4, Optional, 2 weeks)
+### Priority 4: Implement Per-User Security Isolation (3 days)
+
+**Problem**: Connections may not have proper isolation.
+
+**Solution**: Apply DuckDB security settings per user:
+
+```rust
+pub fn create_user_connection(user_id: &str, user_config: &UserConfig) -> Result<Connection> {
+    let conn = Connection::open_in_memory()?;
+    
+    // 1. Restrict file access to user's allowed paths
+    let paths = serde_json::to_string(&user_config.allowed_paths)?;
+    conn.execute(&format!("SET allowed_directories = {}", paths), [])?;
+    
+    // 2. Disable external access by default
+    if !user_config.allow_external_access {
+        conn.execute("SET enable_external_access = false", [])?;
+    }
+    
+    // 3. Disable community extensions
+    conn.execute("SET allow_community_extensions = false", [])?;
+    
+    // 4. Set resource limits
+    conn.execute(&format!("SET threads = {}", user_config.max_threads), [])?;
+    conn.execute(&format!("SET memory_limit = '{}'", user_config.memory_limit), [])?;
+    
+    // 5. Set prepared statement cache size
+    conn.set_prepared_statement_cache_capacity(user_config.cache_capacity);
+    
+    // 6. LOCK configuration to prevent tampering
+    conn.execute("SET lock_configuration = true", [])?;
+    
+    Ok(conn)
+}
+```
+
+### Priority 5: Result Spooling (Optional, 2 weeks)
 
 **Problem**: Results exceeding memory limits fail.
 
 **Solution**: Spool to Azure Blob Storage (Trino-style).
 
-```rust
-pub struct ResultSpooler {
-    storage: Arc<dyn ObjectStore>,
-    config: SpoolConfig,
-}
-
-impl ResultSpooler {
-    pub async fn should_spool(&self, estimated_size: usize) -> bool {
-        estimated_size > self.config.memory_threshold
-    }
-    
-    pub async fn spool(&self, cursor_id: &str, batches: impl Iterator<Item = RecordBatch>) 
-        -> Result<SpoolSession>;
-}
-```
-
-**When to spool**: When result exceeds `max_portal_buffer_rows` (50K).
+**When to implement**: Only if users need results >50K rows via Extended Query Protocol.
 
 ---
 
-## Configuration Reference (Current + Proposed)
+## Configuration Reference
 
 ```yaml
 # CURRENT - Worker configuration
@@ -431,7 +580,7 @@ MAX_CURSORS: 100                      # Max concurrent cursors
 CURSOR_IDLE_TIMEOUT_SECS: 300         # TTL for idle cursors
 CURSOR_CLEANUP_INTERVAL_SECS: 60      # Cleanup frequency
 
-# CURRENT - Delta caching (NEW!)
+# CURRENT - Delta caching
 DELTA_CACHE_MAX_TABLES: 50            # Max attached tables
 DELTA_CACHE_TTL_SECS: 3600            # Metadata cache TTL
 
@@ -446,53 +595,27 @@ TAVANA_MAX_PORTAL_BUFFER_ROWS: 50000  # Portal OOM protection
 TAVANA_WORKER_CLIENT_POOL_SIZE: 10    # Max cached worker connections
 TAVANA_WORKER_CLIENT_TIMEOUT_SECS: 30 # Connection timeout
 
-# PROPOSED - Result spooling (Phase 4)
+# PROPOSED - Per-user security (via user config, not env vars)
+# Per-user configuration stored in database or config file:
+# - allowed_directories: ["/data/user_123/"]
+# - memory_limit: "2GB"
+# - max_threads: 4
+# - cache_capacity: 100
+# - allow_external_access: false
+
+# PROPOSED - Result spooling (Phase 5)
 TAVANA_SPOOL_ENABLED: false
-TAVANA_SPOOL_THRESHOLD_ROWS: 50000    # Start spooling after this
-TAVANA_SPOOL_STORAGE_TYPE: azure_blob # azure_blob | s3
+TAVANA_SPOOL_THRESHOLD_ROWS: 50000
+TAVANA_SPOOL_STORAGE_TYPE: azure_blob
 TAVANA_SPOOL_CONTAINER: tavana-spool
 TAVANA_SPOOL_TTL_HOURS: 1
 ```
 
 ---
 
-## Metrics Reference (Current + Proposed)
-
-### Current Metrics
-
-```rust
-// Worker (via Prometheus endpoint)
-cursor_active_count: Gauge,
-cursor_rows_fetched_total: Counter,
-
-// Gateway (via logs currently)
-streaming_rows_sent: logged per query
-slow_flush_count: logged per connection
-```
-
-### Proposed Metrics
-
-```rust
-// Worker
-cursor_declared_total: Counter,
-cursor_fetch_latency_seconds: Histogram,
-cursor_ttl_evictions_total: Counter,
-delta_cache_hits_total: Counter,
-delta_cache_misses_total: Counter,
-
-// Gateway
-cursor_route_hits_total: Counter,      // Affinity routing success
-cursor_route_misses_total: Counter,    // Fallback to default worker
-portal_buffer_rows: Histogram,         // Distribution of portal sizes
-portal_overflow_total: Counter,        // Results exceeding buffer limit
-streaming_backpressure_events: Counter,
-```
-
----
-
 ## Implementation Roadmap
 
-### Phase 1: Cursor Affinity (Priority 1) - 2 days
+### Phase 1: Cursor Affinity (2 days)
 
 | Task | Effort | Files |
 |------|--------|-------|
@@ -501,7 +624,7 @@ streaming_backpressure_events: Counter,
 | Update `handle_close_cursor` to use pool | 0.5 day | `cursors.rs` |
 | Test with multi-worker setup | 0.5 day | Integration tests |
 
-### Phase 2: Extended Query Streaming (Priority 2) - 1 week
+### Phase 2: Extended Query Streaming (1 week)
 
 | Task | Effort | Files |
 |------|--------|-------|
@@ -511,16 +634,25 @@ streaming_backpressure_events: Counter,
 | Handle Close clearing stream | 0.5 day | `server.rs` |
 | Test with DBeaver scrolling | 1 day | Manual testing |
 
-### Phase 3: Schema Caching (Priority 3) - 2 days
+### Phase 3: Use Native `prepare_cached` (1 day)
 
 | Task | Effort | Files |
 |------|--------|-------|
-| Add `delta_schema_cache` | 0.5 day | `server.rs` |
-| Extract Delta path from queries | 0.5 day | `pg_compat.rs` |
-| Cache invalidation logic | 0.5 day | TTL-based |
-| Test with repeated queries | 0.5 day | Manual testing |
+| Replace schema detection with `prepare_cached` | 0.5 day | `executor.rs` |
+| Set cache capacity per connection | 0.25 day | `executor.rs` |
+| Test schema caching for various queries | 0.25 day | Tests |
 
-### Phase 4: Result Spooling (Optional) - 2 weeks
+### Phase 4: Per-User Security Isolation (3 days)
+
+| Task | Effort | Files |
+|------|--------|-------|
+| Create `UserConnectionConfig` struct | 0.5 day | `executor.rs` |
+| Apply DuckDB security settings per user | 1 day | `executor.rs` |
+| Add `lock_configuration` after setup | 0.5 day | `executor.rs` |
+| Add user_id to cursor IDs | 0.5 day | `cursor_manager.rs` |
+| Test isolation between users | 0.5 day | Tests |
+
+### Phase 5: Result Spooling (Optional, 2 weeks)
 
 | Task | Effort | Files |
 |------|--------|-------|
@@ -534,13 +666,15 @@ streaming_backpressure_events: Counter,
 
 ## Expected Benefits
 
-| Metric | Current | After Phase 1-3 | After Phase 4 |
+| Metric | Current | After Phase 1-4 | After Phase 5 |
 |--------|---------|-----------------|---------------|
-| Multi-worker cursor routing | ❌ Broken | ✅ Works | ✅ Works |
+| Multi-worker cursor routing | Broken | Works | Works |
 | Extended Query first-row latency | 30s (buffered) | <1s (streaming) | <1s |
 | Gateway memory (1M rows) | OOM | ~50MB (streaming) | ~50MB |
 | Max result size | 50K rows | 50K (cursor unlimited) | Unlimited |
-| Delta metadata reads | Per Describe | Once per session | Once |
+| Schema detection | Per Describe | Cached (all queries) | Cached |
+| User isolation | Partial | Full (DuckDB native) | Full |
+| Data privacy | Not enforced | Enforced (locked config) | Enforced |
 
 ---
 
@@ -552,6 +686,8 @@ streaming_backpressure_events: Counter,
 | Worker failure with active stream | Client error | Graceful retry with new cursor |
 | Azure Blob latency for spooling | Slow large results | Only for >50K rows |
 | Backward compatibility | Breaking changes | Feature flags for new behavior |
+| User escaping isolation | Data breach | `lock_configuration = true` prevents tampering |
+| Cache pollution between users | Info leakage | Per-connection cache (DuckDB native) |
 
 ---
 
@@ -559,19 +695,21 @@ streaming_backpressure_events: Counter,
 
 Tavana's streaming infrastructure is **more mature than initially assessed**:
 
-✅ **Already excellent**:
+**Already excellent**:
 - True streaming from DuckDB (batch-at-a-time)
 - Multi-layer backpressure (StarRocks-style)
 - Server-side cursors with LIMIT/OFFSET fallback
 - Delta PIN_SNAPSHOT caching (1.47× speedup)
 
-⚠️ **Key gaps to fix**:
+**Key gaps to fix**:
 1. **Cursor affinity routing** (2 days) - Critical for multi-worker
 2. **Extended Query streaming** (1 week) - Eliminates buffering
-3. **Schema caching** (2 days) - Reduces metadata reads
+3. **Native prepare_cached** (1 day) - Schema caching for ALL queries
+4. **Per-user security isolation** (3 days) - Data privacy with DuckDB native features
 
-📋 **Nice to have**:
-4. **Result spooling** (2 weeks) - For very large results
+**Nice to have**:
+5. **Result spooling** (2 weeks) - For very large results
 
 The recommended approach prioritizes **small, high-impact changes** that leverage
-existing infrastructure rather than wholesale architecture replacement.
+DuckDB's native features for both performance (prepare_cached) and security
+(lock_configuration, allowed_directories).
