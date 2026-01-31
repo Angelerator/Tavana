@@ -69,6 +69,91 @@ pub struct PoolStats {
     pub s3_configured: bool,
 }
 
+/// Attached Delta table with cached metadata
+/// Using PIN_SNAPSHOT provides up to 1.47× speedup by caching Delta metadata
+#[derive(Debug, Clone)]
+pub struct AttachedDeltaTable {
+    /// Original Azure path (e.g., az://container/path/)
+    pub path: String,
+    /// DuckDB alias for the attached table
+    pub alias: String,
+    /// Time when the table was attached
+    pub attached_at: std::time::Instant,
+    /// Whether PIN_SNAPSHOT is enabled (caches metadata across queries)
+    pub pin_snapshot: bool,
+}
+
+/// Delta table cache manager
+/// Automatically attaches frequently accessed Delta tables with PIN_SNAPSHOT
+/// for significant performance improvements (up to 1.47× speedup)
+pub struct DeltaTableCache {
+    /// Map of Delta paths to their attached aliases
+    attached_tables: std::sync::RwLock<std::collections::HashMap<String, AttachedDeltaTable>>,
+    /// Maximum number of tables to keep attached
+    max_tables: usize,
+    /// TTL for attached tables (refresh metadata after this duration)
+    ttl_secs: u64,
+}
+
+impl DeltaTableCache {
+    pub fn new(max_tables: usize, ttl_secs: u64) -> Self {
+        Self {
+            attached_tables: std::sync::RwLock::new(std::collections::HashMap::new()),
+            max_tables,
+            ttl_secs,
+        }
+    }
+    
+    /// Check if a Delta path is already attached
+    pub fn get_alias(&self, path: &str) -> Option<String> {
+        let tables = self.attached_tables.read().ok()?;
+        let entry = tables.get(path)?;
+        
+        // Check if TTL has expired
+        if entry.attached_at.elapsed().as_secs() > self.ttl_secs {
+            return None; // Needs re-attach
+        }
+        
+        Some(entry.alias.clone())
+    }
+    
+    /// Register an attached table
+    pub fn register(&self, path: String, alias: String, pin_snapshot: bool) {
+        if let Ok(mut tables) = self.attached_tables.write() {
+            // Evict oldest if at capacity
+            if tables.len() >= self.max_tables {
+                if let Some(oldest_key) = tables
+                    .iter()
+                    .min_by_key(|(_, v)| v.attached_at)
+                    .map(|(k, _)| k.clone())
+                {
+                    tables.remove(&oldest_key);
+                }
+            }
+            
+            tables.insert(path.clone(), AttachedDeltaTable {
+                path,
+                alias,
+                attached_at: std::time::Instant::now(),
+                pin_snapshot,
+            });
+        }
+    }
+    
+    /// Mark a table as needing re-attach (e.g., after detach)
+    pub fn invalidate(&self, path: &str) {
+        if let Ok(mut tables) = self.attached_tables.write() {
+            tables.remove(path);
+        }
+    }
+    
+    /// Get cache statistics
+    pub fn stats(&self) -> (usize, usize) {
+        let tables = self.attached_tables.read().map(|t| t.len()).unwrap_or(0);
+        (tables, self.max_tables)
+    }
+}
+
 /// DuckDB query executor with connection pool
 ///
 /// Maintains multiple DuckDB connections for parallel query execution.
@@ -84,6 +169,8 @@ pub struct DuckDbExecutor {
     _background_refresh_handle: Option<std::thread::JoinHandle<()>>,
     /// Total queries executed counter for metrics
     query_count: std::sync::atomic::AtomicU64,
+    /// Delta table cache for PIN_SNAPSHOT optimization
+    delta_cache: Arc<DeltaTableCache>,
 }
 
 #[allow(dead_code)]
@@ -120,6 +207,24 @@ impl DuckDbExecutor {
         // Configure S3 for all connections
         let azure_token_state = Arc::new(Mutex::new(None));
         
+        // Configure Delta table cache from environment
+        // DELTA_CACHE_MAX_TABLES: Maximum attached tables (default: 50)
+        // DELTA_CACHE_TTL_SECS: Metadata cache TTL in seconds (default: 3600 = 1 hour)
+        let delta_cache_max = std::env::var("DELTA_CACHE_MAX_TABLES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let delta_cache_ttl = std::env::var("DELTA_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3600);
+        
+        let delta_cache = Arc::new(DeltaTableCache::new(delta_cache_max, delta_cache_ttl));
+        info!(
+            "Delta table cache configured: max_tables={}, ttl_secs={}",
+            delta_cache_max, delta_cache_ttl
+        );
+
         let executor = Self {
             connections,
             semaphore: Arc::new(Semaphore::new(pool_size)),
@@ -128,6 +233,7 @@ impl DuckDbExecutor {
             azure_token_state: azure_token_state.clone(),
             _background_refresh_handle: None,
             query_count: std::sync::atomic::AtomicU64::new(0),
+            delta_cache,
         };
 
         executor.configure_s3_all()?;
@@ -147,6 +253,7 @@ impl DuckDbExecutor {
 
         Ok(Self {
             _background_refresh_handle: background_handle,
+            delta_cache: executor.delta_cache.clone(),
             ..executor
         })
     }
@@ -1060,6 +1167,239 @@ impl DuckDbExecutor {
             azure_configured: std::env::var("AZURE_STORAGE_ACCOUNT_NAME").is_ok(),
             s3_configured: std::env::var("AWS_ACCESS_KEY_ID").is_ok(),
         }
+    }
+
+    // ============= Delta Table PIN_SNAPSHOT Caching =============
+    // DuckDB's ATTACH with PIN_SNAPSHOT provides up to 1.47× speedup
+    // by caching Delta metadata between queries.
+    // https://duckdb.org/2025/03/21/maximizing-your-delta-scan-performance.html
+
+    /// Attach a Delta table with PIN_SNAPSHOT for cached metadata
+    /// Returns the alias to use for querying the table
+    /// 
+    /// PIN_SNAPSHOT caches Delta metadata (transaction log, schema) in memory,
+    /// avoiding repeated reads from Azure Blob Storage on each query.
+    pub fn attach_delta_table(&self, delta_path: &str) -> Result<String> {
+        // Check if already attached and cached
+        if let Some(alias) = self.delta_cache.get_alias(delta_path) {
+            debug!("Delta table already attached with PIN_SNAPSHOT: {} -> {}", delta_path, alias);
+            return Ok(alias);
+        }
+        
+        // Generate a unique alias from the path
+        let alias = self.generate_delta_alias(delta_path);
+        
+        // Get a connection to execute ATTACH
+        let pooled_conn = self.get_connection();
+        let conn = pooled_conn
+            .connection
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        
+        // First, try to detach if it exists (for re-attach after TTL expiry)
+        let detach_sql = format!("DETACH DATABASE IF EXISTS \"{}\"", alias);
+        let _ = conn.execute(&detach_sql, params![]);
+        
+        // Attach with PIN_SNAPSHOT for cached metadata
+        // This caches Delta metadata in memory, providing significant speedup
+        let attach_sql = format!(
+            "ATTACH '{}' AS \"{}\" (TYPE delta, PIN_SNAPSHOT)",
+            delta_path, alias
+        );
+        
+        match conn.execute(&attach_sql, params![]) {
+            Ok(_) => {
+                info!(
+                    "Attached Delta table with PIN_SNAPSHOT: {} -> {}",
+                    delta_path, alias
+                );
+                self.delta_cache.register(delta_path.to_string(), alias.clone(), true);
+                Ok(alias)
+            }
+            Err(e) => {
+                // PIN_SNAPSHOT might not be supported in older DuckDB versions
+                // Fall back to regular ATTACH
+                debug!("PIN_SNAPSHOT failed, trying regular ATTACH: {}", e);
+                let fallback_sql = format!(
+                    "ATTACH '{}' AS \"{}\" (TYPE delta)",
+                    delta_path, alias
+                );
+                match conn.execute(&fallback_sql, params![]) {
+                    Ok(_) => {
+                        info!(
+                            "Attached Delta table (without PIN_SNAPSHOT): {} -> {}",
+                            delta_path, alias
+                        );
+                        self.delta_cache.register(delta_path.to_string(), alias.clone(), false);
+                        Ok(alias)
+                    }
+                    Err(e2) => Err(anyhow::anyhow!("Failed to attach Delta table: {}", e2))
+                }
+            }
+        }
+    }
+    
+    /// Attach a Delta table on all connections for maximum cache benefit
+    pub fn attach_delta_table_all_connections(&self, delta_path: &str) -> Result<String> {
+        let alias = self.generate_delta_alias(delta_path);
+        
+        // Check if already attached
+        if let Some(existing_alias) = self.delta_cache.get_alias(delta_path) {
+            return Ok(existing_alias);
+        }
+        
+        let attach_sql = format!(
+            "ATTACH '{}' AS \"{}\" (TYPE delta, PIN_SNAPSHOT)",
+            delta_path, alias
+        );
+        let detach_sql = format!("DETACH DATABASE IF EXISTS \"{}\"", alias);
+        
+        for pooled_conn in &self.connections {
+            if let Ok(conn) = pooled_conn.connection.lock() {
+                // Clean up any existing attachment
+                let _ = conn.execute(&detach_sql, params![]);
+                
+                // Attach with PIN_SNAPSHOT
+                if let Err(_e) = conn.execute(&attach_sql, params![]) {
+                    // Try without PIN_SNAPSHOT
+                    let fallback_sql = format!(
+                        "ATTACH '{}' AS \"{}\" (TYPE delta)",
+                        delta_path, alias
+                    );
+                    if let Err(e2) = conn.execute(&fallback_sql, params![]) {
+                        tracing::warn!(
+                            "Failed to attach Delta table on connection {}: {}",
+                            pooled_conn.id, e2
+                        );
+                        return Err(anyhow::anyhow!("Failed to attach: {}", e2));
+                    }
+                }
+            }
+        }
+        
+        info!(
+            "Attached Delta table on all {} connections: {} -> {}",
+            self.connections.len(), delta_path, alias
+        );
+        self.delta_cache.register(delta_path.to_string(), alias.clone(), true);
+        Ok(alias)
+    }
+
+    /// Generate a unique alias for a Delta table path
+    fn generate_delta_alias(&self, delta_path: &str) -> String {
+        // Create a short hash of the path for uniqueness
+        let hash = blake3::hash(delta_path.as_bytes());
+        let short_hash = &hash.to_hex()[..8];
+        
+        // Extract the last path component for readability
+        let path_part = delta_path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("delta")
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<String>();
+        
+        format!("delta_{}_{}", path_part, short_hash)
+    }
+
+    /// Rewrite a query to use attached Delta tables where possible
+    /// Returns (rewritten_sql, tables_used) where tables_used is list of aliases
+    pub fn rewrite_query_for_delta_cache(&self, sql: &str) -> (String, Vec<String>) {
+        let mut rewritten = sql.to_string();
+        let mut tables_used = Vec::new();
+        
+        // Find delta_scan('path') patterns and try to replace with attached table
+        // Pattern: delta_scan('az://...') or delta_scan("az://...")
+        let patterns = [
+            (r"delta_scan\s*\(\s*'([^']+)'\s*\)", "'"),
+            (r#"delta_scan\s*\(\s*"([^"]+)"\s*\)"#, "\""),
+        ];
+        
+        for (pattern_str, _quote) in patterns {
+            if let Ok(re) = regex::Regex::new(pattern_str) {
+                // Collect matches with their string data to avoid borrow issues
+                let current_sql = rewritten.clone();
+                let matches: Vec<(String, String)> = re.captures_iter(&current_sql)
+                    .filter_map(|cap| {
+                        let full_match = cap.get(0).map(|m| m.as_str().to_string())?;
+                        let delta_path = cap.get(1).map(|m| m.as_str().to_string())?;
+                        Some((full_match, delta_path))
+                    })
+                    .collect();
+                
+                for (full_match, delta_path) in matches {
+                    if delta_path.is_empty() {
+                        continue;
+                    }
+                    
+                    // Check if this path is cached
+                    if let Some(alias) = self.delta_cache.get_alias(&delta_path) {
+                        // Replace delta_scan('path') with "alias" (the attached table)
+                        rewritten = rewritten.replace(&full_match, &format!("\"{}\"", alias));
+                        tables_used.push(alias);
+                        debug!(
+                            "Rewrote delta_scan to use cached table: {} -> {}",
+                            delta_path, full_match
+                        );
+                    }
+                }
+            }
+        }
+        
+        (rewritten, tables_used)
+    }
+    
+    /// Execute a query with automatic Delta table caching
+    /// If the query contains delta_scan(), attach the table first for better performance
+    #[instrument(skip(self))]
+    pub fn execute_query_with_delta_cache(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        // First, try to attach any Delta tables referenced in the query
+        self.auto_attach_delta_tables(sql);
+        
+        // Rewrite query to use cached tables
+        let (rewritten_sql, tables_used) = self.rewrite_query_for_delta_cache(sql);
+        
+        if !tables_used.is_empty() {
+            info!(
+                "Using {} cached Delta table(s) for query: {:?}",
+                tables_used.len(), tables_used
+            );
+        }
+        
+        // Execute with the (potentially) rewritten query
+        self.execute_query(&rewritten_sql)
+    }
+    
+    /// Automatically attach Delta tables found in a query
+    fn auto_attach_delta_tables(&self, sql: &str) {
+        // Find delta_scan paths
+        let patterns = [
+            r"delta_scan\s*\(\s*'([^']+)'\s*\)",
+            r#"delta_scan\s*\(\s*"([^"]+)"\s*\)"#,
+        ];
+        
+        for pattern_str in patterns {
+            if let Ok(re) = regex::Regex::new(pattern_str) {
+                for cap in re.captures_iter(sql) {
+                    if let Some(delta_path) = cap.get(1).map(|m| m.as_str()) {
+                        // Only attach if not already cached
+                        if self.delta_cache.get_alias(delta_path).is_none() {
+                            if let Err(e) = self.attach_delta_table(delta_path) {
+                                debug!("Could not auto-attach Delta table {}: {}", delta_path, e);
+                                // Continue with original delta_scan - it will still work
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Get Delta cache statistics
+    pub fn delta_cache_stats(&self) -> (usize, usize) {
+        self.delta_cache.stats()
     }
 
     /// Set S3 credentials for accessing cloud storage

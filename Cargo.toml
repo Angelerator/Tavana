@@ -14,18 +14,19 @@ license = "Apache-2.0"
 repository = "https://github.com/tavana/tavana"
 
 [workspace.dependencies]
-# Async runtime (latest stable)
-tokio = { version = "1.47", features = ["full"] }
+# Async runtime (latest stable - Jan 2026)
+tokio = { version = "1.45", features = ["full"] }
 async-trait = "0.1"
 futures = "0.3"
 
-# Protocols - gRPC (v0.13 to match arrow-flight 56)
+# Protocols - gRPC (v0.14 is latest, but arrow-flight 56 requires 0.13)
+# Keeping 0.13 for arrow-flight compatibility
 tonic = { version = "0.13", features = ["tls-ring", "tls-native-roots", "channel"] }
 tonic-build = "0.13"
 prost = "0.13"
 prost-types = "0.13"
 
-# Arrow ecosystem (v56 to match DuckDB's bundled Arrow version)
+# Arrow ecosystem (v56 to match DuckDB 1.4's bundled Arrow version)
 arrow = "56"
 arrow-flight = { version = "56", features = ["flight-sql-experimental"] }
 arrow-schema = "56"
@@ -33,26 +34,27 @@ arrow-array = "56"
 arrow-ipc = "56"
 
 # PostgreSQL wire protocol
-pgwire = "0.25"
+pgwire = "0.28"
 
 # Kubernetes
-kube = { version = "0.98", features = ["runtime", "derive"] }
+kube = { version = "0.99", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.24", features = ["v1_32"] }
 
 # Data formats and processing
-duckdb = { version = "1.4", features = ["bundled"] }
+# DuckDB 1.4.4 is latest stable with Arrow 56 bundled
+duckdb = { version = "1.4.4", features = ["bundled"] }
 object_store = { version = "0.12", features = ["aws", "azure", "gcp"] }
-deltalake = { version = "0.23", features = ["s3", "azure", "gcs"] }
+deltalake = { version = "0.25", features = ["s3", "azure", "gcs"] }
 parquet = "56"
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
 
 # Query parsing
-sqlparser = "0.52"
+sqlparser = "0.55"
 
 # Authentication
-openidconnect = "3.5"
+openidconnect = "4.0"
 jsonwebtoken = "9"
 
 # Security / TLS
@@ -62,18 +64,18 @@ tokio-rustls = "0.26"
 rcgen = "0.13"
 ring = "0.17"
 
-# Observability
+# Observability (updated to latest compatible versions)
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-opentelemetry = "0.27"
-opentelemetry = { version = "0.26", features = ["metrics", "trace"] }
-opentelemetry-otlp = { version = "0.26", features = ["tonic"] }
-opentelemetry_sdk = { version = "0.26", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.29"
+opentelemetry = { version = "0.28", features = ["metrics", "trace"] }
+opentelemetry-otlp = { version = "0.28", features = ["tonic"] }
+opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
 # Disable protobuf feature to avoid CVE-2025-53605 vulnerability
-prometheus = { version = "0.13", default-features = false }
+prometheus = { version = "0.14", default-features = false }
 
 # Web framework
-axum = { version = "0.7", features = ["macros", "tokio"] }
+axum = { version = "0.8", features = ["macros", "tokio"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
 

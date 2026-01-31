@@ -78,8 +78,8 @@ dotenvy = { workspace = true }
 regex = "1.10"
 
 # S3 and data formats for real size estimation
-aws-sdk-s3 = "1.65"
-aws-config = "1.5"
+aws-sdk-s3 = "1.75"
+aws-config = "1.6"
 parquet = { workspace = true }
 tokio-util = { version = "0.7", features = ["compat"] }
 
@@ -93,7 +93,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 urlencoding = "2.1"
 
 # Redis for distributed queue
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "0.28", features = ["tokio-comp", "connection-manager"] }
 
 # HTTP types for K8s API requests
 http = "1.1"
