@@ -35,7 +35,7 @@ RUN useradd -m -u 1000 -s /bin/bash tavana && \
 # Supports: linux/amd64, linux/arm64
 # TARGETARCH is set by Docker buildx; fallback to runtime detection for plain builds
 ARG TARGETARCH
-ARG DUCKDB_VERSION=v1.4.3
+ARG DUCKDB_VERSION=v1.4.4
 RUN set -eux && \
     # Determine architecture: prefer TARGETARCH (buildx), fallback to uname
     if [ -n "${TARGETARCH:-}" ]; then \
@@ -86,7 +86,7 @@ RUN set -eux && \
 COPY --from=builder /app/target/release/tavana-worker /usr/local/bin/
 
 # Download DuckDB CLI for extension verification (as root, before switching user)
-ARG DUCKDB_VERSION=v1.4.3
+ARG DUCKDB_VERSION=v1.4.4
 RUN mkdir -p /tmp/duckdb_cli && \
     curl -fsSL "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip" -o /tmp/duckdb_cli/duckdb.zip && \
     cd /tmp/duckdb_cli && unzip -oq duckdb.zip && chmod +x duckdb && mv duckdb /usr/local/bin/ && \
