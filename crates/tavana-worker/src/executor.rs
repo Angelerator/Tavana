@@ -401,6 +401,16 @@ impl DuckDbExecutor {
         connection.execute(&format!("SET memory_limit = '{}B'", max_memory), params![])?;
         // Note: threads are set later with aggressive I/O parallelism settings
 
+        // Configure prepared statement cache for schema caching
+        // This improves performance for repeated queries by caching prepared statements
+        // including their schema metadata. Default: 100 statements.
+        let cache_capacity = std::env::var("DUCKDB_PREPARED_CACHE_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        connection.set_prepared_statement_cache_capacity(cache_capacity);
+        tracing::debug!("Prepared statement cache capacity set to {}", cache_capacity);
+
         // Load .duckdbrc if present (created at Docker build time)
         // This applies static settings without hardcoding them in Rust
         Self::load_duckdbrc(&connection);
@@ -1060,6 +1070,40 @@ impl DuckDbExecutor {
         }
 
         result
+    }
+
+    /// Get schema for a query using prepare_cached (optimized for repeated schema detection)
+    /// 
+    /// Uses DuckDB's prepared statement cache to avoid re-parsing and re-planning
+    /// the same query. This is particularly useful for LIMIT 0 schema detection
+    /// queries in the Extended Query Protocol.
+    /// 
+    /// The query is wrapped with LIMIT 0 if not already limited.
+    #[instrument(skip(self))]
+    pub fn get_schema_cached(&self, sql: &str) -> Result<Arc<Schema>> {
+        let pooled_conn = self.get_connection();
+        debug!("Using connection {} for cached schema query", pooled_conn.id);
+
+        let conn = pooled_conn
+            .connection
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        // Wrap query with LIMIT 0 if not already present
+        let schema_sql = if sql.to_uppercase().contains("LIMIT 0") {
+            sql.to_string()
+        } else {
+            format!("SELECT * FROM ({}) AS _schema_query LIMIT 0", sql.trim().trim_end_matches(';'))
+        };
+
+        // Use prepare_cached for automatic caching
+        // Same SQL -> same prepared statement -> cached schema
+        let mut stmt = conn.prepare_cached(&schema_sql)?;
+        let arrow_iter = stmt.query_arrow(params![])?;
+        let schema = arrow_iter.get_schema();
+        
+        debug!("Schema cached: {} columns", schema.fields().len());
+        Ok(schema)
     }
 
     /// Execute a query with TRUE STREAMING - sends batches one at a time via callback
