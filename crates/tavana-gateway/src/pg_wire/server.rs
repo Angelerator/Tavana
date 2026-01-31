@@ -34,7 +34,7 @@ use crate::query_router::{QueryRouter, QueryTarget};
 use crate::redis_queue::{RedisQueue, RedisQueueConfig};
 use crate::smart_scaler::SmartScaler;
 use crate::tls_config::TlsConfig;
-use crate::worker_client::{StreamingBatch, WorkerClient};
+use crate::worker_client::{StreamingBatch, WorkerClient, WorkerClientPool};
 use crate::worker_pool::WorkerPoolManager;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -389,6 +389,8 @@ pub struct PgWireServer {
     #[allow(dead_code)]
     auth_gateway: Option<Arc<AuthGateway>>,
     worker_client: Arc<WorkerClient>,
+    /// Pool of worker clients for cursor affinity routing
+    worker_client_pool: Arc<WorkerClientPool>,
     query_router: Arc<QueryRouter>,
     pool_manager: Option<Arc<WorkerPoolManager>>,
     redis_queue: Option<Arc<RedisQueue>>,
@@ -414,6 +416,9 @@ impl PgWireServer {
         // Extract auth gateway from auth service if available
         let auth_gateway = auth_service.gateway().cloned();
         
+        // Create worker client pool for cursor affinity routing
+        let worker_client_pool = Arc::new(WorkerClientPool::new(worker_client.worker_addr().to_string()));
+        
         // Load config from environment (no hardcoded values)
         let config = Arc::new(PgWireConfig::default());
         info!(
@@ -428,6 +433,7 @@ impl PgWireServer {
             auth_service,
             auth_gateway,
             worker_client,
+            worker_client_pool,
             query_router,
             pool_manager: None,
             redis_queue: None,
@@ -485,6 +491,9 @@ impl PgWireServer {
         // Extract auth gateway from auth service if available
         let auth_gateway = auth_service.gateway().cloned();
         
+        // Create worker client pool for cursor affinity routing
+        let worker_client_pool = Arc::new(WorkerClientPool::new(worker_client.worker_addr().to_string()));
+        
         // Load config from environment
         let config = Arc::new(PgWireConfig::default());
 
@@ -493,6 +502,7 @@ impl PgWireServer {
             auth_service,
             auth_gateway,
             worker_client,
+            worker_client_pool,
             query_router,
             pool_manager,
             redis_queue,
@@ -544,6 +554,9 @@ impl PgWireServer {
         // Redis queue disabled - QueryQueue handles queuing
         let redis_queue: Option<Arc<RedisQueue>> = None;
         
+        // Create worker client pool for cursor affinity routing
+        let worker_client_pool = Arc::new(WorkerClientPool::new(worker_client.worker_addr().to_string()));
+        
         // Load config from environment
         let config = Arc::new(PgWireConfig::default());
 
@@ -562,6 +575,7 @@ impl PgWireServer {
             auth_service,
             auth_gateway,
             worker_client,
+            worker_client_pool,
             query_router,
             pool_manager,
             redis_queue,
@@ -657,6 +671,7 @@ impl PgWireServer {
 
             let auth_service = self.auth_service.clone();
             let worker_client = self.worker_client.clone();
+            let worker_client_pool = self.worker_client_pool.clone();
             let query_router = self.query_router.clone();
             let pool_manager = self.pool_manager.clone();
             let redis_queue = self.redis_queue.clone();
@@ -670,6 +685,7 @@ impl PgWireServer {
                     socket,
                     auth_service,
                     worker_client,
+                    worker_client_pool,
                     query_router,
                     pool_manager,
                     redis_queue,
@@ -889,6 +905,7 @@ async fn handle_connection_with_tls(
     mut socket: tokio::net::TcpStream,
     auth_service: Arc<AuthService>,
     worker_client: Arc<WorkerClient>,
+    worker_client_pool: Arc<WorkerClientPool>,
     query_router: Arc<QueryRouter>,
     pool_manager: Option<Arc<WorkerPoolManager>>,
     redis_queue: Option<Arc<RedisQueue>>,
@@ -942,6 +959,7 @@ async fn handle_connection_with_tls(
                         tls_stream,
                         auth_service,
                         worker_client,
+                        worker_client_pool,
                         query_router,
                         pool_manager,
                         redis_queue,
@@ -960,6 +978,7 @@ async fn handle_connection_with_tls(
                         socket,
                         auth_service,
                         worker_client,
+                        worker_client_pool,
                         query_router,
                         pool_manager,
                         redis_queue,
@@ -980,6 +999,7 @@ async fn handle_connection_with_tls(
                     socket,
                     auth_service,
                     worker_client,
+                    worker_client_pool,
                     query_router,
                     pool_manager,
                     redis_queue,
@@ -1025,6 +1045,7 @@ async fn handle_connection_with_tls(
         startup_msg,
         auth_service,
         worker_client,
+        worker_client_pool,
         query_router,
         pool_manager,
         redis_queue,
@@ -1039,6 +1060,7 @@ async fn handle_connection(
     mut socket: tokio::net::TcpStream,
     auth_service: Arc<AuthService>,
     worker_client: Arc<WorkerClient>,
+    worker_client_pool: Arc<WorkerClientPool>,
     query_router: Arc<QueryRouter>,
     _pool_manager: Option<Arc<WorkerPoolManager>>,
     _redis_queue: Option<Arc<RedisQueue>>,
@@ -1133,6 +1155,7 @@ async fn handle_connection(
     run_query_loop(
         &mut socket,
         &worker_client,
+        &worker_client_pool,
         &query_router,
         &user_id,
         smart_scaler.as_ref().map(|s| s.as_ref()),
@@ -1147,6 +1170,7 @@ async fn handle_connection_with_startup(
     startup_msg: Vec<u8>,
     auth_service: Arc<AuthService>,
     worker_client: Arc<WorkerClient>,
+    worker_client_pool: Arc<WorkerClientPool>,
     query_router: Arc<QueryRouter>,
     _pool_manager: Option<Arc<WorkerPoolManager>>,
     _redis_queue: Option<Arc<RedisQueue>>,
@@ -1191,7 +1215,7 @@ async fn handle_connection_with_startup(
     socket.flush().await?;
 
     // Run the query loop
-    run_query_loop(&mut socket, &worker_client, &query_router, &user_id, smart_scaler.as_ref().map(|s| s.as_ref()), &query_queue, &config).await
+    run_query_loop(&mut socket, &worker_client, &worker_client_pool, &query_router, &user_id, smart_scaler.as_ref().map(|s| s.as_ref()), &query_queue, &config).await
 }
 
 /// Generic connection handler for both TLS and non-TLS streams
@@ -1199,6 +1223,7 @@ async fn handle_connection_generic<S>(
     mut socket: S,
     auth_service: Arc<AuthService>,
     worker_client: Arc<WorkerClient>,
+    worker_client_pool: Arc<WorkerClientPool>,
     query_router: Arc<QueryRouter>,
     _pool_manager: Option<Arc<WorkerPoolManager>>,
     _redis_queue: Option<Arc<RedisQueue>>,
@@ -1286,7 +1311,7 @@ where
     socket.flush().await?;
 
     // Run the query loop for TLS stream
-    run_query_loop_generic(&mut socket, &worker_client, &query_router, &user_id, smart_scaler.as_ref().map(|s| s.as_ref()), &query_queue, &config).await
+    run_query_loop_generic(&mut socket, &worker_client, &worker_client_pool, &query_router, &user_id, smart_scaler.as_ref().map(|s| s.as_ref()), &query_queue, &config).await
 }
 
 /// Run the main query loop (for non-TLS)
@@ -1295,6 +1320,7 @@ where
 async fn run_query_loop(
     socket: &mut tokio::net::TcpStream,
     worker_client: &WorkerClient,
+    worker_client_pool: &WorkerClientPool,
     query_router: &QueryRouter,
     user_id: &str,
     smart_scaler: Option<&SmartScaler>,
@@ -1380,7 +1406,9 @@ async fn run_query_loop(
                         query_trimmed = %query_trimmed,
                         "Detected DECLARE CURSOR command (non-TLS)"
                     );
-                    if let Some(result) = cursors::handle_declare_cursor(&query, &mut cursors, worker_client, user_id).await {
+                    // Use default worker client for DECLARE (stores worker_addr for later FETCH affinity)
+                    let default_client = worker_client_pool.default_client();
+                    if let Some(result) = cursors::handle_declare_cursor(&query, &mut cursors, &default_client, user_id).await {
                         info!(cursor_count = cursors.len(), "DECLARE CURSOR handled successfully (non-TLS)");
                         send_query_result_immediate(socket, result.into()).await?;
                         socket.write_all(&ready).await?;
@@ -1391,9 +1419,9 @@ async fn run_query_loop(
                     }
                 }
                 
-                // Handle FETCH
+                // Handle FETCH - uses cursor affinity routing via WorkerClientPool
                 if query_trimmed.starts_with("FETCH ") {
-                    match cursors::handle_fetch_cursor(&query, &mut cursors, worker_client, user_id).await {
+                    match cursors::handle_fetch_cursor(&query, &mut cursors, worker_client_pool, user_id).await {
                         Some(result) => {
                             send_query_result_immediate(socket, result.into()).await?;
                             socket.write_all(&ready).await?;
@@ -1410,9 +1438,9 @@ async fn run_query_loop(
                     }
                 }
                 
-                // Handle CLOSE cursor (also closes on worker for true streaming)
+                // Handle CLOSE cursor - uses cursor affinity routing via WorkerClientPool
                 if query_trimmed.starts_with("CLOSE ") {
-                    if let Some(result) = cursors::handle_close_cursor(&query, &mut cursors, worker_client).await {
+                    if let Some(result) = cursors::handle_close_cursor(&query, &mut cursors, worker_client_pool).await {
                         info!(command_tag = ?result.command_tag, "CLOSE CURSOR handled (TLS simple query)");
                         send_query_result_immediate(socket, QueryExecutionResult {
                             columns: vec![],
@@ -1676,6 +1704,7 @@ struct PortalState {
 async fn run_query_loop_generic<S>(
     socket: &mut S,
     worker_client: &WorkerClient,
+    worker_client_pool: &WorkerClientPool,
     query_router: &QueryRouter,
     user_id: &str,
     smart_scaler: Option<&SmartScaler>,
@@ -1807,13 +1836,14 @@ where
                     );
                 }
                 
-                // Handle DECLARE CURSOR
+                // Handle DECLARE CURSOR - use default worker client (stores worker_addr for affinity)
                 if query_trimmed.starts_with("DECLARE ") && query_trimmed.contains(" CURSOR ") {
                     info!(
                         query_trimmed = %query_trimmed,
                         "Detected DECLARE CURSOR command, attempting to handle"
                     );
-                    if let Some(result) = cursors::handle_declare_cursor(&query, &mut cursors, worker_client, user_id).await {
+                    let default_client = worker_client_pool.default_client();
+                    if let Some(result) = cursors::handle_declare_cursor(&query, &mut cursors, &default_client, user_id).await {
                         info!(
                             cursor_count = cursors.len(),
                             "DECLARE CURSOR handled successfully"
@@ -1830,9 +1860,9 @@ where
                     }
                 }
                 
-                // Handle FETCH
+                // Handle FETCH - uses cursor affinity routing via WorkerClientPool
                 if query_trimmed.starts_with("FETCH ") {
-                    match cursors::handle_fetch_cursor(&query, &mut cursors, worker_client, user_id).await {
+                    match cursors::handle_fetch_cursor(&query, &mut cursors, worker_client_pool, user_id).await {
                         Some(result) => {
                             let cols: Vec<(&str, i32)> = result.columns.iter()
                                 .map(|(n, _)| (n.as_str(), 25i32))
@@ -1852,9 +1882,9 @@ where
                     }
                 }
                 
-                // Handle CLOSE cursor (also closes on worker for true streaming)
+                // Handle CLOSE cursor - uses cursor affinity routing via WorkerClientPool
                 if query_trimmed.starts_with("CLOSE ") {
-                    if let Some(result) = cursors::handle_close_cursor(&query, &mut cursors, worker_client).await {
+                    if let Some(result) = cursors::handle_close_cursor(&query, &mut cursors, worker_client_pool).await {
                         info!(command_tag = ?result.command_tag, "CLOSE CURSOR handled (TLS extended query)");
                         send_simple_result_generic(socket, &[], &[], result.command_tag.as_deref()).await?;
                 socket.write_all(&ready).await?;
