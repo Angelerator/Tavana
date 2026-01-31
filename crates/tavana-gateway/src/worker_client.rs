@@ -2,8 +2,16 @@
 //! 
 //! Supports TRUE STREAMING with Arrow IPC for high-performance data transfer.
 //! Arrow 56 matches DuckDB's bundled version for zero-copy deserialization.
+//!
+//! ## Cursor Affinity Routing
+//! 
+//! For server-side cursors, each cursor is bound to a specific worker.
+//! The `WorkerClientPool` manages connections to multiple workers and routes
+//! cursor operations (FETCH, CLOSE) to the correct worker based on the cursor's
+//! `worker_addr`.
 
 use arrow_ipc::reader::FileReader;
+use dashmap::DashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 use tavana_common::proto;
@@ -490,6 +498,135 @@ impl WorkerClient {
                 }
             }
         }
+    }
+
+    /// Get the worker address this client connects to
+    pub fn worker_addr(&self) -> &str {
+        &self.worker_addr
+    }
+}
+
+// ============= Worker Client Pool for Cursor Affinity Routing =============
+
+/// Pool of WorkerClient connections for cursor affinity routing.
+/// 
+/// In a multi-worker deployment, each cursor is bound to a specific worker.
+/// This pool manages connections to all workers and routes cursor operations
+/// to the correct worker.
+/// 
+/// # Thread Safety
+/// Uses DashMap for concurrent access without explicit locking.
+pub struct WorkerClientPool {
+    /// Map of worker address -> WorkerClient
+    clients: DashMap<String, Arc<WorkerClient>>,
+    /// Default worker address (for non-cursor operations)
+    default_addr: String,
+    /// Maximum number of cached worker connections
+    max_pool_size: usize,
+}
+
+impl WorkerClientPool {
+    /// Create a new pool with a default worker address
+    pub fn new(default_addr: String) -> Self {
+        let max_pool_size = std::env::var("TAVANA_WORKER_CLIENT_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+
+        let pool = Self {
+            clients: DashMap::new(),
+            default_addr: default_addr.clone(),
+            max_pool_size,
+        };
+
+        // Pre-create the default client
+        pool.clients.insert(
+            default_addr.clone(),
+            Arc::new(WorkerClient::new(default_addr)),
+        );
+
+        pool
+    }
+
+    /// Get the default worker client
+    pub fn default_client(&self) -> Arc<WorkerClient> {
+        self.clients
+            .get(&self.default_addr)
+            .map(|r| r.clone())
+            .unwrap_or_else(|| {
+                let client = Arc::new(WorkerClient::new(self.default_addr.clone()));
+                self.clients.insert(self.default_addr.clone(), client.clone());
+                client
+            })
+    }
+
+    /// Get or create a worker client for a specific address
+    /// 
+    /// If the address is None or empty, returns the default client.
+    /// This is the key method for cursor affinity routing.
+    pub fn get_or_create(&self, addr: Option<&str>) -> Arc<WorkerClient> {
+        let addr = match addr {
+            Some(a) if !a.is_empty() => a,
+            _ => return self.default_client(),
+        };
+
+        // Check if we already have this client
+        if let Some(client) = self.clients.get(addr) {
+            return client.clone();
+        }
+
+        // Evict old clients if pool is full
+        if self.clients.len() >= self.max_pool_size {
+            // Simple eviction: remove the first non-default entry
+            // In production, consider LRU or time-based eviction
+            let to_remove: Vec<String> = self.clients
+                .iter()
+                .filter(|r| r.key() != &self.default_addr)
+                .take(1)
+                .map(|r| r.key().clone())
+                .collect();
+            
+            for key in to_remove {
+                debug!(addr = %key, "Evicting worker client from pool");
+                self.clients.remove(&key);
+            }
+        }
+
+        // Create new client
+        let client = Arc::new(WorkerClient::new(addr.to_string()));
+        self.clients.insert(addr.to_string(), client.clone());
+        
+        info!(addr = %addr, pool_size = self.clients.len(), "Created new worker client for affinity routing");
+        
+        client
+    }
+
+    /// Get the number of cached worker connections
+    pub fn pool_size(&self) -> usize {
+        self.clients.len()
+    }
+
+    /// Remove a specific worker client from the pool
+    /// Useful when a worker becomes unhealthy
+    pub fn remove(&self, addr: &str) {
+        if addr != self.default_addr {
+            self.clients.remove(addr);
+            debug!(addr = %addr, "Removed worker client from pool");
+        }
+    }
+
+    /// Check health of all pooled workers
+    pub async fn health_check_all(&self) -> Vec<(String, bool)> {
+        let mut results = Vec::new();
+        
+        for entry in self.clients.iter() {
+            let addr = entry.key().clone();
+            let client = entry.value().clone();
+            let healthy = client.health_check().await;
+            results.push((addr, healthy));
+        }
+        
+        results
     }
 }
 

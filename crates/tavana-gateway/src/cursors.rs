@@ -8,13 +8,13 @@
 //! 2. `FETCH count FROM cursor_name` - Returns next batch of rows
 //! 3. `CLOSE cursor_name` or `CLOSE ALL` - Releases cursor resources
 //!
-//! # Future Enhancement: True Streaming
+//! # Cursor Affinity Routing (Implemented!)
 //! For true streaming without re-scanning on each FETCH:
 //! 1. Worker declares cursor via DeclareCursor gRPC
-//! 2. Gateway stores worker_id for affinity routing
-//! 3. FETCH routes to same worker, which iterates without re-execution
+//! 2. Gateway stores worker_id AND worker_addr for affinity routing
+//! 3. FETCH/CLOSE routes to the SAME worker via WorkerClientPool
 
-use crate::worker_client::WorkerClient;
+use crate::worker_client::{WorkerClient, WorkerClientPool};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -287,6 +287,10 @@ pub fn parse_close_cursor(sql: &str) -> Option<String> {
 
 /// Handle DECLARE cursor_name CURSOR FOR select_query
 /// Uses TRUE STREAMING via worker's DeclareCursor gRPC - no re-scanning on FETCH!
+/// 
+/// # Cursor Affinity
+/// Stores both `worker_id` and `worker_addr` so that subsequent FETCH/CLOSE
+/// operations can be routed to the same worker.
 pub async fn handle_declare_cursor(
     sql: &str,
     cursors: &mut ConnectionCursors,
@@ -308,9 +312,10 @@ pub async fn handle_declare_cursor(
                 .map(|c| (c.name.clone(), c.type_name.clone()))
                 .collect();
 
-            // Store cursor state with worker affinity info
+            // Store cursor state with worker affinity info - CRITICAL for routing!
             let mut cursor_state = CursorState::new(query, columns);
             cursor_state.worker_id = Some(result.worker_id.clone());
+            cursor_state.worker_addr = Some(worker_client.worker_addr().to_string()); // Store for affinity routing
             cursor_state.uses_true_streaming = true;
             
             cursors.insert(cursor_name.clone(), cursor_state);
@@ -318,8 +323,9 @@ pub async fn handle_declare_cursor(
             info!(
                 cursor_name = %cursor_name,
                 worker_id = %result.worker_id,
+                worker_addr = %worker_client.worker_addr(),
                 columns = result.columns.len(),
-                "Cursor declared on worker (true streaming enabled)"
+                "Cursor declared on worker (true streaming enabled with affinity routing)"
             );
 
             Some(CursorResult {
@@ -362,10 +368,14 @@ pub async fn handle_declare_cursor(
 /// Handle FETCH count FROM cursor_name
 /// Uses TRUE STREAMING via worker's FetchCursor gRPC when available (no re-scanning!)
 /// Falls back to LIMIT/OFFSET for cursors not using true streaming
+/// 
+/// # Cursor Affinity Routing
+/// When using true streaming, routes FETCH to the worker that holds the cursor
+/// (stored in `cursor.worker_addr`) via the WorkerClientPool.
 pub async fn handle_fetch_cursor(
     sql: &str,
     cursors: &mut ConnectionCursors,
-    worker_client: &WorkerClient,
+    worker_client_pool: &WorkerClientPool,
     user_id: &str,
 ) -> Option<CursorResult> {
     let (fetch_count, cursor_name) = parse_fetch_cursor(sql)?;
@@ -393,14 +403,18 @@ pub async fn handle_fetch_cursor(
         });
     }
 
-    // ============= TRUE STREAMING PATH =============
+    // ============= TRUE STREAMING PATH WITH AFFINITY ROUTING =============
     // If cursor was declared with true streaming, use worker's FetchCursor gRPC
+    // CRITICAL: Route to the correct worker using cursor.worker_addr!
     if cursor.uses_true_streaming {
         let max_rows = if fetch_count == usize::MAX { 10000 } else { fetch_count };
         
+        // Get the correct worker client using affinity routing
+        let worker_client = worker_client_pool.get_or_create(cursor.worker_addr.as_deref());
+        
         debug!(
-            "FETCH {} FROM {} (TRUE STREAMING - no re-scan)",
-            max_rows, cursor_name
+            "FETCH {} FROM {} (TRUE STREAMING - routed to {})",
+            max_rows, cursor_name, cursor.worker_addr.as_deref().unwrap_or("default")
         );
 
         match worker_client.fetch_cursor(&cursor_name, max_rows).await {
@@ -413,8 +427,10 @@ pub async fn handle_fetch_cursor(
                 }
 
                 info!(
-                    "FETCH {} FROM {} (TRUE STREAMING): returned {} rows",
-                    fetch_count, cursor_name, row_count
+                    "FETCH {} FROM {} (TRUE STREAMING via {}): returned {} rows",
+                    fetch_count, cursor_name, 
+                    cursor.worker_addr.as_deref().unwrap_or("default"),
+                    row_count
                 );
 
                 // Use column metadata from result or cached
@@ -434,7 +450,8 @@ pub async fn handle_fetch_cursor(
                 });
             }
             Err(e) => {
-                warn!("TRUE STREAMING FETCH error: {}", e);
+                warn!("TRUE STREAMING FETCH error (worker {}): {}", 
+                    cursor.worker_addr.as_deref().unwrap_or("default"), e);
                 return Some(CursorResult {
                     columns: cursor.columns.clone(),
                     rows: vec![],
@@ -447,6 +464,8 @@ pub async fn handle_fetch_cursor(
 
     // ============= FALLBACK: LIMIT/OFFSET PATH =============
     // For cursors that don't use true streaming (e.g., when worker gRPC failed)
+    let worker_client = worker_client_pool.default_client();
+    
     let paginated_query = if fetch_count == usize::MAX {
         format!("{} OFFSET {}", cursor.query, cursor.current_offset)
     } else {
@@ -513,23 +532,31 @@ pub async fn handle_fetch_cursor(
 
 /// Handle CLOSE cursor_name or CLOSE ALL
 /// Also closes cursor on worker if using true streaming
+/// 
+/// # Cursor Affinity Routing
+/// When closing a true streaming cursor, routes CLOSE to the worker that holds
+/// the cursor (stored in `cursor.worker_addr`) via the WorkerClientPool.
 pub async fn handle_close_cursor(
     sql: &str,
     cursors: &mut ConnectionCursors,
-    worker_client: &WorkerClient,
+    worker_client_pool: &WorkerClientPool,
 ) -> Option<CursorResult> {
     let cursor_name = parse_close_cursor(sql)?;
 
     if cursor_name == "__ALL__" {
         // Close all cursors on workers that use true streaming
-        let streaming_cursors: Vec<String> = cursors.iter()
+        // Collect cursors with their worker addresses for affinity routing
+        let streaming_cursors: Vec<(String, Option<String>)> = cursors.iter()
             .filter(|(_, c)| c.uses_true_streaming)
-            .map(|(name, _)| name.clone())
+            .map(|(name, c)| (name.clone(), c.worker_addr.clone()))
             .collect();
         
-        for name in streaming_cursors {
+        for (name, worker_addr) in streaming_cursors {
+            // Route CLOSE to the correct worker using affinity
+            let worker_client = worker_client_pool.get_or_create(worker_addr.as_deref());
             if let Err(e) = worker_client.close_cursor(&name).await {
-                warn!("Failed to close cursor '{}' on worker: {}", name, e);
+                warn!("Failed to close cursor '{}' on worker {}: {}", 
+                    name, worker_addr.as_deref().unwrap_or("default"), e);
             }
         }
         
@@ -544,11 +571,17 @@ pub async fn handle_close_cursor(
         });
     }
 
-    // Check if cursor uses true streaming and close on worker
+    // Check if cursor uses true streaming and close on worker with affinity routing
     if let Some(cursor) = cursors.get(&cursor_name) {
         if cursor.uses_true_streaming {
+            // Route CLOSE to the correct worker
+            let worker_client = worker_client_pool.get_or_create(cursor.worker_addr.as_deref());
             if let Err(e) = worker_client.close_cursor(&cursor_name).await {
-                warn!("Failed to close cursor '{}' on worker: {}", cursor_name, e);
+                warn!("Failed to close cursor '{}' on worker {}: {}", 
+                    cursor_name, cursor.worker_addr.as_deref().unwrap_or("default"), e);
+            } else {
+                debug!("Closed cursor '{}' on worker {}", 
+                    cursor_name, cursor.worker_addr.as_deref().unwrap_or("default"));
             }
         }
     }
