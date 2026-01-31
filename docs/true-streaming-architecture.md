@@ -681,29 +681,16 @@ TAVANA_SPOOL_TTL_HOURS: 1
 - `TAVANA_USER_MAX_MEMORY`: Per-user memory limit (e.g., "4GB")
 - `TAVANA_USER_MAX_THREADS`: Per-user thread limit
 
-### Phase 5: Result Spooling (Optional, 2 weeks) ✅ INFRASTRUCTURE COMPLETE
+### Phase 5: Result Spooling (Removed)
 
-| Task | Effort | Files | Status |
-|------|--------|-------|--------|
-| Create `ResultSpooler` component | 2 days | `result_spooler.rs` | ✅ Done |
-| `SpoolerConfig` with env vars | 0.5 day | `result_spooler.rs` | ✅ Done |
-| Spool lifecycle management | 1 day | `result_spooler.rs` | ✅ Done |
-| TTL-based cleanup | 0.5 day | `result_spooler.rs` | ✅ Done |
-| Azure Blob integration | 2 days | `result_spooler.rs` | ⏳ Stubbed |
-| Integrate with Portal handling | 3 days | `server.rs` | ⏳ TODO |
-| Test with 1M+ row results | 2 days | Load testing | Pending |
+**Decision**: Result spooling was removed as unnecessary complexity. 
 
-**Commit**: `d7dd3e4 feat(gateway): add ResultSpooler for very large result sets (Phase 5)`
+**Rationale**: 
+- DECLARE CURSOR / FETCH already provides true streaming for large results
+- Phase 2 streaming portals handle most Extended Query use cases
+- Adding Azure Blob dependency for edge cases is not justified
 
-**Environment variables**:
-- `TAVANA_SPOOL_ENABLED`: Enable/disable spooling (default: false)
-- `TAVANA_SPOOL_THRESHOLD_ROWS`: Minimum rows before spooling (default: 50,000)
-- `TAVANA_SPOOL_CONTAINER`: Azure Blob container name
-- `TAVANA_SPOOL_PREFIX`: Prefix for spool file names
-- `TAVANA_SPOOL_TTL_SECS`: TTL for spool files (default: 3600)
-- `TAVANA_SPOOL_MAX_FILE_SIZE`: Max spool file size (default: 1GB)
-
-**Note**: The infrastructure is complete (metadata tracking, lifecycle). Azure Blob Storage integration needs real implementation. For now, use DECLARE CURSOR / FETCH for large result streaming.
+For very large result sets, use `DECLARE CURSOR` / `FETCH` which streams directly from worker without buffering.
 
 ---
 
@@ -714,23 +701,19 @@ TAVANA_SPOOL_TTL_HOURS: 1
 | Multi-worker cursor routing | Broken | ✅ Works | Phase 1 |
 | Extended Query first-row latency | 30s (buffered) | <1s (streaming resume) | Phase 2 |
 | Gateway memory (1M rows) | OOM | ~50MB (streaming) | Phase 2 |
-| Max result size | 50K rows | 50K (cursor unlimited) | Phase 2 |
+| Max result size | 50K rows | Unlimited (use CURSOR) | Phase 2 |
 | Schema detection | Per Describe | ✅ Cached (prepare_cached) | Phase 3 |
 | User isolation | Partial | ✅ Full (DuckDB native) | Phase 4 |
 | Data privacy | Not enforced | ✅ Enforced (locked config) | Phase 4 |
-| Very large results (>50K rows) | OOM | Spoolable to Azure | Phase 5* |
-
-**Legend**: ✅ = Fully implemented, * = Infrastructure complete (needs integration)
 
 ### Implementation Status Summary
 
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 1 | Cursor Affinity Routing | ✅ Complete |
-| 2 | Extended Query Streaming | ✅ Complete (resume streaming) |
+| 2 | Extended Query Streaming | ✅ Complete (streaming resume) |
 | 3 | Native prepare_cached | ✅ Complete |
 | 4 | Per-User Security Isolation | ✅ Complete |
-| 5 | Result Spooling to Azure | ⚠️ Infrastructure only |
 
 ---
 
