@@ -92,9 +92,6 @@ schemars = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 urlencoding = "2.1"
 
-# Redis for distributed queue
-redis = { version = "0.28", features = ["tokio-comp", "connection-manager"] }
-
 # HTTP types for K8s API requests
 http = "1.1"
 

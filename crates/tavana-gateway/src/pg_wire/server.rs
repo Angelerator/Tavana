@@ -31,7 +31,6 @@ use crate::pg_wire::backpressure::{
 };
 use crate::query_queue::{QueryOutcome, QueryQueue};
 use crate::query_router::{QueryRouter, QueryTarget};
-use crate::redis_queue::{RedisQueue, RedisQueueConfig};
 use crate::smart_scaler::SmartScaler;
 use crate::tls_config::TlsConfig;
 use crate::worker_client::{StreamingBatch, StreamingResult, WorkerClient, WorkerClientPool};
@@ -393,7 +392,6 @@ pub struct PgWireServer {
     worker_client_pool: Arc<WorkerClientPool>,
     query_router: Arc<QueryRouter>,
     pool_manager: Option<Arc<WorkerPoolManager>>,
-    redis_queue: Option<Arc<RedisQueue>>,
     smart_scaler: Option<Arc<SmartScaler>>,
     query_queue: Arc<QueryQueue>,
     tls_config: Option<Arc<TlsConfig>>,
@@ -436,7 +434,6 @@ impl PgWireServer {
             worker_client_pool,
             query_router,
             pool_manager: None,
-            redis_queue: None,
             smart_scaler: None,
             query_queue: QueryQueue::new(),
             tls_config: None,
@@ -464,7 +461,7 @@ impl PgWireServer {
         self
     }
 
-    /// Create with pool manager and optional Redis queue
+    /// Create with pool manager
     pub async fn with_pool_and_queue(
         port: u16,
         auth_service: Arc<AuthService>,
@@ -475,18 +472,6 @@ impl PgWireServer {
         let addr: SocketAddr = format!("0.0.0.0:{}", port)
             .parse()
             .expect("Invalid port number for SocketAddr");
-
-        // Initialize Redis queue if available
-        let redis_queue = match RedisQueue::new(RedisQueueConfig::from_env()).await {
-            Ok(queue) => {
-                info!("Redis queue initialized - burst traffic handling enabled");
-                Some(Arc::new(queue))
-            }
-            Err(e) => {
-                warn!("Failed to initialize Redis queue: {} - queue disabled", e);
-                None
-            }
-        };
 
         // Extract auth gateway from auth service if available
         let auth_gateway = auth_service.gateway().cloned();
@@ -505,7 +490,6 @@ impl PgWireServer {
             worker_client_pool,
             query_router,
             pool_manager,
-            redis_queue,
             smart_scaler: None,
             query_queue: QueryQueue::new(),
             tls_config: None,
@@ -550,9 +534,6 @@ impl PgWireServer {
         let addr: SocketAddr = format!("0.0.0.0:{}", port)
             .parse()
             .expect("Invalid port number for SocketAddr");
-
-        // Redis queue disabled - QueryQueue handles queuing
-        let redis_queue: Option<Arc<RedisQueue>> = None;
         
         // Create worker client pool for cursor affinity routing
         let worker_client_pool = Arc::new(WorkerClientPool::new(worker_client.worker_addr().to_string()));
@@ -578,7 +559,6 @@ impl PgWireServer {
             worker_client_pool,
             query_router,
             pool_manager,
-            redis_queue,
             smart_scaler,
             query_queue,
             tls_config: None,
@@ -607,27 +587,6 @@ impl PgWireServer {
             "Starting PostgreSQL wire protocol server on {} ({}, SmartScaler + QueryQueue mode)",
             self.addr, tls_status
         );
-
-        // Start queue worker if Redis queue is available
-        if let Some(ref queue) = self.redis_queue {
-            let queue_clone = queue.clone();
-            let worker_client = self.worker_client.clone();
-            let query_router = self.query_router.clone();
-            let pool_manager = self.pool_manager.clone();
-            let smart_scaler = self.smart_scaler.clone();
-
-            tokio::spawn(async move {
-                run_queue_worker(
-                    queue_clone,
-                    worker_client,
-                    query_router,
-                    pool_manager,
-                    smart_scaler,
-                )
-                .await;
-            });
-            info!("Queue worker started - processing queued queries with SmartScaler");
-        }
 
         // Start queue stats logging loop (every 5 seconds)
         let queue_for_stats = self.query_queue.clone();
@@ -674,7 +633,6 @@ impl PgWireServer {
             let worker_client_pool = self.worker_client_pool.clone();
             let query_router = self.query_router.clone();
             let pool_manager = self.pool_manager.clone();
-            let redis_queue = self.redis_queue.clone();
             let smart_scaler = self.smart_scaler.clone();
             let query_queue = self.query_queue.clone();
             let tls_config = self.tls_config.clone();
@@ -688,7 +646,6 @@ impl PgWireServer {
                     worker_client_pool,
                     query_router,
                     pool_manager,
-                    redis_queue,
                     smart_scaler,
                     query_queue,
                     tls_config,
@@ -709,196 +666,6 @@ impl PgWireServer {
     }
 }
 
-/// Background worker that processes queries from the Redis queue
-/// Spawns concurrent query processors based on available workers
-async fn run_queue_worker(
-    queue: Arc<RedisQueue>,
-    worker_client: Arc<WorkerClient>,
-    query_router: Arc<QueryRouter>,
-    pool_manager: Option<Arc<WorkerPoolManager>>,
-    smart_scaler: Option<Arc<SmartScaler>>,
-) {
-    info!("Queue worker starting with SmartScaler support...");
-
-    // Track active query processing tasks
-    let _active_tasks = Arc::new(tokio::sync::Semaphore::new(0));
-
-    loop {
-        // Check availability using SmartScaler if available, otherwise pool_manager
-        let idle_count: i32 = if let Some(ref scaler) = smart_scaler {
-            let capacity = scaler.calculate_capacity().await;
-            (capacity.worker_count as u64).saturating_sub(capacity.running_queries) as i32
-        } else if let Some(ref pm) = pool_manager {
-            let availability = pm.check_availability().await;
-            availability.idle as i32
-        } else {
-            3 // Default to 3 concurrent processors
-        };
-
-        if idle_count == 0 {
-            // No workers available, wait a bit
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            continue;
-        }
-
-        // Try to dequeue
-        match queue.dequeue().await {
-            Ok(Some(queued_query)) => {
-                // Clone what we need for the spawned task
-                let query_id = queued_query.id.clone();
-                let sql = queued_query.sql.clone();
-                let user_id = queued_query.user_id.clone();
-                let worker_client = worker_client.clone();
-                let query_router = query_router.clone();
-                let queue = queue.clone();
-
-                // Spawn a task to process this query concurrently
-                tokio::spawn(async move {
-                    let start = Instant::now();
-
-                    debug!(
-                        query_id = %query_id,
-                        user = %user_id,
-                        "Processing queued query"
-                    );
-
-                    // Execute the query
-                    match execute_queued_query(&worker_client, &query_router, &sql, &user_id).await
-                    {
-                        Ok((row_count, worker_name)) => {
-                            // Release the worker
-                            if let Some(ref name) = worker_name {
-                                query_router.release_worker(name, None).await;
-                            }
-
-                            info!(
-                                query_id = %query_id,
-                                rows = row_count,
-                                worker = ?worker_name,
-                                time_ms = start.elapsed().as_millis(),
-                                "Queued query completed"
-                            );
-                            if let Err(e) = queue.complete(&query_id).await {
-                                error!("Failed to mark query as complete: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            error!(
-                                query_id = %query_id,
-                                error = %e,
-                                "Queued query failed"
-                            );
-                            if let Err(e) = queue.fail(&query_id, &e.to_string()).await {
-                                error!("Failed to mark query as failed: {}", e);
-                            }
-                        }
-                    }
-                });
-
-                // Small delay to allow task to start and claim a worker
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-            Ok(None) => {
-                // No queries in queue, wait a bit
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            Err(e) => {
-                error!("Failed to dequeue: {}", e);
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        }
-    }
-}
-
-/// Execute a query from the queue (fire-and-forget style, no streaming to client)
-/// Returns (row_count, worker_name) so the caller can release the worker
-async fn execute_queued_query(
-    worker_client: &WorkerClient,
-    query_router: &QueryRouter,
-    sql: &str,
-    user_id: &str,
-) -> anyhow::Result<(usize, Option<String>)> {
-    let estimate = query_router.route(sql).await;
-
-    match estimate.target {
-        QueryTarget::PreSizedWorker {
-            address,
-            worker_name,
-        } => {
-            // Execute on pre-sized worker
-            let result = execute_query_on_worker(&address, sql, user_id).await?;
-            Ok((result, Some(worker_name)))
-        }
-        QueryTarget::TenantPool {
-            service_addr,
-            tenant_id,
-        } => {
-            // Execute on tenant's dedicated pool (same path as pre-sized)
-            info!("Routing to tenant pool: {}", tenant_id);
-            let result = execute_query_on_worker(&service_addr, sql, user_id).await?;
-            Ok((result, None))
-        }
-        QueryTarget::WorkerPool => {
-            // Execute on default worker
-            let result = worker_client.execute_query(sql, user_id).await?;
-            Ok((result.rows.len(), None))
-        }
-    }
-}
-
-/// Helper to execute query directly on a worker address
-async fn execute_query_on_worker(
-    worker_addr: &str,
-    sql: &str,
-    user_id: &str,
-) -> anyhow::Result<usize> {
-    const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
-
-    let channel = Channel::from_shared(worker_addr.to_string())?
-        .timeout(std::time::Duration::from_secs(1800))
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
-        .connect()
-        .await?;
-
-    let mut client = proto::query_service_client::QueryServiceClient::new(channel)
-        .max_decoding_message_size(MAX_MESSAGE_SIZE)
-        .max_encoding_message_size(MAX_MESSAGE_SIZE);
-
-    let query_id = uuid::Uuid::new_v4().to_string();
-
-    let request = proto::ExecuteQueryRequest {
-        query_id: query_id.clone(),
-        sql: sql.to_string(),
-        user: Some(proto::UserIdentity {
-            user_id: user_id.to_string(),
-            tenant_id: "default".to_string(),
-            scopes: vec!["query:execute".to_string()],
-            claims: Default::default(),
-        }),
-        options: Some(proto::QueryOptions {
-            timeout_seconds: 1800,
-            max_rows: 0,
-            max_bytes: 0,
-            enable_profiling: false,
-            session_params: Default::default(),
-        }),
-        allocated_resources: None,
-    };
-
-    let response = client.execute_query(request).await?;
-    let mut stream = response.into_inner();
-
-    let mut total_rows = 0;
-    while let Some(batch) = stream.message().await? {
-        if let Some(proto::query_result_batch::Result::RecordBatch(data)) = batch.result {
-            total_rows += data.row_count as usize;
-        }
-    }
-
-    Ok(total_rows)
-}
-
 /// Handle connection with optional TLS upgrade
 /// This function handles SSL negotiation and upgrades the connection if TLS is configured
 async fn handle_connection_with_tls(
@@ -908,7 +675,6 @@ async fn handle_connection_with_tls(
     worker_client_pool: Arc<WorkerClientPool>,
     query_router: Arc<QueryRouter>,
     pool_manager: Option<Arc<WorkerPoolManager>>,
-    redis_queue: Option<Arc<RedisQueue>>,
     smart_scaler: Option<Arc<SmartScaler>>,
     query_queue: Arc<QueryQueue>,
     tls_config: Option<Arc<TlsConfig>>,
@@ -962,7 +728,6 @@ async fn handle_connection_with_tls(
                         worker_client_pool,
                         query_router,
                         pool_manager,
-                        redis_queue,
                         smart_scaler,
                         query_queue,
                         config,
@@ -981,7 +746,6 @@ async fn handle_connection_with_tls(
                         worker_client_pool,
                         query_router,
                         pool_manager,
-                        redis_queue,
                         smart_scaler,
                         query_queue,
                         config,
@@ -1002,7 +766,6 @@ async fn handle_connection_with_tls(
                     worker_client_pool,
                     query_router,
                     pool_manager,
-                    redis_queue,
                     smart_scaler,
                     query_queue,
                     config,
@@ -1048,7 +811,6 @@ async fn handle_connection_with_tls(
         worker_client_pool,
         query_router,
         pool_manager,
-        redis_queue,
         smart_scaler,
         query_queue,
         config,
@@ -1063,7 +825,6 @@ async fn handle_connection(
     worker_client_pool: Arc<WorkerClientPool>,
     query_router: Arc<QueryRouter>,
     _pool_manager: Option<Arc<WorkerPoolManager>>,
-    _redis_queue: Option<Arc<RedisQueue>>,
     smart_scaler: Option<Arc<SmartScaler>>,
     query_queue: Arc<QueryQueue>,
     config: Arc<PgWireConfig>,
@@ -1173,7 +934,6 @@ async fn handle_connection_with_startup(
     worker_client_pool: Arc<WorkerClientPool>,
     query_router: Arc<QueryRouter>,
     _pool_manager: Option<Arc<WorkerPoolManager>>,
-    _redis_queue: Option<Arc<RedisQueue>>,
     smart_scaler: Option<Arc<SmartScaler>>,
     query_queue: Arc<QueryQueue>,
     config: Arc<PgWireConfig>,
@@ -1226,7 +986,6 @@ async fn handle_connection_generic<S>(
     worker_client_pool: Arc<WorkerClientPool>,
     query_router: Arc<QueryRouter>,
     _pool_manager: Option<Arc<WorkerPoolManager>>,
-    _redis_queue: Option<Arc<RedisQueue>>,
     smart_scaler: Option<Arc<SmartScaler>>,
     query_queue: Arc<QueryQueue>,
     config: Arc<PgWireConfig>,
@@ -2598,162 +2357,124 @@ where
                             }
                         }
                         
-                        // Execute query and get all rows
-                        // NOTE: This still buffers all rows for JDBC cursor support.
-                        // True streaming for JDBC requires DECLARE CURSOR / FETCH instead.
-                        info!("Extended Protocol - Execute: Describe sent RowDescription ({} cols), max_rows={}, executing query", __describe_column_count, max_rows);
+                        // TRUE STREAMING: Execute query with streaming to prevent OOM
+                        // Rows are sent to client as they arrive from worker
+                        info!("Extended Protocol - Execute: TRUE STREAMING mode, max_rows={}, executing query", max_rows);
                         
-                        // Apply query timeout enforcement
-                        let timeout_duration = Duration::from_secs(config.query_timeout_secs);
-                        let query_result = tokio::time::timeout(
-                            timeout_duration,
-                            execute_query_get_rows(worker_client, query_router, &final_sql, user_id, smart_scaler)
-                        ).await;
+                        // Start streaming query
+                        let stream_result = worker_client.execute_query_streaming(&final_sql, user_id).await;
                         
-                        match query_result {
-                            Ok(Ok(rows)) => {
-                                let total_rows = rows.len();
-                                // CRITICAL: Validate that returned row column count matches Describe
-                                let actual_col_count = if total_rows > 0 { rows[0].len() } else { 0 };
-                                if actual_col_count > 0 && actual_col_count != __describe_column_count {
-                                    warn!(
-                                        "Extended Protocol - Execute: COLUMN COUNT MISMATCH! Describe announced {} cols, Execute returned {} cols. This may cause client errors.",
-                                        __describe_column_count, actual_col_count
-                                    );
-                                }
-                                info!("Extended Protocol - Execute: query returned {} rows, {} cols (expected {} cols)", 
-                                    total_rows, actual_col_count, __describe_column_count);
-                                // Log sample of first row for debugging (truncated values)
-                                if total_rows > 0 && actual_col_count > 0 {
-                                    let first_row_preview: Vec<String> = rows[0].iter()
-                                        .take(5)
-                                        .map(|v| if v.len() > 30 { format!("{}...", &v[..30]) } else { v.clone() })
-                                        .collect();
-                                    debug!("Extended Protocol - First row preview (first 5 cols): {:?}", first_row_preview);
-                                    
-                                    // Check for potential issues in data
-                                    for (i, v) in rows[0].iter().enumerate() {
-                                        if v.contains('\0') {
-                                            warn!("Column {} contains NULL byte! Value preview: {:?}", i, &v[..v.len().min(50)]);
-                                        }
-                                        if v.len() > 10_000_000 {
-                                            warn!("Column {} has unusually large value: {} bytes", i, v.len());
-                                        }
-                                    }
-                                }
-                                let rows_to_send = if max_rows > 0 && (max_rows as usize) < total_rows {
-                                    max_rows as usize
-                                } else {
-                                    total_rows
-                                };
-                                
-                                // Check if remaining rows exceed portal buffer limit
-                                let remaining_rows = total_rows - rows_to_send;
-                                if remaining_rows > config.max_portal_buffer_rows {
-                                    // Too many rows to buffer - reject to prevent OOM
-                                    // Client should use DECLARE CURSOR / FETCH or LIMIT clause
-                                    let error_msg = format!(
-                                        "Result set too large for portal buffer: {} rows exceed {} limit. \
-                                        Use LIMIT clause, DECLARE CURSOR / FETCH, or increase max_rows in Execute.",
-                                        remaining_rows, config.max_portal_buffer_rows
-                                    );
-                                    warn!("Extended Protocol - Execute: {}", error_msg);
-                                    send_error_generic(socket, &error_msg).await?;
-                                    ignore_till_sync = true;
-                                    update_transaction_status!(TRANSACTION_STATUS_ERROR);
-                                    continue;
-                                }
-                                
-                                // Send rows with backpressure awareness (StarRocks-style)
-                                // Flush every N rows to prevent overwhelming slow clients
+                        match stream_result {
+                            Ok(mut stream) => {
+                                let max_rows_to_send = if max_rows > 0 { max_rows as usize } else { usize::MAX };
+                                let mut rows_sent = 0usize;
                                 let mut bytes_since_flush = 0usize;
-                                let mut rows_since_flush = 0usize;
                                 let mut client_disconnected = false;
+                                let mut stream_exhausted = false;
+                                let mut stream_error: Option<String> = None;
+                                let mut pending_rows: Vec<Vec<String>> = Vec::new();
+                                let mut columns: Vec<(String, String)> = Vec::new();
                                 
-                                for row in &rows[..rows_to_send] {
-                                    // Build and send DataRow
-                                    let data_row = build_data_row(row);
-                                    bytes_since_flush += data_row.len();
-                                    rows_since_flush += 1;
-                                    socket.write_all(&data_row).await?;
+                                // Stream rows directly to client
+                                'stream_loop: loop {
+                                    if rows_sent >= max_rows_to_send {
+                                        break; // Reached max_rows limit
+                                    }
                                     
-                                    // Backpressure check: flush based on bytes or row count
-                                    if bytes_since_flush >= config.flush_threshold_bytes 
-                                        || rows_since_flush >= config.flush_threshold_rows {
-                                        // Flush and check for slow client
-                                        let flush_start = std::time::Instant::now();
-                                        if let Err(e) = socket.flush().await {
-                                            if is_disconnect_error(&e) {
-                                                warn!("Client disconnected during streaming after {} rows", rows_since_flush);
-                                                client_disconnected = true;
-                                                break;
+                                    match stream.next().await {
+                                        Some(Ok(StreamingBatch::Metadata { columns: cols, column_types: types })) => {
+                                            // Convert to (name, type) pairs
+                                            columns = cols.into_iter().zip(types.into_iter()).collect();
+                                            continue;
+                                        }
+                                        Some(Ok(StreamingBatch::Rows(batch_rows))) => {
+                                            for row in batch_rows {
+                                                if rows_sent >= max_rows_to_send {
+                                                    // Save remaining rows for portal resumption
+                                                    pending_rows.push(row);
+                                                } else {
+                                                    let data_row = build_data_row(&row);
+                                                    bytes_since_flush += data_row.len();
+                                                    if let Err(e) = socket.write_all(&data_row).await {
+                                                        if is_disconnect_error(&e) {
+                                                            client_disconnected = true;
+                                                            break 'stream_loop;
+                                                        }
+                                                        return Err(e.into());
+                                                    }
+                                                    rows_sent += 1;
+                                                    
+                                                    // Backpressure: flush periodically
+                                                    if bytes_since_flush >= config.flush_threshold_bytes {
+                                                        if let Err(e) = socket.flush().await {
+                                                            if is_disconnect_error(&e) {
+                                                                client_disconnected = true;
+                                                                break 'stream_loop;
+                                                            }
+                                                            return Err(e.into());
+                                                        }
+                                                        bytes_since_flush = 0;
+                                                    }
+                                                }
                                             }
-                                            return Err(e.into());
                                         }
-                                        let flush_time = flush_start.elapsed();
-                                        if flush_time.as_secs() >= 5 {
-                                            debug!("Slow client detected: flush took {}ms", flush_time.as_millis());
+                                        Some(Ok(StreamingBatch::Error(msg))) => {
+                                            stream_error = Some(msg);
+                                            break;
                                         }
-                                        bytes_since_flush = 0;
-                                        rows_since_flush = 0;
+                                        Some(Err(e)) => {
+                                            stream_error = Some(e.to_string());
+                                            break;
+                                        }
+                                        None => {
+                                            stream_exhausted = true;
+                                            break;
+                                        }
                                     }
                                 }
                                 
                                 // Final flush
-                                if !client_disconnected {
-                                    socket.flush().await?;
+                                if !client_disconnected && stream_error.is_none() {
+                                    let _ = socket.flush().await;
                                 }
                                 
                                 if client_disconnected {
-                                    // Client gone, clean up
-                                    info!("Client disconnected during Execute, cleaning up");
+                                    info!("Client disconnected during TRUE STREAMING Execute after {} rows", rows_sent);
                                     break;
-                                }
-                                
-                                if rows_to_send < total_rows {
-                                    // More rows - store state and send PortalSuspended
-                                    // Only buffer what we need (rows after offset)
-                                    let rows_to_buffer: Vec<Vec<String>> = rows.into_iter()
-                                        .skip(rows_to_send)
-                                        .collect();
-                                    portal_state = Some(PortalState::new_buffered(
-                                        rows_to_buffer,
-                                        __describe_column_count,
-                                    ));
-                                    debug!("Extended Protocol - Execute: {} rows sent, {} buffered for portal, sending PortalSuspended", 
-                                        rows_to_send, total_rows - rows_to_send);
+                                } else if let Some(err) = stream_error {
+                                    error!("Extended Protocol - Execute: stream error: {}", err);
+                                    send_error_generic(socket, &err).await?;
+                                    ignore_till_sync = true;
+                                    update_transaction_status!(TRANSACTION_STATUS_ERROR);
+                                } else if stream_exhausted && pending_rows.is_empty() {
+                                    // All rows sent
+                                    let cmd_tag = format!("SELECT {}", rows_sent);
+                                    send_command_complete_generic(socket, &cmd_tag).await?;
+                                    socket.flush().await?;
+                                    info!("Extended Protocol - Execute: TRUE STREAMING sent {} rows, CommandComplete", rows_sent);
+                                } else {
+                                    // More rows available - store streaming portal for resumption
+                                    info!("Extended Protocol - Execute: TRUE STREAMING sent {} rows, more available, storing StreamingPortal", rows_sent);
+                                    portal_state = Some(PortalState::Streaming(StreamingPortal {
+                                        stream,
+                                        columns,
+                                        rows_sent,
+                                        column_count: __describe_column_count,
+                                        pending_rows,
+                                    }));
                                     socket.write_all(&[b's', 0, 0, 0, 4]).await?; // PortalSuspended
                                     socket.flush().await?;
                                     continue; // Don't clear state
-                                } else {
-                                    // All rows sent
-                                    let cmd_tag = format!("SELECT {}", total_rows);
-                                    send_command_complete_generic(socket, &cmd_tag).await?;
-                                    socket.flush().await?;
-                                    info!("Extended Protocol - Execute: sent CommandComplete ({}), flushed", cmd_tag);
                                 }
                             }
-                            Ok(Err(e)) => {
-                                error!("Extended Protocol - Execute: query failed: {}", e);
+                            Err(e) => {
+                                error!("Extended Protocol - Execute: failed to start stream: {}", e);
                                 send_error_generic(socket, &e.to_string()).await?;
-                                // Set skip-till-sync for error recovery (PostgreSQL protocol)
-                                // Don't send ReadyForQuery yet - wait for client to send Sync
-                                ignore_till_sync = true;
-                                update_transaction_status!(TRANSACTION_STATUS_ERROR);
-                            }
-                            Err(_elapsed) => {
-                                // Timeout expired
-                                let error_msg = format!(
-                                    "Query timeout: exceeded {}s limit. Use LIMIT clause or DECLARE CURSOR.",
-                                    config.query_timeout_secs
-                                );
-                                error!("Extended Protocol - Execute: query timed out after {}s", config.query_timeout_secs);
-                                send_error_generic(socket, &error_msg).await?;
-                                // Set skip-till-sync for error recovery
                                 ignore_till_sync = true;
                                 update_transaction_status!(TRANSACTION_STATUS_ERROR);
                             }
                         }
+                        
                     }
                     
                     // Clear state only if no more rows
