@@ -34,7 +34,7 @@ use crate::query_router::{QueryRouter, QueryTarget};
 use crate::redis_queue::{RedisQueue, RedisQueueConfig};
 use crate::smart_scaler::SmartScaler;
 use crate::tls_config::TlsConfig;
-use crate::worker_client::{StreamingBatch, WorkerClient, WorkerClientPool};
+use crate::worker_client::{StreamingBatch, StreamingResult, WorkerClient, WorkerClientPool};
 use crate::worker_pool::WorkerPoolManager;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -367,7 +367,7 @@ async fn send_notice_message<S: AsyncWrite + Unpin>(
 /// Result of streaming query execution (for metrics tracking)
 #[derive(Debug, Default)]
 #[allow(dead_code)]
-struct StreamingResult {
+struct StreamingMetrics {
     /// Total rows streamed to client
     rows: usize,
     /// Total bytes streamed to client
@@ -1680,21 +1680,68 @@ async fn run_query_loop(
 /// Portal state for Extended Query Protocol cursor support
 /// This enables JDBC setFetchSize() streaming by maintaining row state between Execute calls
 /// 
-/// ARCHITECTURE NOTE: Currently buffers all rows for simplicity. For true PostgreSQL-like
-/// streaming, this should hold a Stream instead of Vec<Vec<String>>. However, this requires:
-/// 1. Changing execute_query_get_rows to return a Stream
-/// 2. Storing the Stream across async boundaries (Pin<Box<dyn Stream>>)
-/// 3. Handling Stream lifetime with the worker gRPC connection
+/// Supports two modes:
+/// 1. **TRUE STREAMING**: Holds a gRPC stream handle, reads rows on-demand
+/// 2. **BUFFERED**: Falls back to buffering for small results or compatibility
 /// 
-/// The current approach works for datasets under ~1M rows per batch. For larger datasets,
-/// use Simple Query Protocol (preferQueryMode=simple) or DECLARE CURSOR / FETCH.
-struct PortalState {
-    /// Buffered rows from query execution (TODO: Replace with Stream for true streaming)
+/// TRUE STREAMING provides:
+/// - Low latency (first row sent immediately after query starts)
+/// - Low memory (only one batch in memory at a time)
+/// - Backpressure propagation (slow client -> slow worker via gRPC flow control)
+enum PortalState {
+    /// TRUE STREAMING: Holds gRPC stream handle, reads on-demand
+    /// This is the preferred mode for large result sets
+    Streaming(StreamingPortal),
+    /// BUFFERED: Fallback for small results or when streaming setup fails
+    Buffered(BufferedPortal),
+}
+
+/// Streaming portal - holds a live gRPC stream for true streaming
+struct StreamingPortal {
+    /// The gRPC streaming result from worker (owns the receiver)
+    stream: StreamingResult,
+    /// Column metadata from first batch
+    columns: Vec<(String, String)>,
+    /// Total rows sent so far (for CommandComplete)
+    rows_sent: usize,
+    /// Column count for DataRow consistency
+    column_count: usize,
+    /// Buffer for partial batch consumption (when max_rows < batch size)
+    /// Rows that were read from stream but not yet sent to client
+    pending_rows: Vec<Vec<String>>,
+}
+
+/// Buffered portal - stores all rows in memory (fallback mode)
+struct BufferedPortal {
+    /// All rows from query execution
     rows: Vec<Vec<String>>,
-    /// Current row offset (for resumption)
+    /// Current row offset (for resumption after PortalSuspended)
     offset: usize,
     /// Column count for DataRow consistency
     column_count: usize,
+}
+
+impl PortalState {
+    /// Create a new streaming portal
+    fn new_streaming(stream: StreamingResult, columns: Vec<(String, String)>) -> Self {
+        let column_count = columns.len();
+        PortalState::Streaming(StreamingPortal {
+            stream,
+            columns,
+            rows_sent: 0,
+            column_count,
+            pending_rows: Vec::new(),
+        })
+    }
+    
+    /// Create a new buffered portal (fallback)
+    fn new_buffered(rows: Vec<Vec<String>>, column_count: usize) -> Self {
+        PortalState::Buffered(BufferedPortal {
+            rows,
+            offset: 0,
+            column_count,
+        })
+    }
 }
 
 /// Run the main query loop for generic streams (TLS)
@@ -2337,72 +2384,175 @@ where
                 };
                 
                 // Check if we're resuming from a suspended portal
-                if let Some(ref mut state) = portal_state {
-                    // Resume from stored rows
-                    let remaining = state.rows.len() - state.offset;
-                    let rows_to_send = if max_rows > 0 && (max_rows as usize) < remaining {
-                        max_rows as usize
-                    } else {
-                        remaining
+                // Use take() to avoid borrow issues with mutable state
+                if let Some(mut state) = portal_state.take() {
+                    let (should_continue, keep_state) = match &mut state {
+                        PortalState::Streaming(portal) => {
+                            // TRUE STREAMING: Read from gRPC stream on-demand
+                            let max_rows_to_send = if max_rows > 0 { max_rows as usize } else { usize::MAX };
+                            let mut rows_sent_this_batch = 0usize;
+                            let mut bytes_since_flush = 0usize;
+                            let mut client_disconnected = false;
+                            let mut stream_exhausted = false;
+                            let mut stream_error: Option<String> = None;
+                            
+                            debug!("Extended Protocol - Execute: TRUE STREAMING resume, max_rows={}", max_rows);
+                            
+                            // First, send any pending rows from previous partial batch
+                            while !portal.pending_rows.is_empty() && rows_sent_this_batch < max_rows_to_send {
+                                let row = portal.pending_rows.remove(0);
+                                let data_row = build_data_row(&row);
+                                bytes_since_flush += data_row.len();
+                                if let Err(e) = socket.write_all(&data_row).await {
+                                    if is_disconnect_error(&e) { client_disconnected = true; break; }
+                                    return Err(e.into());
+                                }
+                                rows_sent_this_batch += 1;
+                                portal.rows_sent += 1;
+                                
+                                if bytes_since_flush >= config.flush_threshold_bytes {
+                                    if let Err(e) = socket.flush().await {
+                                        if is_disconnect_error(&e) { client_disconnected = true; break; }
+                                        return Err(e.into());
+                                    }
+                                    bytes_since_flush = 0;
+                                }
+                            }
+                            
+                            // Then read from stream until we reach max_rows or stream exhausted
+                            while !client_disconnected && rows_sent_this_batch < max_rows_to_send {
+                                match portal.stream.next().await {
+                                    Some(Ok(StreamingBatch::Rows(batch_rows))) => {
+                                        for row in batch_rows {
+                                            if rows_sent_this_batch >= max_rows_to_send {
+                                                // Save remaining rows for next Execute
+                                                portal.pending_rows.push(row);
+                                            } else {
+                                                let data_row = build_data_row(&row);
+                                                bytes_since_flush += data_row.len();
+                                                if let Err(e) = socket.write_all(&data_row).await {
+                                                    if is_disconnect_error(&e) { client_disconnected = true; break; }
+                                                    return Err(e.into());
+                                                }
+                                                rows_sent_this_batch += 1;
+                                                portal.rows_sent += 1;
+                                                
+                                                if bytes_since_flush >= config.flush_threshold_bytes {
+                                                    if let Err(e) = socket.flush().await {
+                                                        if is_disconnect_error(&e) { client_disconnected = true; break; }
+                                                        return Err(e.into());
+                                                    }
+                                                    bytes_since_flush = 0;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Some(Ok(StreamingBatch::Metadata { .. })) => continue,
+                                    Some(Ok(StreamingBatch::Error(msg))) => { stream_error = Some(msg); break; }
+                                    Some(Err(e)) => { stream_error = Some(e.to_string()); break; }
+                                    None => { stream_exhausted = true; break; }
+                                }
+                            }
+                            
+                            if !client_disconnected && stream_error.is_none() {
+                                let _ = socket.flush().await;
+                            }
+                            
+                            if client_disconnected {
+                                info!("Client disconnected during streaming resume");
+                                (false, false) // break loop, don't keep state
+                            } else if let Some(err) = stream_error {
+                                send_error_generic(socket, &err).await?;
+                                (true, false) // continue, don't keep state
+                            } else if stream_exhausted && portal.pending_rows.is_empty() {
+                                // All rows sent
+                                let cmd_tag = format!("SELECT {}", portal.rows_sent);
+                                send_command_complete_generic(socket, &cmd_tag).await?;
+                                prepared_query = None;
+                                describe_sent_row_description = false;
+                                __describe_column_count = 0;
+                                bound_parameters.clear();
+                                cached_describe_columns = None;
+                                (true, false) // continue, don't keep state
+                            } else {
+                                // More rows available - send PortalSuspended
+                                debug!("Extended Protocol - Execute: TRUE STREAMING sent {} rows, more available", rows_sent_this_batch);
+                                socket.write_all(&[b's', 0, 0, 0, 4]).await?;
+                                socket.flush().await?;
+                                (true, true) // continue, keep state
+                            }
+                        }
+                        PortalState::Buffered(portal) => {
+                            // BUFFERED: Resume from stored rows (fallback mode)
+                            let remaining = portal.rows.len() - portal.offset;
+                            let rows_to_send = if max_rows > 0 && (max_rows as usize) < remaining {
+                                max_rows as usize
+                            } else {
+                                remaining
+                            };
+                            
+                            let end = portal.offset + rows_to_send;
+                            debug!("Extended Protocol - Execute: BUFFERED resume from offset {}, sending {} rows", portal.offset, rows_to_send);
+                            
+                            let mut bytes_since_flush = 0usize;
+                            let mut rows_since_flush = 0usize;
+                            let mut client_disconnected = false;
+                            
+                            for row in &portal.rows[portal.offset..end] {
+                                let data_row = build_data_row(row);
+                                bytes_since_flush += data_row.len();
+                                rows_since_flush += 1;
+                                socket.write_all(&data_row).await?;
+                                
+                                if bytes_since_flush >= config.flush_threshold_bytes 
+                                    || rows_since_flush >= config.flush_threshold_rows {
+                                    if let Err(e) = socket.flush().await {
+                                        if is_disconnect_error(&e) { client_disconnected = true; break; }
+                                        return Err(e.into());
+                                    }
+                                    bytes_since_flush = 0;
+                                    rows_since_flush = 0;
+                                }
+                            }
+                            
+                            if !client_disconnected {
+                                socket.flush().await?;
+                            }
+                            
+                            if client_disconnected {
+                                info!("Client disconnected during buffered resume");
+                                (false, false) // break loop, don't keep state
+                            } else {
+                                portal.offset = end;
+                                
+                                if portal.offset >= portal.rows.len() {
+                                    // All rows sent
+                                    let cmd_tag = format!("SELECT {}", portal.rows.len());
+                                    send_command_complete_generic(socket, &cmd_tag).await?;
+                                    prepared_query = None;
+                                    describe_sent_row_description = false;
+                                    __describe_column_count = 0;
+                                    bound_parameters.clear();
+                                    cached_describe_columns = None;
+                                    (true, false) // continue, don't keep state
+                                } else {
+                                    // More rows available - send PortalSuspended
+                                    socket.write_all(&[b's', 0, 0, 0, 4]).await?;
+                                    socket.flush().await?;
+                                    (true, true) // continue, keep state
+                                }
+                            }
+                        }
                     };
                     
-                    let end = state.offset + rows_to_send;
-                    debug!("Extended Protocol - Execute: Resuming from offset {}, sending {} rows", state.offset, rows_to_send);
-                    
-                    // Send rows with backpressure awareness
-                    let mut bytes_since_flush = 0usize;
-                    let mut rows_since_flush = 0usize;
-                    let mut client_disconnected = false;
-                    
-                    for row in &state.rows[state.offset..end] {
-                        let data_row = build_data_row(row);
-                        bytes_since_flush += data_row.len();
-                        rows_since_flush += 1;
-                        socket.write_all(&data_row).await?;
-                        
-                        // Backpressure check
-                        if bytes_since_flush >= config.flush_threshold_bytes 
-                            || rows_since_flush >= config.flush_threshold_rows {
-                            if let Err(e) = socket.flush().await {
-                                if is_disconnect_error(&e) {
-                                    warn!("Client disconnected during portal resume after {} rows", rows_since_flush);
-                                    client_disconnected = true;
-                                    break;
-                                }
-                                return Err(e.into());
-                            }
-                            bytes_since_flush = 0;
-                            rows_since_flush = 0;
-                        }
+                    // Restore portal_state if we should keep it
+                    if keep_state {
+                        portal_state = Some(state);
+                        continue; // Don't process further, wait for next Execute
                     }
                     
-                    if !client_disconnected {
-                        socket.flush().await?;
-                    }
-                    
-                    if client_disconnected {
-                        info!("Client disconnected during portal resume, cleaning up");
-                        portal_state = None;
-                        break;
-                    }
-                    
-                    state.offset = end;
-                    
-                    if state.offset >= state.rows.len() {
-                        // All rows sent
-                        let cmd_tag = format!("SELECT {}", state.rows.len());
-                        send_command_complete_generic(socket, &cmd_tag).await?;
-                        portal_state = None;
-                        prepared_query = None;
-                        describe_sent_row_description = false;
-                        __describe_column_count = 0;
-                        bound_parameters.clear();
-                        cached_describe_columns = None;
-                    } else {
-                        // More rows available
-                        socket.write_all(&[b's', 0, 0, 0, 4]).await?; // PortalSuspended
-                        socket.flush().await?;
-                        continue; // Don't clear state
+                    if !should_continue {
+                        break; // Client disconnected
                     }
                 } else if let Some(ref sql) = prepared_query {
                     // First Execute - need to run query
@@ -2566,11 +2716,10 @@ where
                                     let rows_to_buffer: Vec<Vec<String>> = rows.into_iter()
                                         .skip(rows_to_send)
                                         .collect();
-                                    portal_state = Some(PortalState {
-                                        rows: rows_to_buffer,
-                                        offset: 0, // Reset offset since we truncated the Vec
-                                        column_count: __describe_column_count,
-                                    });
+                                    portal_state = Some(PortalState::new_buffered(
+                                        rows_to_buffer,
+                                        __describe_column_count,
+                                    ));
                                     debug!("Extended Protocol - Execute: {} rows sent, {} buffered for portal, sending PortalSuspended", 
                                         rows_to_send, total_rows - rows_to_send);
                                     socket.write_all(&[b's', 0, 0, 0, 4]).await?; // PortalSuspended
