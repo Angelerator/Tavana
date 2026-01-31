@@ -1991,14 +1991,20 @@ where
                 let mut data = vec![0u8; len];
                 socket.read_exact(&mut data).await?;
                 
-                debug!("Extended Protocol - Describe");
+                // PROTOCOL FIX: Parse describe type - 'S' for Statement, 'P' for Portal
+                // Portal describe should NOT receive ParameterDescription
+                let describe_type = if data.is_empty() { b'S' } else { data[0] };
+                debug!("Extended Protocol - Describe type: {}", describe_type as char);
                 
                 // Reset state for this Describe
                 describe_sent_row_description = false;
                 __describe_column_count = 0;
                 
-                // Send ParameterDescription (no parameters)
-                socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
+                // PROTOCOL FIX: Only send ParameterDescription for Statement describes ('S')
+                // Portal describes expect ONLY RowDescription or NoData
+                if describe_type == b'S' {
+                    socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
+                }
                 
                 // Get column descriptions if we have a prepared query
                 // Note: COPY commands were already rewritten to SELECT at Parse time
@@ -4798,8 +4804,11 @@ async fn handle_describe(
     if let Some(sql) = prepared_query {
         // Check for PostgreSQL-specific commands first
         if let Some(result) = handle_pg_specific_command(sql) {
-            // Send ParameterDescription (no parameters)
-            socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?; // 0 parameters
+            // PROTOCOL FIX: Only send ParameterDescription for Statement describes ('S'), not Portal ('P')
+            // Portal describe expects ONLY RowDescription or NoData
+            if describe_type == b'S' {
+                socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?; // 0 parameters
+            }
             
             // Send RowDescription for the columns
             if result.columns.is_empty() {
@@ -4839,8 +4848,10 @@ async fn handle_describe(
             
             match worker_client.execute_query(&schema_query, user_id).await {
                 Ok(result) => {
-                    // Send ParameterDescription (no parameters)
-                    socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?; // 0 parameters
+                    // PROTOCOL FIX: Only send ParameterDescription for Statement describes ('S'), not Portal ('P')
+                    if describe_type == b'S' {
+                        socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?; // 0 parameters
+                    }
                     
                     // Build columns list
                     let columns: Vec<(String, String)> = result.columns.iter()
@@ -4862,8 +4873,10 @@ async fn handle_describe(
                 }
                 Err(e) => {
                     warn!("Extended Protocol (non-TLS) - Describe failed: {}, sending NoData", e);
-                    // Send ParameterDescription (no parameters) and NoData as fallback
-                    socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
+                    // PROTOCOL FIX: Only send ParameterDescription for Statement describes
+                    if describe_type == b'S' {
+                        socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
+                    }
                     socket.write_all(&[b'n', 0, 0, 0, 4]).await?;
                     return Ok((false, 0));
                 }
