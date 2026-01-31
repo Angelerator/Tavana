@@ -210,6 +210,119 @@ pub fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
     // Let all pg_catalog queries pass through to DuckDB for proper client compatibility.
     // Previously this returned empty results which broke DBeaver and other clients.
 
+    // =========================================================================
+    // REDSHIFT SYSTEM TABLE INTERCEPTION
+    // =========================================================================
+    // The Redshift ODBC/JDBC driver queries Redshift-specific system tables
+    // (stv_*, stl_*, svv_*, svl_*) during connection validation and metadata
+    // discovery. Since Tavana uses DuckDB (which doesn't have these tables),
+    // we return empty results to satisfy the driver's expectations.
+    // =========================================================================
+
+    // Check for Redshift system table queries
+    if sql_upper.contains("STV_") || sql_upper.contains("STL_") 
+        || sql_upper.contains("SVV_") || sql_upper.contains("SVL_")
+        || sql_upper.contains("PG_USER_INFO") 
+        || sql_upper.contains("PG_DEFAULT_ACL")
+    {
+        info!(
+            "Intercepting Redshift system table query: {}",
+            if sql.len() > 100 { &sql[..100] } else { sql }
+        );
+
+        // STV_SESSIONS - active sessions (used by driver for connection validation)
+        if sql_upper.contains("STV_SESSIONS") {
+            return Some(QueryExecutionResult {
+                columns: vec![
+                    ("user_name".to_string(), "text".to_string()),
+                    ("db_name".to_string(), "text".to_string()),
+                    ("process".to_string(), "int4".to_string()),
+                ],
+                rows: vec![vec!["tavana".to_string(), "main".to_string(), "1".to_string()]],
+                row_count: 1,
+                command_tag: None,
+            });
+        }
+
+        // STV_INFLIGHT - running queries
+        if sql_upper.contains("STV_INFLIGHT") {
+            return Some(QueryExecutionResult {
+                columns: vec![
+                    ("userid".to_string(), "int4".to_string()),
+                    ("query".to_string(), "text".to_string()),
+                ],
+                rows: vec![],
+                row_count: 0,
+                command_tag: None,
+            });
+        }
+
+        // SVV_TABLES - all tables (for metadata discovery)
+        if sql_upper.contains("SVV_TABLES") || sql_upper.contains("SVV_ALL_TABLES") {
+            return Some(QueryExecutionResult {
+                columns: vec![
+                    ("table_catalog".to_string(), "text".to_string()),
+                    ("table_schema".to_string(), "text".to_string()),
+                    ("table_name".to_string(), "text".to_string()),
+                    ("table_type".to_string(), "text".to_string()),
+                ],
+                rows: vec![],
+                row_count: 0,
+                command_tag: None,
+            });
+        }
+
+        // SVV_COLUMNS - column metadata
+        if sql_upper.contains("SVV_COLUMNS") || sql_upper.contains("SVV_ALL_COLUMNS") {
+            return Some(QueryExecutionResult {
+                columns: vec![
+                    ("table_catalog".to_string(), "text".to_string()),
+                    ("table_schema".to_string(), "text".to_string()),
+                    ("table_name".to_string(), "text".to_string()),
+                    ("column_name".to_string(), "text".to_string()),
+                    ("data_type".to_string(), "text".to_string()),
+                ],
+                rows: vec![],
+                row_count: 0,
+                command_tag: None,
+            });
+        }
+
+        // SVV_EXTERNAL_SCHEMAS - external schemas (Spectrum)
+        if sql_upper.contains("SVV_EXTERNAL") {
+            return Some(QueryExecutionResult {
+                columns: vec![
+                    ("schemaname".to_string(), "text".to_string()),
+                    ("databasename".to_string(), "text".to_string()),
+                ],
+                rows: vec![],
+                row_count: 0,
+                command_tag: None,
+            });
+        }
+
+        // PG_USER_INFO - Redshift-specific user info
+        if sql_upper.contains("PG_USER_INFO") {
+            return Some(QueryExecutionResult {
+                columns: vec![
+                    ("usename".to_string(), "text".to_string()),
+                    ("usesysid".to_string(), "int4".to_string()),
+                ],
+                rows: vec![vec!["tavana".to_string(), "1".to_string()]],
+                row_count: 1,
+                command_tag: None,
+            });
+        }
+
+        // Default: return empty result for any other Redshift system table
+        return Some(QueryExecutionResult {
+            columns: vec![],
+            rows: vec![],
+            row_count: 0,
+            command_tag: None,
+        });
+    }
+
     None
 }
 
