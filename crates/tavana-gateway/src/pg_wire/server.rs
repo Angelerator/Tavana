@@ -29,6 +29,7 @@ use crate::pg_wire::backpressure::{
     build_row_description, build_command_complete, build_data_row,
     is_disconnect_error,
 };
+use crate::pg_wire::protocol::types::{pg_type_len, pg_type_oid};
 use crate::query_queue::{QueryOutcome, QueryQueue};
 use crate::query_router::{QueryRouter, QueryTarget};
 use crate::smart_scaler::SmartScaler;
@@ -287,25 +288,6 @@ fn build_notice_message(message: &str) -> Vec<u8> {
     buf
 }
 
-/// Send a PostgreSQL NOTICE message to inform client
-#[allow(dead_code)]
-async fn send_notice_message<S: AsyncWrite + Unpin>(
-    socket: &mut S,
-    message: &str,
-) -> std::io::Result<()> {
-    socket.write_all(&build_notice_message(message)).await
-}
-
-/// Result of streaming query execution (for metrics tracking)
-#[derive(Debug, Default)]
-#[allow(dead_code)]
-struct StreamingMetrics {
-    /// Total rows streamed to client
-    rows: usize,
-    /// Total bytes streamed to client
-    bytes: usize,
-}
-
 /// PostgreSQL wire protocol server with SmartScaler (Formula 3) and Query Queue
 ///
 /// Architecture:
@@ -318,7 +300,6 @@ struct StreamingMetrics {
 pub struct PgWireServer {
     addr: SocketAddr,
     auth_service: Arc<AuthService>,
-    #[allow(dead_code)]
     auth_gateway: Option<Arc<AuthGateway>>,
     worker_client: Arc<WorkerClient>,
     /// Pool of worker clients for cursor affinity routing
@@ -332,7 +313,6 @@ pub struct PgWireServer {
     config: Arc<PgWireConfig>,
 }
 
-#[allow(dead_code)]
 impl PgWireServer {
     pub fn new(
         port: u16,
@@ -4362,32 +4342,6 @@ fn extract_startup_param(msg: &[u8], key: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn pg_type_oid(type_name: &str) -> u32 {
-    match type_name.to_lowercase().as_str() {
-        "int4" | "integer" | "int" | "int32" => 23,
-        "int8" | "bigint" | "int64" => 20,
-        "int2" | "smallint" | "int16" => 21,
-        "float4" | "real" | "float" => 700,
-        "float8" | "double" | "float64" => 701,
-        "bool" | "boolean" => 16,
-        "timestamp" | "timestamptz" => 1184,
-        "date" => 1082,
-        _ => 25, // TEXT
-    }
-}
-
-fn pg_type_len(type_name: &str) -> i16 {
-    match type_name.to_lowercase().as_str() {
-        "int4" | "integer" | "int" | "int32" => 4,
-        "int8" | "bigint" | "int64" => 8,
-        "int2" | "smallint" | "int16" => 2,
-        "float4" | "real" | "float" => 4,
-        "float8" | "double" | "float64" => 8,
-        "bool" | "boolean" => 1,
-        _ => -1, // Variable length
-    }
 }
 
 // ===== Password Authentication =====

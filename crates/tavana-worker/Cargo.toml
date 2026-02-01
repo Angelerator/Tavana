@@ -29,8 +29,7 @@ arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-flight = { workspace = true }
 
-# Note: DuckDB bundles Arrow 56.x, workspace uses 54.x
-# Arrow IPC serialization deferred until versions align
+# Note: Arrow 56 matches DuckDB's bundled Arrow version
 
 # DuckDB
 duckdb = { workspace = true }
@@ -66,9 +65,9 @@ num_cpus = "1.16"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 
 # Cursor manager dependencies
-dashmap = "6"
-parking_lot = "0.12"
-hex = "0.4"
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+hex = { workspace = true }
 
 # Query pattern matching for Delta cache
 regex = "1.10"

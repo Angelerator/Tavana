@@ -786,7 +786,7 @@ impl QueryQueue {
                     if let Some(resources) = &container.resources {
                         if let Some(limits) = &resources.limits {
                             if let Some(mem) = limits.get("memory") {
-                                let mem_mb = parse_k8s_memory_to_mb(&mem.0);
+                                let mem_mb = tavana_common::k8s::parse_k8s_memory_mb(&mem.0);
                                 total_memory_mb += mem_mb;
                                 worker_count += 1;
                             }
@@ -795,7 +795,7 @@ impl QueryQueue {
                         // (Real usage requires metrics-server)
                         if let Some(requests) = &resources.requests {
                             if let Some(mem) = requests.get("memory") {
-                                let mem_mb = parse_k8s_memory_to_mb(&mem.0);
+                                let mem_mb = tavana_common::k8s::parse_k8s_memory_mb(&mem.0);
                                 used_memory_mb += mem_mb / 2; // Conservative estimate
                             }
                         }
@@ -853,7 +853,7 @@ impl QueryQueue {
             if let Some(status) = &node.status {
                 if let Some(allocatable) = &status.allocatable {
                     if let Some(mem) = allocatable.get("memory") {
-                        total_allocatable_mb += parse_k8s_memory_to_mb(&mem.0);
+                        total_allocatable_mb += tavana_common::k8s::parse_k8s_memory_mb(&mem.0);
                     }
                 }
             }
@@ -1087,42 +1087,3 @@ impl std::fmt::Display for QueueError {
 
 impl std::error::Error for QueueError {}
 
-// ═══════════════════════════════════════════════════════════════════════════
-// HELPERS
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Parse K8s memory string (e.g., "512Mi", "2Gi", "1024") to MB
-fn parse_k8s_memory_to_mb(mem_str: &str) -> u64 {
-    let mem_str = mem_str.trim();
-
-    if let Some(val) = mem_str.strip_suffix("Gi") {
-        val.parse::<u64>().unwrap_or(0) * 1024
-    } else if let Some(val) = mem_str.strip_suffix("Mi") {
-        val.parse::<u64>().unwrap_or(0)
-    } else if let Some(val) = mem_str.strip_suffix("Ki") {
-        val.parse::<u64>().unwrap_or(0) / 1024
-    } else if let Some(val) = mem_str.strip_suffix("G") {
-        val.parse::<u64>().unwrap_or(0) * 1000
-    } else if let Some(val) = mem_str.strip_suffix("M") {
-        val.parse::<u64>().unwrap_or(0)
-    } else if let Some(val) = mem_str.strip_suffix("K") {
-        val.parse::<u64>().unwrap_or(0) / 1000
-    } else {
-        // Assume bytes
-        mem_str.parse::<u64>().unwrap_or(0) / (1024 * 1024)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_memory() {
-        assert_eq!(parse_k8s_memory_to_mb("512Mi"), 512);
-        assert_eq!(parse_k8s_memory_to_mb("2Gi"), 2048);
-        assert_eq!(parse_k8s_memory_to_mb("1024Ki"), 1);
-        assert_eq!(parse_k8s_memory_to_mb("1G"), 1000);
-        assert_eq!(parse_k8s_memory_to_mb("1073741824"), 1024); // 1GB in bytes
-    }
-}

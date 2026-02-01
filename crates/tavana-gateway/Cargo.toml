@@ -100,8 +100,8 @@ socket2 = { version = "0.5", features = ["all"] }
 
 # MD5 authentication for PostgreSQL wire protocol
 md5 = "0.7"
-rand = "0.8"
+rand = { workspace = true }
 
 # Base64 encoding for Flight SQL auth
-base64 = "0.22"
+base64 = { workspace = true }
 

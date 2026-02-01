@@ -1,11 +1,9 @@
 //! gRPC service implementation for the worker
 //!
-//! Uses TRUE STREAMING with Arrow IPC for high-performance query execution.
-//! Arrow 56 matches DuckDB's bundled version for zero-copy serialization.
+//! Uses TRUE STREAMING for high-performance query execution.
 
 use crate::cursor_manager::{CursorManager, CursorManagerConfig};
 use crate::executor::{DuckDbExecutor, ExecutorConfig};
-use arrow_ipc::writer::FileWriter;
 use dashmap::DashMap;
 use duckdb::arrow::array::Array;
 use duckdb::arrow::util::display::ArrayFormatter;
@@ -210,7 +208,7 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                 total_rows += batch.num_rows() as u64;
                 
                 // Use JSON serialization for reliable data transfer
-                let ipc_data = serialize_batch_to_json_fallback(&batch);
+                let ipc_data = serialize_batch_to_json(&batch);
                 
                 let arrow_batch = proto::ArrowRecordBatch {
                     schema: vec![], // Schema sent in metadata
@@ -587,40 +585,8 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
     }
 }
 
-/// Serialize a RecordBatch to Arrow IPC format (zero-copy binary)
-/// 
-/// Now that Arrow 56 matches DuckDB's bundled version, we can use Arrow IPC directly.
-/// This is 10-100x faster than JSON serialization and uses 50-80% less bandwidth.
-#[allow(dead_code)]
-fn serialize_batch_to_arrow_ipc(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u8> {
-    let mut buffer = Vec::new();
-    
-    // Use FileWriter for a complete, self-contained Arrow IPC message
-    {
-        let schema = batch.schema();
-        match FileWriter::try_new(&mut buffer, schema.as_ref()) {
-            Ok(mut writer) => {
-                if let Err(e) = writer.write(batch) {
-                    warn!("Arrow IPC write failed: {}, falling back to JSON", e);
-                    return serialize_batch_to_json_fallback(batch);
-                }
-                if let Err(e) = writer.finish() {
-                    warn!("Arrow IPC finish failed: {}, falling back to JSON", e);
-                    return serialize_batch_to_json_fallback(batch);
-                }
-            }
-            Err(e) => {
-                warn!("Arrow IPC writer creation failed: {}, falling back to JSON", e);
-                return serialize_batch_to_json_fallback(batch);
-            }
-        }
-    }
-    
-    buffer
-}
-
-/// Fallback JSON serialization for compatibility
-fn serialize_batch_to_json_fallback(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u8> {
+/// Serialize a RecordBatch to JSON format for streaming
+fn serialize_batch_to_json(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u8> {
     let mut rows_json: Vec<Vec<String>> = Vec::with_capacity(batch.num_rows());
     
     for row_idx in 0..batch.num_rows() {
