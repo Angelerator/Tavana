@@ -38,6 +38,7 @@ tracing = { workspace = true }
 opentelemetry = { workspace = true }
 
 # Utils
+rand = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }

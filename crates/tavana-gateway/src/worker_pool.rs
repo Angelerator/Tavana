@@ -17,6 +17,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tavana_common::k8s::{parse_k8s_cpu_millicores, parse_k8s_memory_bytes, parse_k8s_memory_mb};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -608,8 +609,8 @@ impl WorkerPoolManager {
                             .unwrap_or("0");
 
                         return Ok(PodResourceUsage {
-                            memory_bytes: parse_k8s_memory(memory_str),
-                            cpu_millicores: parse_k8s_cpu(cpu_str),
+                            memory_bytes: parse_k8s_memory_bytes(memory_str),
+                            cpu_millicores: parse_k8s_cpu_millicores(cpu_str),
                         });
                     }
                 }
@@ -699,45 +700,7 @@ pub struct PodResourceUsage {
 
 /// Parse K8s memory quantity to MB
 fn parse_memory_to_mb(quantity: &Quantity) -> u64 {
-    parse_k8s_memory(&quantity.0) / (1024 * 1024)
-}
-
-/// Parse K8s memory string to bytes
-fn parse_k8s_memory(value: &str) -> u64 {
-    // Parse common formats: "256Mi", "1Gi", "512M", "1G", "1234567890"
-    if value.ends_with("Gi") {
-        value.trim_end_matches("Gi").parse::<u64>().unwrap_or(0) * 1024 * 1024 * 1024
-    } else if value.ends_with("Mi") {
-        value.trim_end_matches("Mi").parse::<u64>().unwrap_or(0) * 1024 * 1024
-    } else if value.ends_with("Ki") {
-        value.trim_end_matches("Ki").parse::<u64>().unwrap_or(0) * 1024
-    } else if value.ends_with("G") {
-        value.trim_end_matches("G").parse::<u64>().unwrap_or(0) * 1000 * 1000 * 1000
-    } else if value.ends_with("M") {
-        value.trim_end_matches("M").parse::<u64>().unwrap_or(0) * 1000 * 1000
-    } else if value.ends_with("K") {
-        value.trim_end_matches("K").parse::<u64>().unwrap_or(0) * 1000
-    } else {
-        // Assume bytes
-        value.parse::<u64>().unwrap_or(0)
-    }
-}
-
-/// Parse K8s CPU string to millicores
-fn parse_k8s_cpu(value: &str) -> u64 {
-    // Parse common formats: "100m", "1", "1500m", "2.5"
-    if value.ends_with("m") {
-        value.trim_end_matches("m").parse::<u64>().unwrap_or(0)
-    } else if value.ends_with("n") {
-        // Nanocores
-        value.trim_end_matches("n").parse::<u64>().unwrap_or(0) / 1_000_000
-    } else if value.contains('.') {
-        // Fractional cores
-        (value.parse::<f64>().unwrap_or(0.0) * 1000.0) as u64
-    } else {
-        // Whole cores
-        value.parse::<u64>().unwrap_or(0) * 1000
-    }
+    parse_k8s_memory_mb(&quantity.0)
 }
 
 #[cfg(test)]
@@ -746,13 +709,12 @@ mod tests {
 
     #[test]
     fn test_parse_memory_to_mb() {
-        // Binary units (1 MiB = 1024 * 1024 bytes)
+        // Binary units (MiB, GiB)
         assert_eq!(parse_memory_to_mb(&Quantity("256Mi".to_string())), 256);
         assert_eq!(parse_memory_to_mb(&Quantity("1Gi".to_string())), 1024);
         assert_eq!(parse_memory_to_mb(&Quantity("4Gi".to_string())), 4096);
-        // SI units (1 MB = 1000 * 1000 bytes = ~0.95 MiB)
-        // 512 * 1000 * 1000 / (1024 * 1024) = 488
-        assert_eq!(parse_memory_to_mb(&Quantity("512M".to_string())), 488);
+        // SI units - treated as megabytes directly
+        assert_eq!(parse_memory_to_mb(&Quantity("512M".to_string())), 512);
     }
 
     #[test]

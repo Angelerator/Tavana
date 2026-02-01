@@ -419,7 +419,9 @@ impl CursorManager {
             Ok(result) => result,
             Err(e) => {
                 debug!("Cursor query failed, rolling back to clear transaction state");
-                let _ = connection.execute("ROLLBACK", params![]);
+                if let Err(rollback_err) = connection.execute("ROLLBACK", params![]) {
+                    warn!("Rollback failed (non-critical): {}", rollback_err);
+                }
                 return Err(e);
             }
         };
@@ -515,7 +517,9 @@ impl CursorManager {
             }
             Err(e) => {
                 warn!(cursor_id = %cursor_id, error = %e, "Failed to fetch more cursor data");
-                let _ = connection.execute("ROLLBACK", params![]);
+                if let Err(rollback_err) = connection.execute("ROLLBACK", params![]) {
+                    warn!("Rollback failed (non-critical): {}", rollback_err);
+                }
                 Err(e)
             }
         }

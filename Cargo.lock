@@ -5454,6 +5454,7 @@ dependencies = [
  "opentelemetry",
  "prost",
  "prost-types",
+ "rand 0.8.5",
  "rcgen",
  "rustls 0.23.35",
  "rustls-pemfile",

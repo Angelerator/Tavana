@@ -133,20 +133,16 @@ impl ApiKeyValidator {
     /// Hash an API key using BLAKE3
     fn hash_key(key: &str) -> String {
         let hash = blake3::hash(key.as_bytes());
-        hash.to_hex().to_string()
+        hash.to_hex().as_str().to_owned()
     }
 
-    /// Generate a new random API key
+    /// Generate a new random API key using cryptographically secure RNG
     pub fn generate_api_key() -> String {
         use base64::Engine;
+        use rand::RngCore;
+
         let mut bytes = [0u8; 32];
-        // Use a simple random generation - in production use proper RNG
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is before UNIX epoch - check system time configuration")
-            .as_nanos();
-        let hash = blake3::hash(&timestamp.to_le_bytes());
-        bytes.copy_from_slice(hash.as_bytes());
+        rand::thread_rng().fill_bytes(&mut bytes);
 
         format!(
             "tvn_{}",

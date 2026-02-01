@@ -29,6 +29,7 @@ use kube::{
     api::{Api, ListParams, Patch, PatchParams},
     Client,
 };
+use tavana_common::k8s::{parse_k8s_cpu_millicores, parse_k8s_memory_mb};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -661,14 +662,14 @@ impl SmartScaler {
                                         .get("usage")
                                         .and_then(|u| u.get("memory"))
                                         .and_then(|m| m.as_str())
-                                        .map(|s| parse_k8s_memory(s))
+                                        .map(parse_k8s_memory_mb)
                                         .unwrap_or(0);
 
                                     let cpu = container
                                         .get("usage")
                                         .and_then(|u| u.get("cpu"))
                                         .and_then(|c| c.as_str())
-                                        .map(|s| parse_k8s_cpu(s))
+                                        .map(parse_k8s_cpu_millicores)
                                         .unwrap_or(0);
 
                                     metrics.insert(name.to_string(), (memory, cpu));
@@ -1861,71 +1862,20 @@ impl SmartScaler {
 /// Parse K8s memory quantity (e.g., "1Gi", "512Mi", "1000000Ki")
 fn parse_memory_quantity(quantity: Option<&Quantity>) -> u64 {
     quantity
-        .map(|q| parse_k8s_memory(&q.0))
+        .map(|q| parse_k8s_memory_mb(&q.0))
         .unwrap_or(MIN_MEMORY_MB)
 }
 
 /// Parse K8s CPU quantity (e.g., "1", "500m", "2000m")
 fn parse_cpu_quantity(quantity: Option<&Quantity>) -> u64 {
-    quantity.map(|q| parse_k8s_cpu(&q.0)).unwrap_or(1000)
-}
-
-/// Parse K8s memory string to MB
-fn parse_k8s_memory(s: &str) -> u64 {
-    let s = s.trim();
-
-    if s.ends_with("Gi") {
-        s.trim_end_matches("Gi").parse::<u64>().unwrap_or(0) * 1024
-    } else if s.ends_with("Mi") {
-        s.trim_end_matches("Mi").parse::<u64>().unwrap_or(0)
-    } else if s.ends_with("Ki") {
-        s.trim_end_matches("Ki").parse::<u64>().unwrap_or(0) / 1024
-    } else if s.ends_with("G") {
-        s.trim_end_matches("G").parse::<u64>().unwrap_or(0) * 1024
-    } else if s.ends_with("M") {
-        s.trim_end_matches("M").parse::<u64>().unwrap_or(0)
-    } else if s.ends_with("K") {
-        s.trim_end_matches("K").parse::<u64>().unwrap_or(0) / 1024
-    } else {
-        // Assume bytes
-        s.parse::<u64>().unwrap_or(0) / (1024 * 1024)
-    }
-}
-
-/// Parse K8s CPU string to millicores
-fn parse_k8s_cpu(s: &str) -> u64 {
-    let s = s.trim();
-
-    if s.ends_with("m") {
-        s.trim_end_matches("m").parse::<u64>().unwrap_or(0)
-    } else if s.ends_with("n") {
-        s.trim_end_matches("n").parse::<u64>().unwrap_or(0) / 1_000_000
-    } else {
-        // Assume cores
-        (s.parse::<f64>().unwrap_or(0.0) * 1000.0) as u64
-    }
+    quantity
+        .map(|q| parse_k8s_cpu_millicores(&q.0))
+        .unwrap_or(1000)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_k8s_memory() {
-        assert_eq!(parse_k8s_memory("1Gi"), 1024);
-        assert_eq!(parse_k8s_memory("512Mi"), 512);
-        assert_eq!(parse_k8s_memory("256Mi"), 256);
-        assert_eq!(parse_k8s_memory("2Gi"), 2048);
-        assert_eq!(parse_k8s_memory("100G"), 100 * 1024);
-    }
-
-    #[test]
-    fn test_parse_k8s_cpu() {
-        assert_eq!(parse_k8s_cpu("1"), 1000);
-        assert_eq!(parse_k8s_cpu("500m"), 500);
-        assert_eq!(parse_k8s_cpu("2"), 2000);
-        assert_eq!(parse_k8s_cpu("100m"), 100);
-    }
 
     #[test]
     fn test_worker_state_calculations() {

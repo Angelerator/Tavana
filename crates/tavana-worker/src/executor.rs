@@ -8,7 +8,7 @@ use duckdb::arrow::datatypes::Schema;
 use duckdb::{params, Connection};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 /// DuckDB executor configuration
 #[derive(Debug, Clone)]
@@ -299,7 +299,6 @@ impl DeltaTableCache {
 /// - Community extension restrictions
 /// - Per-user resource limits (memory, threads)
 /// - Configuration locking to prevent privilege escalation
-#[allow(dead_code)]
 pub struct DuckDbExecutor {
     connections: Vec<Arc<PooledConnection>>,
     semaphore: Arc<Semaphore>,
@@ -317,7 +316,6 @@ pub struct DuckDbExecutor {
     security_config: SecurityConfig,
 }
 
-#[allow(dead_code)]
 impl DuckDbExecutor {
     /// Create a new DuckDB executor with connection pool
     pub fn new(config: ExecutorConfig) -> Result<Self> {
@@ -1235,7 +1233,9 @@ impl DuckDbExecutor {
         // This ensures the next query on this connection will succeed
         if result.is_err() {
             debug!("Query failed, rolling back to clear transaction state");
-            let _ = conn.execute("ROLLBACK", params![]);
+            if let Err(e) = conn.execute("ROLLBACK", params![]) {
+                warn!("Rollback failed (non-critical): {}", e);
+            }
         }
 
         result
@@ -1325,7 +1325,9 @@ impl DuckDbExecutor {
         // If query failed, rollback to clear any aborted transaction state
         if result.is_err() {
             debug!("Streaming query failed, rolling back to clear transaction state");
-            let _ = conn.execute("ROLLBACK", params![]);
+            if let Err(e) = conn.execute("ROLLBACK", params![]) {
+                warn!("Rollback failed (non-critical): {}", e);
+            }
         }
 
         result
@@ -1360,7 +1362,9 @@ impl DuckDbExecutor {
         // If query failed, rollback to clear any aborted transaction state
         if result.is_err() {
             debug!("Query with params failed, rolling back to clear transaction state");
-            let _ = conn.execute("ROLLBACK", params![]);
+            if let Err(e) = conn.execute("ROLLBACK", params![]) {
+                warn!("Rollback failed (non-critical): {}", e);
+            }
         }
 
         result
@@ -1735,48 +1739,6 @@ impl DuckDbExecutor {
         
         Ok(())
     }
-
-    /// Get query statistics (for resource tracking)
-    pub fn get_query_stats(&self) -> Result<QueryStats> {
-        // Use first connection for stats
-        let pooled_conn = &self.connections[0];
-        let conn = pooled_conn
-            .connection
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
-
-        let mut stmt = conn.prepare("SELECT current_setting('threads') as threads")?;
-        let mut rows = stmt.query(params![])?;
-
-        let threads: String = if let Some(row) = rows.next()? {
-            row.get(0)?
-        } else {
-            "unknown".to_string()
-        };
-
-        Ok(QueryStats {
-            threads: threads.parse().unwrap_or(1),
-            pool_size: self.connections.len(),
-        })
-    }
-}
-
-/// Query execution statistics
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct QueryStats {
-    pub threads: u32,
-    pub pool_size: usize,
-}
-
-/// Execution stats for billing
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct ExecutionStats {
-    pub execution_time_ms: u64,
-    pub rows_returned: u64,
-    pub bytes_scanned: u64,
-    pub cpu_time_ms: u64,
 }
 
 #[cfg(test)]
