@@ -105,3 +105,7 @@ rand = { workspace = true }
 # Base64 encoding for Flight SQL auth
 base64 = { workspace = true }
 
+# Fast numeric formatting (no allocation)
+itoa = "1.0"
+ryu = "1.0"
+

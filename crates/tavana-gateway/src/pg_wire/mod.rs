@@ -22,6 +22,7 @@
 //! 6. Complete → release capacity for next query
 
 // Utility modules (new modular structure)
+pub mod arrow_encoder;
 pub mod auth;
 pub mod backpressure;
 pub mod config;
