@@ -495,17 +495,116 @@ fn encode_text_value_optimized(buf: &mut BytesMut, value: &str) {
     }
 }
 
-/// Encode binary value into BytesMut buffer
-/// Same logic as encode_binary_value but works with BytesMut
+/// Encode binary value directly into BytesMut buffer (zero intermediate allocations)
+/// 
+/// Uses inline encoding logic to avoid the temporary Vec allocation that
+/// would occur if we called encode_binary_value and then copied.
 #[inline]
 fn encode_binary_value_bytes(buf: &mut BytesMut, value: &str, type_name: &str) {
-    // Reuse Vec<u8> logic - convert BytesMut to Vec temporarily
-    // This is slightly suboptimal but maintains compatibility
-    let start_len = buf.len();
-    let mut temp = Vec::with_capacity(32);
-    encode_binary_value(&mut temp, value, type_name);
-    buf.extend_from_slice(&temp);
-    let _ = start_len; // Suppress unused warning
+    let type_lower = type_name.to_lowercase();
+    
+    match type_lower.as_str() {
+        // === INTEGERS (most common) ===
+        "int4" | "integer" | "int" | "int32" | "signed" => {
+            if let Ok(v) = value.parse::<i32>() {
+                buf.extend_from_slice(&4i32.to_be_bytes());
+                buf.extend_from_slice(&v.to_be_bytes());
+            } else {
+                encode_text_fallback_bytes(buf, value);
+            }
+        }
+        "bigint" | "int64" | "long" => {
+            if let Ok(v) = value.parse::<i64>() {
+                buf.extend_from_slice(&8i32.to_be_bytes());
+                buf.extend_from_slice(&v.to_be_bytes());
+            } else {
+                encode_text_fallback_bytes(buf, value);
+            }
+        }
+        "int2" | "smallint" | "int16" | "short" => {
+            if let Ok(v) = value.parse::<i16>() {
+                buf.extend_from_slice(&2i32.to_be_bytes());
+                buf.extend_from_slice(&v.to_be_bytes());
+            } else {
+                encode_text_fallback_bytes(buf, value);
+            }
+        }
+        "int1" | "tinyint" | "int8" => {
+            if let Ok(v) = value.parse::<i8>() {
+                buf.extend_from_slice(&2i32.to_be_bytes());
+                buf.extend_from_slice(&(v as i16).to_be_bytes());
+            } else if let Ok(v) = value.parse::<i64>() {
+                buf.extend_from_slice(&8i32.to_be_bytes());
+                buf.extend_from_slice(&v.to_be_bytes());
+            } else {
+                encode_text_fallback_bytes(buf, value);
+            }
+        }
+        // === FLOATING POINT ===
+        "float8" | "double" | "float64" | "double precision" => {
+            if let Ok(v) = value.parse::<f64>() {
+                buf.extend_from_slice(&8i32.to_be_bytes());
+                buf.extend_from_slice(&v.to_be_bytes());
+            } else {
+                encode_text_fallback_bytes(buf, value);
+            }
+        }
+        "float4" | "real" | "float" | "float32" => {
+            if let Ok(v) = value.parse::<f32>() {
+                buf.extend_from_slice(&4i32.to_be_bytes());
+                buf.extend_from_slice(&v.to_be_bytes());
+            } else {
+                encode_text_fallback_bytes(buf, value);
+            }
+        }
+        // === BOOLEAN ===
+        "bool" | "boolean" | "logical" => {
+            let v: u8 = match value.to_lowercase().as_str() {
+                "t" | "true" | "1" | "yes" | "on" => 1,
+                _ => 0,
+            };
+            buf.extend_from_slice(&1i32.to_be_bytes());
+            buf.extend_from_slice(&[v]);
+        }
+        // === DATE/TIME (common) ===
+        "date" | "date32" => {
+            if let Some(days) = parse_date_to_pg_days(value) {
+                buf.extend_from_slice(&4i32.to_be_bytes());
+                buf.extend_from_slice(&days.to_be_bytes());
+            } else {
+                encode_text_fallback_bytes(buf, value);
+            }
+        }
+        "timestamp" | "datetime" | "timestamptz" | "timestamp with time zone" => {
+            if let Some(micros) = parse_timestamp_to_pg_micros(value) {
+                buf.extend_from_slice(&8i32.to_be_bytes());
+                buf.extend_from_slice(&micros.to_be_bytes());
+            } else {
+                encode_text_fallback_bytes(buf, value);
+            }
+        }
+        // === UUID ===
+        "uuid" => {
+            if let Some(bytes) = parse_uuid(value) {
+                buf.extend_from_slice(&16i32.to_be_bytes());
+                buf.extend_from_slice(&bytes);
+            } else {
+                encode_text_fallback_bytes(buf, value);
+            }
+        }
+        // === All other types: use text fallback ===
+        _ => {
+            encode_text_fallback_bytes(buf, value);
+        }
+    }
+}
+
+/// Text fallback for BytesMut (zero-copy where possible)
+#[inline]
+fn encode_text_fallback_bytes(buf: &mut BytesMut, value: &str) {
+    let bytes = value.as_bytes();
+    buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+    buf.extend_from_slice(bytes);
 }
 
 /// Get the format code for a specific column index
