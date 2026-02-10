@@ -36,7 +36,7 @@ use crate::query_queue::{QueryOutcome, QueryQueue};
 use crate::query_router::{QueryRouter, QueryTarget};
 use crate::smart_scaler::SmartScaler;
 use crate::tls_config::TlsConfig;
-use crate::worker_client::{NativeStreamingBatch, StreamingBatch, StreamingResult, WorkerClient, WorkerClientPool};
+use crate::worker_client::{NativeStreamingBatch, StreamingBatch, StreamingResult, WorkerClient, WorkerClientPool, deserialize_arrow_ipc, arrow_batch_to_string_rows};
 use crate::worker_pool::WorkerPoolManager;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -3479,79 +3479,93 @@ async fn execute_query_streaming_to_worker_impl(
             }
             Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
                 if !batch.data.is_empty() {
-                    if let Ok(rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
-                        for row in rows {
-                            // Build and write DataRow with backpressure tracking
-                            let data_row = build_data_row(&row);
-                            
-                            match writer.write_bytes(&data_row).await {
-                                Ok(_) => {}
+                    // Deserialize rows from the batch data
+                    // Priority 1: Arrow IPC format (new zero-copy format from worker)
+                    // Priority 2: JSON format (legacy fallback)
+                    let rows: Vec<Vec<String>> = if let Ok(record_batches) = deserialize_arrow_ipc(&batch.data) {
+                        let mut all_rows = Vec::new();
+                        for rb in record_batches {
+                            all_rows.extend(arrow_batch_to_string_rows(&rb));
+                        }
+                        all_rows
+                    } else if let Ok(json_rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                        json_rows
+                    } else {
+                        warn!("Failed to deserialize batch data ({} bytes) - not Arrow IPC or JSON", batch.data.len());
+                        continue;
+                    };
+                    
+                    for row in rows {
+                        // Build and write DataRow with backpressure tracking
+                        let data_row = build_data_row(&row);
+                        
+                        match writer.write_bytes(&data_row).await {
+                            Ok(_) => {}
+                            Err(e) if is_disconnect_error(&e) => {
+                                let stats = writer.stats();
+                                warn!("Client disconnected during streaming after {} rows, {} bytes", 
+                                    stats.rows_sent, stats.bytes_sent);
+                                return Err(anyhow::anyhow!("Client disconnected"));
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
+                        writer.row_sent();
+
+                        // Check if we should flush (based on bytes AND rows)
+                        if writer.should_flush() {
+                            match writer.flush_with_backpressure().await {
+                                Ok(true) => {} // Normal flush
+                                Ok(false) => {
+                                    // Slow client detected - continue but log
+                                    let stats = writer.stats();
+                                    debug!("Slow client detected after {} rows", stats.rows_sent);
+                                }
                                 Err(e) if is_disconnect_error(&e) => {
                                     let stats = writer.stats();
-                                    warn!("Client disconnected during streaming after {} rows, {} bytes", 
-                                        stats.rows_sent, stats.bytes_sent);
+                                    warn!("Client disconnected during flush after {} rows", stats.rows_sent);
                                     return Err(anyhow::anyhow!("Client disconnected"));
                                 }
-                                Err(e) => return Err(e.into()),
-                            }
-                            writer.row_sent();
-
-                            // Check if we should flush (based on bytes AND rows)
-                            if writer.should_flush() {
-                                match writer.flush_with_backpressure().await {
-                                    Ok(true) => {} // Normal flush
-                                    Ok(false) => {
-                                        // Slow client detected - continue but log
-                                        let stats = writer.stats();
-                                        debug!("Slow client detected after {} rows", stats.rows_sent);
-                                    }
-                                    Err(e) if is_disconnect_error(&e) => {
-                                        let stats = writer.stats();
-                                        warn!("Client disconnected during flush after {} rows", stats.rows_sent);
-                                        return Err(anyhow::anyhow!("Client disconnected"));
-                                    }
-                                    Err(e) => {
-                                        // Timeout or other error - client too slow
-                                        warn!("Flush failed: {} - client may be overwhelmed", e);
-                                        return Err(anyhow::anyhow!("Client too slow: {}", e));
-                                    }
+                                Err(e) => {
+                                    // Timeout or other error - client too slow
+                                    warn!("Flush failed: {} - client may be overwhelmed", e);
+                                    return Err(anyhow::anyhow!("Client too slow: {}", e));
                                 }
                             }
+                        }
 
-                            // Periodically check if client is still connected
-                            if writer.should_check_connection() {
-                                if !writer.is_connected().await {
-                                    let stats = writer.stats();
-                                    warn!("Client disconnected during streaming after {} rows", stats.rows_sent);
-                                    return Err(anyhow::anyhow!("Client disconnected"));
-                                }
-                                
+                        // Periodically check if client is still connected
+                        if writer.should_check_connection() {
+                            if !writer.is_connected().await {
                                 let stats = writer.stats();
-                                debug!("Streaming progress: {} rows, {} bytes, {} flushes", 
-                                    stats.rows_sent, stats.bytes_sent, stats.flush_count);
+                                warn!("Client disconnected during streaming after {} rows", stats.rows_sent);
+                                return Err(anyhow::anyhow!("Client disconnected"));
                             }
-
-                            // Check for large transfer warning (16GB, then every 2GB)
-                            // Non-blocking: just sends a NOTICE, doesn't slow streaming
-                            if let Some(current_gb) = writer.stats_mut().should_warn_large_transfer() {
-                                let notice_msg = format!(
-                                    "Large data transfer: {}GB sent. Consider using LIMIT or CURSOR for very large results.",
-                                    current_gb
-                                );
-                                warn!("Large transfer warning: {}GB sent to client", current_gb);
-                                // Send notice inline - non-blocking, just adds to buffer
-                                let notice_bytes = build_notice_message(&notice_msg);
-                                if let Err(e) = writer.write_bytes(&notice_bytes).await {
-                                    debug!("Failed to send large transfer notice: {}", e);
-                                }
-                            }
-
-                            // Log progress for very large queries
+                            
                             let stats = writer.stats();
-                            if stats.rows_sent % 1_000_000 == 0 && stats.rows_sent > 0 {
-                                info!("Streaming progress: {} rows, {} MB sent", 
-                                    stats.rows_sent, stats.bytes_sent / (1024 * 1024));
+                            debug!("Streaming progress: {} rows, {} bytes, {} flushes", 
+                                stats.rows_sent, stats.bytes_sent, stats.flush_count);
+                        }
+
+                        // Check for large transfer warning (16GB, then every 2GB)
+                        // Non-blocking: just sends a NOTICE, doesn't slow streaming
+                        if let Some(current_gb) = writer.stats_mut().should_warn_large_transfer() {
+                            let notice_msg = format!(
+                                "Large data transfer: {}GB sent. Consider using LIMIT or CURSOR for very large results.",
+                                current_gb
+                            );
+                            warn!("Large transfer warning: {}GB sent to client", current_gb);
+                            // Send notice inline - non-blocking, just adds to buffer
+                            let notice_bytes = build_notice_message(&notice_msg);
+                            if let Err(e) = writer.write_bytes(&notice_bytes).await {
+                                debug!("Failed to send large transfer notice: {}", e);
                             }
+                        }
+
+                        // Log progress for very large queries
+                        let stats = writer.stats();
+                        if stats.rows_sent % 1_000_000 == 0 && stats.rows_sent > 0 {
+                            info!("Streaming progress: {} rows, {} MB sent", 
+                                stats.rows_sent, stats.bytes_sent / (1024 * 1024));
                         }
                     }
                 }

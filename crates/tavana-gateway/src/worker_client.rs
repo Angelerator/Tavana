@@ -1174,7 +1174,7 @@ fn duckdb_type_to_arrow(type_name: &str) -> arrow_schema::DataType {
 /// Uses Arrow IPC stream format which preserves native types.
 /// 
 /// Tries StreamReader first (new format), falls back to FileReader (legacy).
-fn deserialize_arrow_ipc(data: &[u8]) -> Result<Vec<arrow_array::RecordBatch>, anyhow::Error> {
+pub fn deserialize_arrow_ipc(data: &[u8]) -> Result<Vec<arrow_array::RecordBatch>, anyhow::Error> {
     if data.is_empty() {
         warn!("Empty Arrow IPC data received");
         return Ok(Vec::new());
@@ -1321,7 +1321,7 @@ pub fn deserialize_arrow_ipc_native(data: &[u8]) -> Result<(arrow_schema::Schema
 
 /// Convert an Arrow RecordBatch to string rows for PG wire protocol
 /// Uses Arrow's built-in formatters for type-safe conversion
-fn arrow_batch_to_string_rows(batch: &arrow_array::RecordBatch) -> Vec<Vec<String>> {
+pub fn arrow_batch_to_string_rows(batch: &arrow_array::RecordBatch) -> Vec<Vec<String>> {
     use arrow_array::Array;
     use arrow::util::display::ArrayFormatter;
     
