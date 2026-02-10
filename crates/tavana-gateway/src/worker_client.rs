@@ -275,37 +275,62 @@ impl WorkerClient {
                     total_rows = meta.total_rows;
                 }
                 Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
-                    debug!("Received batch with {} rows", batch.row_count);
+                    debug!("Received batch with {} rows, {} bytes data", batch.row_count, batch.data.len());
                     if !batch.data.is_empty() {
+                        let mut deserialized = false;
+                        
                         // Priority 1: Try Arrow IPC format (new zero-copy format)
-                        if let Ok(record_batches) = deserialize_arrow_ipc(&batch.data) {
-                            for rb in record_batches {
-                                let batch_rows = arrow_batch_to_string_rows(&rb);
-                                rows.extend(batch_rows);
+                        match deserialize_arrow_ipc(&batch.data) {
+                            Ok(record_batches) => {
+                                if !record_batches.is_empty() {
+                                    for rb in record_batches {
+                                        let batch_rows = arrow_batch_to_string_rows(&rb);
+                                        debug!("Converted Arrow batch to {} string rows", batch_rows.len());
+                                        rows.extend(batch_rows);
+                                    }
+                                    deserialized = true;
+                                } else {
+                                    warn!("Arrow IPC deserialized to 0 batches, trying fallback formats");
+                                }
+                            }
+                            Err(e) => {
+                                debug!("Arrow IPC deserialization failed: {}", e);
                             }
                         }
+                        
                         // Priority 2: Try TVNA binary format (legacy optimized format)
-                        else if batch.data.starts_with(b"TVNA") {
+                        if !deserialized && batch.data.starts_with(b"TVNA") {
                             match deserialize_binary_batch(&batch.data) {
                                 Ok(batch_rows) => {
+                                    debug!("TVNA decoded {} rows", batch_rows.len());
                                     rows.extend(batch_rows);
+                                    deserialized = true;
                                 }
                                 Err(e) => {
                                     error!("TVNA decode failed: {}", e);
                                 }
                             }
                         }
+                        
                         // Priority 3: Fallback to JSON (oldest format)
-                        else {
+                        if !deserialized && !batch.data.starts_with(b"TVNA") {
                             match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
                                 Ok(batch_rows) => {
+                                    debug!("JSON decoded {} rows", batch_rows.len());
                                     rows.extend(batch_rows);
+                                    deserialized = true;
                                 }
                                 Err(json_err) => {
-                                    error!("All decode methods failed: {}", json_err);
+                                    error!("All decode methods failed for {} bytes: Arrow IPC failed, not TVNA, JSON error: {}", batch.data.len(), json_err);
                                 }
                             }
                         }
+                        
+                        if !deserialized {
+                            error!("Failed to deserialize batch data ({} bytes)", batch.data.len());
+                        }
+                    } else {
+                        warn!("Received RecordBatch with row_count={} but empty data", batch.row_count);
                     }
                 }
                 Some(proto::query_result_batch::Result::Profile(profile)) => {
@@ -388,32 +413,70 @@ impl WorkerClient {
                         })
                     }
                     Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
+                        debug!("Streaming received batch: {} rows, {} bytes data", batch.row_count, batch.data.len());
                         if !batch.data.is_empty() {
+                            let mut deserialized = false;
+                            let mut all_rows = Vec::new();
+                            
                             // Priority 1: Try Arrow IPC format (new zero-copy format)
                             // Arrow IPC preserves native types for Flight SQL passthrough
-                            if let Ok(record_batches) = deserialize_arrow_ipc(&batch.data) {
-                                let mut all_rows = Vec::new();
-                                for rb in record_batches {
-                                    let rows = arrow_batch_to_string_rows(&rb);
-                                    all_rows.extend(rows);
+                            match deserialize_arrow_ipc(&batch.data) {
+                                Ok(record_batches) => {
+                                    if !record_batches.is_empty() {
+                                        for rb in record_batches {
+                                            let rows = arrow_batch_to_string_rows(&rb);
+                                            debug!("Streaming: Arrow batch -> {} string rows", rows.len());
+                                            all_rows.extend(rows);
+                                        }
+                                        deserialized = true;
+                                    } else {
+                                        warn!("Streaming: Arrow IPC deserialized to 0 batches from {} bytes", batch.data.len());
+                                    }
                                 }
-                                Ok(StreamingBatch::Rows(all_rows))
+                                Err(e) => {
+                                    debug!("Streaming: Arrow IPC failed: {}", e);
+                                }
                             }
+                            
                             // Priority 2: Try TVNA binary format (legacy optimized format)
-                            else if batch.data.starts_with(b"TVNA") {
+                            if !deserialized && batch.data.starts_with(b"TVNA") {
                                 match deserialize_binary_batch(&batch.data) {
-                                    Ok(rows) => Ok(StreamingBatch::Rows(rows)),
-                                    Err(e) => Err(anyhow::anyhow!("Failed to decode TVNA batch: {}", e)),
+                                    Ok(rows) => {
+                                        debug!("Streaming: TVNA decoded {} rows", rows.len());
+                                        all_rows = rows;
+                                        deserialized = true;
+                                    }
+                                    Err(e) => {
+                                        error!("Streaming: TVNA decode failed: {}", e);
+                                    }
                                 }
                             }
+                            
                             // Priority 3: Fallback to JSON (oldest format)
-                            else {
+                            if !deserialized && !batch.data.starts_with(b"TVNA") {
                                 match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
-                                    Ok(rows) => Ok(StreamingBatch::Rows(rows)),
-                                    Err(e) => Err(anyhow::anyhow!("Failed to decode batch (tried Arrow IPC, TVNA, JSON): {}", e)),
+                                    Ok(rows) => {
+                                        debug!("Streaming: JSON decoded {} rows", rows.len());
+                                        all_rows = rows;
+                                        deserialized = true;
+                                    }
+                                    Err(e) => {
+                                        error!("Streaming: All decode methods failed for {} bytes: {}", batch.data.len(), e);
+                                    }
                                 }
+                            }
+                            
+                            if deserialized && !all_rows.is_empty() {
+                                Ok(StreamingBatch::Rows(all_rows))
+                            } else if deserialized {
+                                // Deserialized but 0 rows - this is valid for empty result sets
+                                debug!("Streaming: Batch deserialized to 0 rows");
+                                continue;
+                            } else {
+                                Err(anyhow::anyhow!("Failed to deserialize batch ({} bytes)", batch.data.len()))
                             }
                         } else {
+                            warn!("Streaming: Received RecordBatch with row_count={} but empty data", batch.row_count);
                             continue;
                         }
                     }
@@ -756,24 +819,62 @@ impl WorkerClient {
                         .collect();
                 }
                 Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
+                    debug!("Cursor fetch received batch: {} rows, {} bytes data", batch.row_count, batch.data.len());
                     if !batch.data.is_empty() {
+                        let mut deserialized = false;
+                        
                         // Priority 1: Try Arrow IPC format (new zero-copy format)
-                        if let Ok(record_batches) = deserialize_arrow_ipc(&batch.data) {
-                            for rb in record_batches {
-                                let batch_rows = arrow_batch_to_string_rows(&rb);
-                                rows.extend(batch_rows);
+                        match deserialize_arrow_ipc(&batch.data) {
+                            Ok(record_batches) => {
+                                if !record_batches.is_empty() {
+                                    for rb in record_batches {
+                                        let batch_rows = arrow_batch_to_string_rows(&rb);
+                                        debug!("Cursor: Arrow batch -> {} string rows", batch_rows.len());
+                                        rows.extend(batch_rows);
+                                    }
+                                    deserialized = true;
+                                } else {
+                                    warn!("Cursor: Arrow IPC deserialized to 0 batches from {} bytes", batch.data.len());
+                                }
+                            }
+                            Err(e) => {
+                                debug!("Cursor: Arrow IPC failed: {}", e);
                             }
                         }
+                        
                         // Priority 2: Try TVNA binary format (legacy)
-                        else if batch.data.starts_with(b"TVNA") {
-                            if let Ok(batch_rows) = deserialize_binary_batch(&batch.data) {
-                                rows.extend(batch_rows);
+                        if !deserialized && batch.data.starts_with(b"TVNA") {
+                            match deserialize_binary_batch(&batch.data) {
+                                Ok(batch_rows) => {
+                                    debug!("Cursor: TVNA decoded {} rows", batch_rows.len());
+                                    rows.extend(batch_rows);
+                                    deserialized = true;
+                                }
+                                Err(e) => {
+                                    error!("Cursor: TVNA decode failed: {}", e);
+                                }
                             }
                         }
+                        
                         // Priority 3: Fallback to JSON
-                        else if let Ok(batch_rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
-                            rows.extend(batch_rows);
+                        if !deserialized && !batch.data.starts_with(b"TVNA") {
+                            match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                                Ok(batch_rows) => {
+                                    debug!("Cursor: JSON decoded {} rows", batch_rows.len());
+                                    rows.extend(batch_rows);
+                                    deserialized = true;
+                                }
+                                Err(e) => {
+                                    error!("Cursor: All decode methods failed for {} bytes: {}", batch.data.len(), e);
+                                }
+                            }
                         }
+                        
+                        if !deserialized {
+                            error!("Cursor: Failed to deserialize batch ({} bytes)", batch.data.len());
+                        }
+                    } else {
+                        warn!("Cursor: Received RecordBatch with row_count={} but empty data", batch.row_count);
                     }
                 }
                 Some(proto::query_result_batch::Result::Error(err)) => {
@@ -1074,26 +1175,75 @@ fn duckdb_type_to_arrow(type_name: &str) -> arrow_schema::DataType {
 /// 
 /// Tries StreamReader first (new format), falls back to FileReader (legacy).
 fn deserialize_arrow_ipc(data: &[u8]) -> Result<Vec<arrow_array::RecordBatch>, anyhow::Error> {
+    if data.is_empty() {
+        warn!("Empty Arrow IPC data received");
+        return Ok(Vec::new());
+    }
+    
+    debug!("Deserializing Arrow IPC data: {} bytes", data.len());
+    
     // Try StreamReader first (new Arrow IPC stream format)
     let cursor = Cursor::new(data);
-    if let Ok(reader) = StreamReader::try_new(cursor, None) {
-        let mut batches = Vec::new();
-        for batch_result in reader {
-            batches.push(batch_result?);
+    match StreamReader::try_new(cursor, None) {
+        Ok(reader) => {
+            let schema = reader.schema();
+            debug!("Arrow IPC StreamReader created, schema: {:?}", schema);
+            
+            let mut batches = Vec::new();
+            for (idx, batch_result) in reader.enumerate() {
+                match batch_result {
+                    Ok(batch) => {
+                        debug!("Read batch {}: {} rows", idx, batch.num_rows());
+                        batches.push(batch);
+                    }
+                    Err(e) => {
+                        warn!("Error reading batch {}: {}", idx, e);
+                        return Err(e.into());
+                    }
+                }
+            }
+            
+            if batches.is_empty() {
+                warn!("StreamReader returned 0 batches from {} bytes of data", data.len());
+            } else {
+                debug!("Successfully deserialized {} batches", batches.len());
+            }
+            
+            return Ok(batches);
         }
-        return Ok(batches);
+        Err(e) => {
+            debug!("StreamReader failed: {}, trying FileReader", e);
+        }
     }
     
     // Fallback to FileReader for backwards compatibility
     let cursor = Cursor::new(data);
-    let reader = FileReader::try_new(cursor, None)?;
-    
-    let mut batches = Vec::new();
-    for batch_result in reader {
-        batches.push(batch_result?);
+    match FileReader::try_new(cursor, None) {
+        Ok(reader) => {
+            let schema = reader.schema();
+            debug!("Arrow IPC FileReader created, schema: {:?}", schema);
+            
+            let mut batches = Vec::new();
+            for (idx, batch_result) in reader.enumerate() {
+                match batch_result {
+                    Ok(batch) => {
+                        debug!("Read batch {}: {} rows", idx, batch.num_rows());
+                        batches.push(batch);
+                    }
+                    Err(e) => {
+                        warn!("Error reading batch {}: {}", idx, e);
+                        return Err(e.into());
+                    }
+                }
+            }
+            
+            Ok(batches)
+        }
+        Err(e) => {
+            error!("Both StreamReader and FileReader failed for {} bytes: {}", data.len(), e);
+            Err(e.into())
+        }
     }
-    
-    Ok(batches)
 }
 
 /// Deserialize Arrow IPC data directly to RecordBatches without string conversion
@@ -1101,28 +1251,72 @@ fn deserialize_arrow_ipc(data: &[u8]) -> Result<Vec<arrow_array::RecordBatch>, a
 /// This is used by Flight SQL to preserve native Arrow types.
 /// Returns the schema and batches for direct use.
 pub fn deserialize_arrow_ipc_native(data: &[u8]) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), anyhow::Error> {
+    if data.is_empty() {
+        return Err(anyhow::anyhow!("Empty Arrow IPC data"));
+    }
+    
+    debug!("Deserializing Arrow IPC native: {} bytes", data.len());
+    
     // Try StreamReader first (new Arrow IPC stream format)
     let cursor = Cursor::new(data);
-    if let Ok(reader) = StreamReader::try_new(cursor, None) {
-        let schema = reader.schema();
-        let mut batches = Vec::new();
-        for batch_result in reader {
-            batches.push(batch_result?);
+    match StreamReader::try_new(cursor, None) {
+        Ok(reader) => {
+            let schema = reader.schema();
+            debug!("Native StreamReader created, schema has {} fields", schema.fields().len());
+            
+            let mut batches = Vec::new();
+            for (idx, batch_result) in reader.enumerate() {
+                match batch_result {
+                    Ok(batch) => {
+                        debug!("Native read batch {}: {} rows", idx, batch.num_rows());
+                        batches.push(batch);
+                    }
+                    Err(e) => {
+                        warn!("Native error reading batch {}: {}", idx, e);
+                        return Err(e.into());
+                    }
+                }
+            }
+            
+            if batches.is_empty() {
+                warn!("Native StreamReader returned 0 batches from {} bytes", data.len());
+            }
+            
+            return Ok((schema, batches));
         }
-        return Ok((schema, batches));
+        Err(e) => {
+            debug!("Native StreamReader failed: {}, trying FileReader", e);
+        }
     }
     
     // Fallback to FileReader
     let cursor = Cursor::new(data);
-    let reader = FileReader::try_new(cursor, None)?;
-    let schema = reader.schema();
-    
-    let mut batches = Vec::new();
-    for batch_result in reader {
-        batches.push(batch_result?);
+    match FileReader::try_new(cursor, None) {
+        Ok(reader) => {
+            let schema = reader.schema();
+            debug!("Native FileReader created, schema has {} fields", schema.fields().len());
+            
+            let mut batches = Vec::new();
+            for (idx, batch_result) in reader.enumerate() {
+                match batch_result {
+                    Ok(batch) => {
+                        debug!("Native read batch {}: {} rows", idx, batch.num_rows());
+                        batches.push(batch);
+                    }
+                    Err(e) => {
+                        warn!("Native error reading batch {}: {}", idx, e);
+                        return Err(e.into());
+                    }
+                }
+            }
+            
+            Ok((schema, batches))
+        }
+        Err(e) => {
+            error!("Native: Both StreamReader and FileReader failed for {} bytes: {}", data.len(), e);
+            Err(e.into())
+        }
     }
-    
-    Ok((schema, batches))
 }
 
 /// Convert an Arrow RecordBatch to string rows for PG wire protocol

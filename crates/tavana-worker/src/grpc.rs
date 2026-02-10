@@ -203,16 +203,25 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                 }
 
                 // TRUE STREAMING: batches are sent as they're produced, never buffered
-                total_rows += batch.num_rows() as u64;
+                let batch_rows = batch.num_rows();
+                total_rows += batch_rows as u64;
                 
                 // Use Arrow IPC format for TRUE zero-copy (native types preserved)
                 // This eliminates Arrow→String→Binary conversion overhead
                 let ipc_data = serialize_batch_to_arrow_ipc(&batch);
                 
+                // Validate serialization succeeded
+                if ipc_data.is_empty() && batch_rows > 0 {
+                    error!("Arrow IPC serialization failed for batch with {} rows - this should not happen!", batch_rows);
+                    return Err(anyhow::anyhow!("Arrow IPC serialization failed"));
+                }
+                
+                debug!("Sending batch: {} rows, {} IPC bytes", batch_rows, ipc_data.len());
+                
                 let arrow_batch = proto::ArrowRecordBatch {
                     schema: vec![], // Schema embedded in IPC stream
                     data: ipc_data,
-                    row_count: batch.num_rows() as u64,
+                    row_count: batch_rows as u64,
                 };
 
                 // Send batch immediately - TRUE STREAMING
@@ -655,10 +664,17 @@ fn serialize_batch_to_binary(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u
 fn serialize_batch_to_arrow_ipc(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u8> {
     use arrow_ipc::writer::StreamWriter;
     
+    let num_rows = batch.num_rows();
+    let num_cols = batch.num_columns();
+    let schema = batch.schema();
+    
+    debug!("Serializing Arrow IPC batch: {} rows, {} cols, schema fields: {:?}", 
+           num_rows, num_cols, schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+    
     let mut buf = Vec::new();
     
     // Create IPC stream writer - includes schema in the stream
-    let mut writer = match StreamWriter::try_new(&mut buf, &batch.schema()) {
+    let mut writer = match StreamWriter::try_new(&mut buf, &schema) {
         Ok(w) => w,
         Err(e) => {
             warn!("Failed to create Arrow IPC writer: {}", e);
@@ -668,7 +684,7 @@ fn serialize_batch_to_arrow_ipc(batch: &duckdb::arrow::array::RecordBatch) -> Ve
     
     // Write the batch
     if let Err(e) = writer.write(batch) {
-        warn!("Failed to write batch to Arrow IPC: {}", e);
+        warn!("Failed to write batch to Arrow IPC: {} rows, error: {}", num_rows, e);
         return Vec::new();
     }
     
@@ -677,6 +693,8 @@ fn serialize_batch_to_arrow_ipc(batch: &duckdb::arrow::array::RecordBatch) -> Ve
         warn!("Failed to finish Arrow IPC stream: {}", e);
         return Vec::new();
     }
+    
+    debug!("Arrow IPC serialized {} rows to {} bytes", num_rows, buf.len());
     
     buf
 }
@@ -779,5 +797,103 @@ fn format_array_value(array: &dyn Array, idx: usize) -> String {
     match ArrayFormatter::try_new(array, &Default::default()) {
         Ok(formatter) => formatter.value(idx).to_string(),
         Err(_) => format!("<{:?}>", array.data_type()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Int32Array, StringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+    
+    /// Test that Arrow IPC serialization/deserialization roundtrip works correctly
+    /// This verifies the core data path works before testing with actual DuckDB data
+    #[test]
+    fn test_arrow_ipc_roundtrip() {
+        use arrow_ipc::reader::StreamReader;
+        use std::io::Cursor;
+        
+        // Create a simple test batch
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        
+        let id_array = Int32Array::from(vec![1, 2, 3]);
+        let name_array = StringArray::from(vec![Some("Alice"), Some("Bob"), None]);
+        
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(id_array), Arc::new(name_array)],
+        ).expect("Failed to create batch");
+        
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 2);
+        
+        // Serialize using our function
+        let ipc_data = serialize_batch_to_arrow_ipc(&batch);
+        
+        // Verify we got some data
+        assert!(!ipc_data.is_empty(), "IPC data should not be empty");
+        println!("Serialized {} rows to {} bytes", batch.num_rows(), ipc_data.len());
+        
+        // Deserialize
+        let cursor = Cursor::new(&ipc_data);
+        let reader = StreamReader::try_new(cursor, None)
+            .expect("Failed to create StreamReader");
+        
+        let read_schema = reader.schema();
+        assert_eq!(read_schema.fields().len(), 2);
+        
+        let batches: Vec<_> = reader.filter_map(|r| r.ok()).collect();
+        assert_eq!(batches.len(), 1, "Should have exactly 1 batch");
+        
+        let read_batch = &batches[0];
+        assert_eq!(read_batch.num_rows(), 3);
+        assert_eq!(read_batch.num_columns(), 2);
+        
+        println!("Roundtrip test passed: {} rows, {} bytes", read_batch.num_rows(), ipc_data.len());
+    }
+    
+    /// Test with DuckDB's arrow types specifically
+    #[test]
+    fn test_arrow_ipc_with_duckdb_types() {
+        use arrow_ipc::reader::StreamReader;
+        use std::io::Cursor;
+        use duckdb::arrow::array::{Int32Array as DuckInt32Array, StringArray as DuckStringArray};
+        use duckdb::arrow::datatypes::{DataType as DuckDataType, Field as DuckField, Schema as DuckSchema};
+        use duckdb::arrow::array::RecordBatch as DuckRecordBatch;
+        
+        // Create batch using DuckDB's arrow types (exactly like the executor returns)
+        let schema = DuckSchema::new(vec![
+            DuckField::new("value", DuckDataType::Int32, false),
+        ]);
+        
+        let value_array = DuckInt32Array::from(vec![1]);
+        
+        let batch = DuckRecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![std::sync::Arc::new(value_array)],
+        ).expect("Failed to create DuckDB batch");
+        
+        assert_eq!(batch.num_rows(), 1);
+        
+        // Serialize using our function (this is the exact path used in streaming)
+        let ipc_data = serialize_batch_to_arrow_ipc(&batch);
+        
+        assert!(!ipc_data.is_empty(), "DuckDB IPC data should not be empty");
+        println!("DuckDB serialized {} rows to {} bytes", batch.num_rows(), ipc_data.len());
+        
+        // Deserialize using arrow-ipc reader (like the gateway does)
+        let cursor = Cursor::new(&ipc_data);
+        let reader = StreamReader::try_new(cursor, None)
+            .expect("Failed to create StreamReader from DuckDB IPC data");
+        
+        let batches: Vec<_> = reader.filter_map(|r| r.ok()).collect();
+        assert_eq!(batches.len(), 1, "Should have exactly 1 batch from DuckDB data");
+        assert_eq!(batches[0].num_rows(), 1, "Batch should have 1 row");
+        
+        println!("DuckDB roundtrip test passed!");
     }
 }
