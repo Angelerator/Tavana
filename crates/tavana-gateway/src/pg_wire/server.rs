@@ -2914,10 +2914,16 @@ async fn execute_query_on_worker_buffered(
                     .collect();
             }
             Some(proto::query_result_batch::Result::RecordBatch(batch_data)) => {
-                // Decode JSON data
+                // Decode batch data - try Arrow IPC first, then JSON fallback
                 if !batch_data.data.is_empty() {
-                    if let Ok(batch_rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch_data.data) {
+                    if let Ok(record_batches) = deserialize_arrow_ipc(&batch_data.data) {
+                        for rb in record_batches {
+                            rows.extend(arrow_batch_to_string_rows(&rb));
+                        }
+                    } else if let Ok(batch_rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch_data.data) {
                         rows.extend(batch_rows);
+                    } else {
+                        warn!("Failed to deserialize batch data ({} bytes) in buffered query", batch_data.data.len());
                     }
                 }
             }
