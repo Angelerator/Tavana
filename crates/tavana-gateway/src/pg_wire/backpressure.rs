@@ -460,16 +460,23 @@ fn encode_binary_value(buf: &mut Vec<u8>, value: &str, type_name: &str) {
     match type_lower.as_str() {
         // === SIGNED INTEGERS ===
         // 1-byte signed integer (TINYINT) - promoted to INT2 for PostgreSQL compatibility
-        // We tell the client it's INT2 (OID 21), so we must send 2 bytes
-        "int1" | "tinyint" => {
+        // Arrow: Int8, DuckDB: TINYINT/INT1
+        "int1" | "tinyint" | "int8" => {
+            // Note: Arrow "int8" means 8-bit integer, not PostgreSQL int8 (64-bit)
+            // We disambiguate by checking if it parses as i8
             if let Ok(v) = value.parse::<i8>() {
-                buf.extend_from_slice(&2i32.to_be_bytes()); // 2 bytes, not 1
-                buf.extend_from_slice(&(v as i16).to_be_bytes()); // Promote to i16
+                buf.extend_from_slice(&2i32.to_be_bytes());
+                buf.extend_from_slice(&(v as i16).to_be_bytes());
+            } else if let Ok(v) = value.parse::<i64>() {
+                // Fallback: might be Arrow Int64 misnamed
+                buf.extend_from_slice(&8i32.to_be_bytes());
+                buf.extend_from_slice(&v.to_be_bytes());
             } else {
                 encode_text_fallback(buf, value);
             }
         }
         // 2-byte signed integer (SMALLINT)
+        // Arrow: Int16, DuckDB: SMALLINT/INT2
         "int2" | "smallint" | "int16" | "short" => {
             if let Ok(v) = value.parse::<i16>() {
                 buf.extend_from_slice(&2i32.to_be_bytes());
@@ -479,6 +486,7 @@ fn encode_binary_value(buf: &mut Vec<u8>, value: &str, type_name: &str) {
             }
         }
         // 4-byte signed integer (INTEGER)
+        // Arrow: Int32, DuckDB: INTEGER/INT4/INT
         "int4" | "integer" | "int" | "int32" | "signed" => {
             if let Ok(v) = value.parse::<i32>() {
                 buf.extend_from_slice(&4i32.to_be_bytes());
@@ -488,7 +496,8 @@ fn encode_binary_value(buf: &mut Vec<u8>, value: &str, type_name: &str) {
             }
         }
         // 8-byte signed integer (BIGINT)
-        "int8" | "bigint" | "int64" | "long" => {
+        // Arrow: Int64, DuckDB: BIGINT/INT64
+        "bigint" | "int64" | "long" => {
             if let Ok(v) = value.parse::<i64>() {
                 buf.extend_from_slice(&8i32.to_be_bytes());
                 buf.extend_from_slice(&v.to_be_bytes());
@@ -502,38 +511,38 @@ fn encode_binary_value(buf: &mut Vec<u8>, value: &str, type_name: &str) {
         }
         
         // === UNSIGNED INTEGERS ===
-        // 1-byte unsigned integer (UTINYINT)
-        "uint1" | "utinyint" => {
+        // Arrow: UInt8, DuckDB: UTINYINT
+        "uint1" | "utinyint" | "uint8" => {
             if let Ok(v) = value.parse::<u8>() {
-                // PostgreSQL doesn't have unsigned types, send as int2
                 buf.extend_from_slice(&2i32.to_be_bytes());
                 buf.extend_from_slice(&(v as i16).to_be_bytes());
+            } else if let Ok(v) = value.parse::<u64>() {
+                // Fallback for larger values
+                encode_text_fallback(buf, &v.to_string());
             } else {
                 encode_text_fallback(buf, value);
             }
         }
-        // 2-byte unsigned integer (USMALLINT)
-        "uint2" | "usmallint" => {
+        // Arrow: UInt16, DuckDB: USMALLINT
+        "uint2" | "usmallint" | "uint16" => {
             if let Ok(v) = value.parse::<u16>() {
-                // Send as int4 to avoid overflow
                 buf.extend_from_slice(&4i32.to_be_bytes());
                 buf.extend_from_slice(&(v as i32).to_be_bytes());
             } else {
                 encode_text_fallback(buf, value);
             }
         }
-        // 4-byte unsigned integer (UINTEGER)
-        "uint4" | "uinteger" => {
+        // Arrow: UInt32, DuckDB: UINTEGER
+        "uint4" | "uinteger" | "uint32" => {
             if let Ok(v) = value.parse::<u32>() {
-                // Send as int8 to avoid overflow
                 buf.extend_from_slice(&8i32.to_be_bytes());
                 buf.extend_from_slice(&(v as i64).to_be_bytes());
             } else {
                 encode_text_fallback(buf, value);
             }
         }
-        // 8-byte unsigned integer (UBIGINT) - send as text, may overflow int8
-        "uint8" | "ubigint" => {
+        // Arrow: UInt64, DuckDB: UBIGINT - send as text, may overflow int8
+        "ubigint" | "uint64" => {
             encode_text_fallback(buf, value);
         }
         // 16-byte unsigned integer (UHUGEINT) - send as text
@@ -542,8 +551,8 @@ fn encode_binary_value(buf: &mut Vec<u8>, value: &str, type_name: &str) {
         }
         
         // === FLOATING POINT ===
-        // 4-byte floating point (FLOAT/REAL)
-        "float4" | "real" | "float" => {
+        // Arrow: Float32, DuckDB: REAL/FLOAT
+        "float4" | "real" | "float" | "float32" => {
             if let Ok(v) = value.parse::<f32>() {
                 buf.extend_from_slice(&4i32.to_be_bytes());
                 buf.extend_from_slice(&v.to_be_bytes());
@@ -551,7 +560,7 @@ fn encode_binary_value(buf: &mut Vec<u8>, value: &str, type_name: &str) {
                 encode_text_fallback(buf, value);
             }
         }
-        // 8-byte floating point (DOUBLE)
+        // Arrow: Float64, DuckDB: DOUBLE
         "float8" | "double" | "float64" | "double precision" => {
             if let Ok(v) = value.parse::<f64>() {
                 buf.extend_from_slice(&8i32.to_be_bytes());
@@ -562,12 +571,13 @@ fn encode_binary_value(buf: &mut Vec<u8>, value: &str, type_name: &str) {
         }
         
         // === DECIMAL/NUMERIC ===
-        // Variable precision - send as text (PostgreSQL binary NUMERIC is complex)
-        "decimal" | "numeric" => {
+        // Arrow: Decimal128, DuckDB: DECIMAL/NUMERIC
+        "decimal" | "numeric" | "decimal128" => {
             encode_text_fallback(buf, value);
         }
         
         // === BOOLEAN ===
+        // Arrow: Boolean, DuckDB: BOOLEAN
         "bool" | "boolean" | "logical" => {
             let v: u8 = match value.to_lowercase().as_str() {
                 "t" | "true" | "1" | "yes" | "on" => 1,
@@ -578,8 +588,8 @@ fn encode_binary_value(buf: &mut Vec<u8>, value: &str, type_name: &str) {
         }
         
         // === DATE/TIME TYPES ===
-        // DATE - PostgreSQL binary: days since 2000-01-01
-        "date" => {
+        // Arrow: Date32, DuckDB: DATE
+        "date" | "date32" => {
             if let Some(days) = parse_date_to_pg_days(value) {
                 buf.extend_from_slice(&4i32.to_be_bytes());
                 buf.extend_from_slice(&days.to_be_bytes());
@@ -587,7 +597,7 @@ fn encode_binary_value(buf: &mut Vec<u8>, value: &str, type_name: &str) {
                 encode_text_fallback(buf, value);
             }
         }
-        // TIMESTAMP - PostgreSQL binary: microseconds since 2000-01-01 00:00:00
+        // Arrow: Timestamp, DuckDB: TIMESTAMP
         "timestamp" | "datetime" => {
             if let Some(micros) = parse_timestamp_to_pg_micros(value) {
                 buf.extend_from_slice(&8i32.to_be_bytes());
@@ -605,8 +615,8 @@ fn encode_binary_value(buf: &mut Vec<u8>, value: &str, type_name: &str) {
                 encode_text_fallback(buf, value);
             }
         }
-        // TIME - PostgreSQL binary: microseconds since midnight
-        "time" | "time without time zone" => {
+        // Arrow: Time64, DuckDB: TIME
+        "time" | "time without time zone" | "time64" => {
             if let Some(micros) = parse_time_to_micros(value) {
                 buf.extend_from_slice(&8i32.to_be_bytes());
                 buf.extend_from_slice(&micros.to_be_bytes());
@@ -614,8 +624,8 @@ fn encode_binary_value(buf: &mut Vec<u8>, value: &str, type_name: &str) {
                 encode_text_fallback(buf, value);
             }
         }
-        // INTERVAL - complex binary format, use text
-        "interval" => {
+        // Arrow: Duration/Interval
+        "interval" | "duration" => {
             encode_text_fallback(buf, value);
         }
         
@@ -630,9 +640,8 @@ fn encode_binary_value(buf: &mut Vec<u8>, value: &str, type_name: &str) {
         }
         
         // === BINARY DATA ===
-        // BYTEA/BLOB - the value is already hex-encoded or escaped
-        "bytea" | "blob" | "binary" | "varbinary" => {
-            // DuckDB returns blob as hex string like \x0102...
+        // Arrow: Binary/LargeBinary, DuckDB: BLOB/BYTEA
+        "bytea" | "blob" | "binary" | "varbinary" | "largebinary" => {
             if let Some(bytes) = parse_bytea(value) {
                 buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
                 buf.extend_from_slice(&bytes);
@@ -642,12 +651,16 @@ fn encode_binary_value(buf: &mut Vec<u8>, value: &str, type_name: &str) {
         }
         
         // === TEXT TYPES (always text format) ===
-        "varchar" | "char" | "bpchar" | "text" | "string" | "json" | "bit" | "bitstring" => {
+        // Arrow: Utf8/LargeUtf8, DuckDB: VARCHAR/TEXT
+        "varchar" | "char" | "bpchar" | "text" | "string" | "utf8" | "largeutf8" |
+        "json" | "bit" | "bitstring" => {
             encode_text_fallback(buf, value);
         }
         
         // === NESTED TYPES (always text format) ===
-        "list" | "array" | "map" | "struct" | "union" => {
+        // Arrow: List/LargeList/Map/Struct/Union
+        "list" | "array" | "largelist" | "fixedsizelist" |
+        "map" | "struct" | "union" => {
             encode_text_fallback(buf, value);
         }
         
