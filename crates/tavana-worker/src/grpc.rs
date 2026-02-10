@@ -205,11 +205,12 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                 // TRUE STREAMING: batches are sent as they're produced, never buffered
                 total_rows += batch.num_rows() as u64;
                 
-                // Use optimized binary format (2-3x smaller, 5-10x faster than JSON)
-                let ipc_data = serialize_batch_to_binary(&batch);
+                // Use Arrow IPC format for TRUE zero-copy (native types preserved)
+                // This eliminates Arrow→String→Binary conversion overhead
+                let ipc_data = serialize_batch_to_arrow_ipc(&batch);
                 
                 let arrow_batch = proto::ArrowRecordBatch {
-                    schema: vec![], // Schema sent in metadata
+                    schema: vec![], // Schema embedded in IPC stream
                     data: ipc_data,
                     row_count: batch.num_rows() as u64,
                 };
@@ -598,6 +599,10 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
 ///   - For each column:
 ///     - Value length: i32 (4 bytes, -1 for NULL)
 ///     - Value bytes: UTF-8 string (if length >= 0)
+/// 
+/// NOTE: This is kept for backward compatibility with PostgreSQL wire protocol.
+/// For Flight SQL, use serialize_batch_to_arrow_ipc() instead.
+#[allow(dead_code)]
 fn serialize_batch_to_binary(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u8> {
     let num_rows = batch.num_rows();
     let num_cols = batch.num_columns();
@@ -623,6 +628,71 @@ fn serialize_batch_to_binary(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u
                 buf.extend_from_slice(bytes);
             }
         }
+    }
+    
+    buf
+}
+
+/// Serialize a RecordBatch to Arrow IPC format (ZERO-COPY OPTIMIZED)
+/// 
+/// This is the recommended approach per Apache Arrow documentation:
+/// - Preserves native data types (no string conversion overhead)
+/// - Zero-copy deserialization possible on receiver side
+/// - Compatible with all Arrow clients (Flight SQL, ADBC, etc.)
+/// 
+/// Format: Arrow IPC stream format with embedded schema
+/// 
+/// Reference: https://arrow.apache.org/docs/format/IPC.html
+fn serialize_batch_to_arrow_ipc(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u8> {
+    use arrow_ipc::writer::StreamWriter;
+    
+    let mut buf = Vec::new();
+    
+    // Create IPC stream writer - includes schema in the stream
+    let mut writer = match StreamWriter::try_new(&mut buf, &batch.schema()) {
+        Ok(w) => w,
+        Err(e) => {
+            warn!("Failed to create Arrow IPC writer: {}", e);
+            return Vec::new();
+        }
+    };
+    
+    // Write the batch
+    if let Err(e) = writer.write(batch) {
+        warn!("Failed to write batch to Arrow IPC: {}", e);
+        return Vec::new();
+    }
+    
+    // Finish the stream
+    if let Err(e) = writer.finish() {
+        warn!("Failed to finish Arrow IPC stream: {}", e);
+        return Vec::new();
+    }
+    
+    buf
+}
+
+/// Serialize a RecordBatch schema to Arrow IPC format
+/// 
+/// Used to send schema separately in metadata for clients that need it
+fn serialize_schema_to_arrow_ipc(schema: &duckdb::arrow::datatypes::SchemaRef) -> Vec<u8> {
+    use arrow_ipc::writer::StreamWriter;
+    
+    let mut buf = Vec::new();
+    
+    // Create a writer just to emit the schema
+    let writer = match StreamWriter::try_new(&mut buf, schema) {
+        Ok(w) => w,
+        Err(e) => {
+            warn!("Failed to create Arrow IPC schema writer: {}", e);
+            return Vec::new();
+        }
+    };
+    
+    // Finish immediately - this writes just the schema message
+    if let Err(e) = writer.into_inner() {
+        warn!("Failed to finish Arrow IPC schema stream: {}", e);
+        return Vec::new();
     }
     
     buf

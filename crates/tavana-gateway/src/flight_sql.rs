@@ -188,8 +188,52 @@ impl TavanaFlightSqlService {
             .unwrap_or_else(|| "anonymous".to_string())
     }
 
-    /// Execute a query and return RecordBatches
+    /// Execute a query and return RecordBatches with NATIVE ARROW TYPES (ZERO-COPY)
+    /// 
+    /// This uses the new Arrow IPC streaming from worker to gateway,
+    /// preserving native data types without string conversion overhead.
     async fn execute_query(&self, sql: &str, user: &str) -> Result<Vec<RecordBatch>, Status> {
+        use crate::worker_client::ArrowStreamingBatch;
+        
+        let mut stream = self
+            .worker_client
+            .execute_query_arrow_streaming(sql, user)
+            .await
+            .map_err(|e| Status::internal(format!("Query failed: {}", e)))?;
+
+        let mut batches = Vec::new();
+        let mut schema: Option<SchemaRef> = None;
+
+        // Collect all batches from the stream
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(ArrowStreamingBatch::Schema(s)) => {
+                    schema = Some(s);
+                }
+                Ok(ArrowStreamingBatch::RecordBatch(batch)) => {
+                    batches.push(batch);
+                }
+                Ok(ArrowStreamingBatch::Error(e)) => {
+                    return Err(Status::internal(format!("Query error: {}", e)));
+                }
+                Err(e) => {
+                    return Err(Status::internal(format!("Stream error: {}", e)));
+                }
+            }
+        }
+
+        // If no batches, return empty result with schema
+        if batches.is_empty() {
+            let empty_schema = schema.unwrap_or_else(|| Arc::new(Schema::empty()));
+            return Ok(vec![RecordBatch::new_empty(empty_schema)]);
+        }
+
+        Ok(batches)
+    }
+    
+    /// Legacy execute_query that converts to strings (for backward compatibility)
+    #[allow(dead_code)]
+    async fn execute_query_legacy(&self, sql: &str, user: &str) -> Result<Vec<RecordBatch>, Status> {
         let result = self
             .worker_client
             .execute_query(sql, user)

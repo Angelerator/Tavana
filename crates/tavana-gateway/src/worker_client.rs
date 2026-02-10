@@ -10,7 +10,7 @@
 //! cursor operations (FETCH, CLOSE) to the correct worker based on the cursor's
 //! `worker_addr`.
 
-use arrow_ipc::reader::FileReader;
+use arrow_ipc::reader::{FileReader, StreamReader};
 use dashmap::DashMap;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -104,6 +104,19 @@ pub enum StreamingBatch {
     Error(String),
 }
 
+/// Native Arrow streaming batch types for Flight SQL (ZERO-COPY)
+/// 
+/// This preserves Arrow RecordBatches without string conversion,
+/// enabling true zero-copy data transfer to Flight SQL clients.
+pub enum ArrowStreamingBatch {
+    /// Schema and type information
+    Schema(arrow_schema::SchemaRef),
+    /// Native Arrow RecordBatch (zero-copy from worker)
+    RecordBatch(arrow_array::RecordBatch),
+    /// Error message
+    Error(String),
+}
+
 /// Stream wrapper for async iteration
 pub struct StreamingResult {
     receiver: tokio::sync::mpsc::Receiver<Result<StreamingBatch, anyhow::Error>>,
@@ -111,6 +124,17 @@ pub struct StreamingResult {
 
 impl StreamingResult {
     pub async fn next(&mut self) -> Option<Result<StreamingBatch, anyhow::Error>> {
+        self.receiver.recv().await
+    }
+}
+
+/// Stream wrapper for native Arrow async iteration (Flight SQL)
+pub struct ArrowStreamingResult {
+    receiver: tokio::sync::mpsc::Receiver<Result<ArrowStreamingBatch, anyhow::Error>>,
+}
+
+impl ArrowStreamingResult {
+    pub async fn next(&mut self) -> Option<Result<ArrowStreamingBatch, anyhow::Error>> {
         self.receiver.recv().await
     }
 }
@@ -225,35 +249,32 @@ impl WorkerClient {
                 Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
                     debug!("Received batch with {} rows", batch.row_count);
                     if !batch.data.is_empty() {
-                        // Try optimized binary format first (fastest path)
-                        if batch.data.starts_with(b"TVNA") {
+                        // Priority 1: Try Arrow IPC format (new zero-copy format)
+                        if let Ok(record_batches) = deserialize_arrow_ipc(&batch.data) {
+                            for rb in record_batches {
+                                let batch_rows = arrow_batch_to_string_rows(&rb);
+                                rows.extend(batch_rows);
+                            }
+                        }
+                        // Priority 2: Try TVNA binary format (legacy optimized format)
+                        else if batch.data.starts_with(b"TVNA") {
                             match deserialize_binary_batch(&batch.data) {
                                 Ok(batch_rows) => {
                                     rows.extend(batch_rows);
                                 }
                                 Err(e) => {
-                                    error!("Binary format decode failed: {}", e);
+                                    error!("TVNA decode failed: {}", e);
                                 }
                             }
-                        } else {
-                            // Fallback: try Arrow IPC or JSON for backwards compatibility
-                            match deserialize_arrow_ipc(&batch.data) {
-                                Ok(record_batches) => {
-                                    for rb in record_batches {
-                                        let batch_rows = arrow_batch_to_string_rows(&rb);
-                                        rows.extend(batch_rows);
-                                    }
+                        }
+                        // Priority 3: Fallback to JSON (oldest format)
+                        else {
+                            match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                                Ok(batch_rows) => {
+                                    rows.extend(batch_rows);
                                 }
-                                Err(e) => {
-                                    debug!("Arrow IPC decode failed: {}, trying JSON fallback", e);
-                                    match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
-                                        Ok(batch_rows) => {
-                                            rows.extend(batch_rows);
-                                        }
-                                        Err(json_err) => {
-                                            error!("All decode methods failed. Arrow: {}, JSON: {}", e, json_err);
-                                        }
-                                    }
+                                Err(json_err) => {
+                                    error!("All decode methods failed: {}", json_err);
                                 }
                             }
                         }
@@ -340,30 +361,28 @@ impl WorkerClient {
                     }
                     Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
                         if !batch.data.is_empty() {
-                            // Try optimized binary format first (2-3x smaller, 5-10x faster)
-                            if batch.data.starts_with(b"TVNA") {
+                            // Priority 1: Try Arrow IPC format (new zero-copy format)
+                            // Arrow IPC preserves native types for Flight SQL passthrough
+                            if let Ok(record_batches) = deserialize_arrow_ipc(&batch.data) {
+                                let mut all_rows = Vec::new();
+                                for rb in record_batches {
+                                    let rows = arrow_batch_to_string_rows(&rb);
+                                    all_rows.extend(rows);
+                                }
+                                Ok(StreamingBatch::Rows(all_rows))
+                            }
+                            // Priority 2: Try TVNA binary format (legacy optimized format)
+                            else if batch.data.starts_with(b"TVNA") {
                                 match deserialize_binary_batch(&batch.data) {
                                     Ok(rows) => Ok(StreamingBatch::Rows(rows)),
-                                    Err(e) => Err(anyhow::anyhow!("Failed to decode binary batch: {}", e)),
+                                    Err(e) => Err(anyhow::anyhow!("Failed to decode TVNA batch: {}", e)),
                                 }
-                            } else {
-                                // Fallback to JSON for backwards compatibility
+                            }
+                            // Priority 3: Fallback to JSON (oldest format)
+                            else {
                                 match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
                                     Ok(rows) => Ok(StreamingBatch::Rows(rows)),
-                                    Err(_) => {
-                                        // Fallback to Arrow IPC for legacy workers
-                                        match deserialize_arrow_ipc(&batch.data) {
-                                            Ok(record_batches) => {
-                                                let mut all_rows = Vec::new();
-                                                for rb in record_batches {
-                                                    let rows = arrow_batch_to_string_rows(&rb);
-                                                    all_rows.extend(rows);
-                                                }
-                                                Ok(StreamingBatch::Rows(all_rows))
-                                            }
-                                            Err(e) => Err(anyhow::anyhow!("Failed to decode batch: {}", e)),
-                                        }
-                                    }
+                                    Err(e) => Err(anyhow::anyhow!("Failed to decode batch (tried Arrow IPC, TVNA, JSON): {}", e)),
                                 }
                             }
                         } else {
@@ -384,6 +403,110 @@ impl WorkerClient {
         });
 
         Ok(StreamingResult { receiver: rx })
+    }
+
+    /// Execute a query with NATIVE ARROW STREAMING for Flight SQL (ZERO-COPY)
+    /// 
+    /// This method returns Arrow RecordBatches directly without string conversion,
+    /// enabling true zero-copy data transfer to ADBC/Flight SQL clients.
+    /// 
+    /// Use this for:
+    /// - Arrow Flight SQL endpoints
+    /// - ADBC clients (Python, Go, Java)
+    /// - Any client that can consume Arrow format directly
+    pub async fn execute_query_arrow_streaming(
+        &self,
+        sql: &str,
+        user_id: &str,
+    ) -> Result<ArrowStreamingResult, anyhow::Error> {
+        let mut client = self.get_client().await?;
+
+        let query_id = Uuid::new_v4().to_string();
+        debug!(
+            "Executing Arrow streaming query {} for user {}",
+            query_id, user_id
+        );
+
+        let request = proto::ExecuteQueryRequest {
+            query_id: query_id.clone(),
+            sql: sql.to_string(),
+            user: Some(proto::UserIdentity {
+                user_id: user_id.to_string(),
+                tenant_id: "default".to_string(),
+                scopes: vec!["query:execute".to_string()],
+                claims: Default::default(),
+            }),
+            options: Some(proto::QueryOptions {
+                timeout_seconds: query_timeout_secs(),
+                max_rows: 0,          // 0 = unlimited rows (streaming)
+                max_bytes: 0,
+                enable_profiling: false,
+                session_params: Default::default(),
+            }),
+            allocated_resources: None,
+        };
+
+        let response = client.execute_query(request).await?;
+        let mut stream = response.into_inner();
+
+        // Channel for streaming Arrow batches (small buffer for backpressure)
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+
+        // Spawn a task to read from gRPC stream and forward Arrow batches
+        tokio::spawn(async move {
+            let mut schema_sent = false;
+            
+            while let Ok(Some(batch)) = stream.message().await {
+                match batch.result {
+                    Some(proto::query_result_batch::Result::Metadata(meta)) => {
+                        // Build schema from metadata for clients that need it
+                        if !schema_sent {
+                            let fields: Vec<arrow_schema::Field> = meta.columns.iter()
+                                .zip(meta.column_types.iter())
+                                .map(|(name, type_name)| {
+                                    let data_type = duckdb_type_to_arrow(type_name);
+                                    arrow_schema::Field::new(name, data_type, true)
+                                })
+                                .collect();
+                            let schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
+                            let _ = tx.send(Ok(ArrowStreamingBatch::Schema(schema))).await;
+                            schema_sent = true;
+                        }
+                    }
+                    Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
+                        if !batch.data.is_empty() {
+                            // Deserialize Arrow IPC directly to RecordBatches (ZERO-COPY)
+                            match deserialize_arrow_ipc_native(&batch.data) {
+                                Ok((schema, record_batches)) => {
+                                    // Send schema first if not already sent
+                                    if !schema_sent {
+                                        let _ = tx.send(Ok(ArrowStreamingBatch::Schema(schema))).await;
+                                        schema_sent = true;
+                                    }
+                                    
+                                    // Send each batch
+                                    for rb in record_batches {
+                                        if tx.send(Ok(ArrowStreamingBatch::RecordBatch(rb))).await.is_err() {
+                                            return; // Receiver dropped
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Ok(ArrowStreamingBatch::Error(format!("Arrow IPC decode failed: {}", e)))).await;
+                                }
+                            }
+                        }
+                    }
+                    Some(proto::query_result_batch::Result::Error(err)) => {
+                        let _ = tx.send(Ok(ArrowStreamingBatch::Error(format!("{}: {}", err.code, err.message)))).await;
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+        });
+
+        Ok(ArrowStreamingResult { receiver: rx })
     }
 
     // ============= Cursor Operations for True Streaming =============
@@ -481,12 +604,21 @@ impl WorkerClient {
                 }
                 Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
                     if !batch.data.is_empty() {
-                        // Try binary format first, fallback to JSON
-                        if batch.data.starts_with(b"TVNA") {
+                        // Priority 1: Try Arrow IPC format (new zero-copy format)
+                        if let Ok(record_batches) = deserialize_arrow_ipc(&batch.data) {
+                            for rb in record_batches {
+                                let batch_rows = arrow_batch_to_string_rows(&rb);
+                                rows.extend(batch_rows);
+                            }
+                        }
+                        // Priority 2: Try TVNA binary format (legacy)
+                        else if batch.data.starts_with(b"TVNA") {
                             if let Ok(batch_rows) = deserialize_binary_batch(&batch.data) {
                                 rows.extend(batch_rows);
                             }
-                        } else if let Ok(batch_rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                        }
+                        // Priority 3: Fallback to JSON
+                        else if let Ok(batch_rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
                             rows.extend(batch_rows);
                         }
                     }
@@ -702,11 +834,104 @@ impl WorkerClientPool {
     }
 }
 
+// ============= Arrow Type Mapping Utilities =============
+
+/// Map DuckDB type names to Arrow DataTypes
+/// 
+/// This enables native type preservation when streaming Arrow data,
+/// avoiding the overhead of string conversion.
+fn duckdb_type_to_arrow(type_name: &str) -> arrow_schema::DataType {
+    use arrow_schema::DataType;
+    
+    // Normalize type name
+    let type_lower = type_name.to_lowercase();
+    let type_clean = type_lower.trim();
+    
+    match type_clean {
+        // Integers
+        "tinyint" | "int8" | "int1" => DataType::Int8,
+        "smallint" | "int16" | "int2" | "short" => DataType::Int16,
+        "integer" | "int32" | "int4" | "int" | "signed" => DataType::Int32,
+        "bigint" | "int64" | "long" | "int128" | "hugeint" => DataType::Int64,
+        
+        // Unsigned integers
+        "utinyint" | "uint8" => DataType::UInt8,
+        "usmallint" | "uint16" => DataType::UInt16,
+        "uinteger" | "uint32" => DataType::UInt32,
+        "ubigint" | "uint64" | "uhugeint" => DataType::UInt64,
+        
+        // Floats
+        "float" | "float4" | "real" => DataType::Float32,
+        "double" | "float8" | "double precision" => DataType::Float64,
+        
+        // Boolean
+        "boolean" | "bool" | "logical" => DataType::Boolean,
+        
+        // Strings
+        "varchar" | "text" | "string" | "char" | "bpchar" | "name" => DataType::Utf8,
+        
+        // Binary
+        "blob" | "bytea" | "binary" | "varbinary" => DataType::Binary,
+        
+        // Date/Time
+        "date" => DataType::Date32,
+        "time" | "time without time zone" => DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+        "timestamp" | "datetime" | "timestamp without time zone" => {
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+        }
+        "timestamptz" | "timestamp with time zone" => {
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
+        }
+        
+        // Intervals
+        "interval" => DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano),
+        
+        // UUID
+        "uuid" => DataType::Utf8, // UUID represented as string
+        
+        // JSON
+        "json" | "jsonb" => DataType::Utf8, // JSON as string
+        
+        // Decimal (default precision/scale)
+        _ if type_clean.starts_with("decimal") || type_clean.starts_with("numeric") => {
+            DataType::Decimal128(38, 10) // Default precision/scale
+        }
+        
+        // List types
+        _ if type_clean.ends_with("[]") => {
+            let inner = &type_clean[..type_clean.len() - 2];
+            let inner_type = duckdb_type_to_arrow(inner);
+            DataType::List(std::sync::Arc::new(arrow_schema::Field::new("item", inner_type, true)))
+        }
+        
+        // Default to Utf8 for unknown types
+        _ => {
+            debug!("Unknown DuckDB type '{}', defaulting to Utf8", type_name);
+            DataType::Utf8
+        }
+    }
+}
+
 // ============= Arrow IPC Deserialization Utilities =============
 
-/// Deserialize Arrow IPC data to RecordBatches
-/// This is the inverse of the worker's serialize_batch_to_arrow_ipc
+/// Deserialize Arrow IPC data to RecordBatches (ZERO-COPY OPTIMIZED)
+/// 
+/// This is the inverse of the worker's serialize_batch_to_arrow_ipc.
+/// Uses Arrow IPC stream format which preserves native types.
+/// 
+/// Tries StreamReader first (new format), falls back to FileReader (legacy).
 fn deserialize_arrow_ipc(data: &[u8]) -> Result<Vec<arrow_array::RecordBatch>, anyhow::Error> {
+    // Try StreamReader first (new Arrow IPC stream format)
+    let cursor = Cursor::new(data);
+    if let Ok(reader) = StreamReader::try_new(cursor, None) {
+        let mut batches = Vec::new();
+        for batch_result in reader {
+            batches.push(batch_result?);
+        }
+        return Ok(batches);
+    }
+    
+    // Fallback to FileReader for backwards compatibility
     let cursor = Cursor::new(data);
     let reader = FileReader::try_new(cursor, None)?;
     
@@ -716,6 +941,35 @@ fn deserialize_arrow_ipc(data: &[u8]) -> Result<Vec<arrow_array::RecordBatch>, a
     }
     
     Ok(batches)
+}
+
+/// Deserialize Arrow IPC data directly to RecordBatches without string conversion
+/// 
+/// This is used by Flight SQL to preserve native Arrow types.
+/// Returns the schema and batches for direct use.
+pub fn deserialize_arrow_ipc_native(data: &[u8]) -> Result<(arrow_schema::SchemaRef, Vec<arrow_array::RecordBatch>), anyhow::Error> {
+    // Try StreamReader first (new Arrow IPC stream format)
+    let cursor = Cursor::new(data);
+    if let Ok(reader) = StreamReader::try_new(cursor, None) {
+        let schema = reader.schema();
+        let mut batches = Vec::new();
+        for batch_result in reader {
+            batches.push(batch_result?);
+        }
+        return Ok((schema, batches));
+    }
+    
+    // Fallback to FileReader
+    let cursor = Cursor::new(data);
+    let reader = FileReader::try_new(cursor, None)?;
+    let schema = reader.schema();
+    
+    let mut batches = Vec::new();
+    for batch_result in reader {
+        batches.push(batch_result?);
+    }
+    
+    Ok((schema, batches))
 }
 
 /// Convert an Arrow RecordBatch to string rows for PG wire protocol
