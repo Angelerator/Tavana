@@ -1014,6 +1014,9 @@ async fn run_query_loop(
     let mut __describe_column_count: usize = 0;
     // Server-side cursor storage for this connection
     let mut cursors = ConnectionCursors::new();
+    // Binary format support for non-TLS extended query protocol
+    let mut result_format_codes_nontls: Vec<i16> = Vec::new();
+    let mut cached_column_types_nontls: Vec<String> = Vec::new();
     
     // Helper macro to update ready message when transaction status changes
     macro_rules! update_transaction_status {
@@ -1248,11 +1251,14 @@ async fn run_query_loop(
                     prepared_query = Some(query);
                 }
             }
-            b'B' => handle_bind(socket, &mut buf).await?,
+            b'B' => {
+                result_format_codes_nontls = handle_bind(socket, &mut buf).await?;
+            }
             b'D' => {
-                let (sent_row_desc, col_count) = handle_describe(socket, &mut buf, prepared_query.as_deref(), worker_client, user_id).await?;
+                let (sent_row_desc, col_count, col_types) = handle_describe_with_formats(socket, &mut buf, prepared_query.as_deref(), worker_client, user_id, &result_format_codes_nontls).await?;
                 describe_sent_row_description = sent_row_desc;
                 __describe_column_count = col_count;
+                cached_column_types_nontls = col_types;
             }
             b'E' => {
                 if let Some(ref query) = prepared_query {
@@ -1279,7 +1285,7 @@ async fn run_query_loop(
                         socket.write_all(&msg).await?;
                         socket.flush().await?;
                     } else {
-                        handle_execute_extended(
+                        handle_execute_extended_with_formats(
                             socket,
                             &mut buf,
                             worker_client,
@@ -1288,6 +1294,8 @@ async fn run_query_loop(
                             user_id,
                             smart_scaler,
                             query_queue,
+                            &result_format_codes_nontls,
+                            &cached_column_types_nontls,
                         )
                         .await?;
                     }
@@ -1296,6 +1304,8 @@ async fn run_query_loop(
                 }
                 prepared_query = None;
                 describe_sent_row_description = false;
+                result_format_codes_nontls.clear();
+                cached_column_types_nontls.clear();
             }
             b'C' => {
                 // Close message - close a prepared statement or portal
@@ -4608,14 +4618,14 @@ async fn handle_parse_extended(
     }
 }
 
-async fn handle_bind(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4]) -> anyhow::Result<()> {
+async fn handle_bind(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4]) -> anyhow::Result<Vec<i16>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     socket.read_exact(buf).await?;
     let len = u32::from_be_bytes(*buf) as usize - 4;
     let mut data = vec![0u8; len];
     socket.read_exact(&mut data).await?;
     
-    // Parse Bind message to log format codes
+    // Parse Bind message to extract format codes
     // Format: portal_name\0 + stmt_name\0 + param_format_count(i16) + param_formats + 
     //         param_values_count(i16) + params + result_format_count(i16) + result_formats
     let mut offset = 0;
@@ -4647,30 +4657,26 @@ async fn handle_bind(socket: &mut tokio::net::TcpStream, buf: &mut [u8; 4]) -> a
         }
     }
     
-    // Parse result format codes
+    // Parse and store result format codes for binary support
+    let mut result_format_codes: Vec<i16> = Vec::new();
     if offset + 2 <= data.len() {
         let result_format_count = i16::from_be_bytes([data[offset], data[offset+1]]) as usize;
         offset += 2;
         if result_format_count > 0 && offset + result_format_count * 2 <= data.len() {
-            let mut has_binary = false;
             for i in 0..result_format_count {
                 let fmt = i16::from_be_bytes([data[offset + i*2], data[offset + i*2 + 1]]);
-                if fmt == 1 {
-                    has_binary = true;
-                }
+                result_format_codes.push(fmt);
             }
-            if has_binary {
-                // CRITICAL: Client requested binary format but Tavana only supports text
-                warn!("Bind: client requested BINARY format for {} result columns! Tavana only supports TEXT format, this may cause client parsing errors.", result_format_count);
-            } else {
-                debug!("Bind: client requested TEXT format for {} result columns", result_format_count);
+            if result_format_codes.iter().any(|&f| f == 1) {
+                debug!("Bind (non-TLS): client requested BINARY format for {} columns, will encode appropriately", 
+                    result_format_codes.iter().filter(|&&f| f == 1).count());
             }
         }
     }
     
     socket.write_all(&[b'2', 0, 0, 0, 4]).await?; // BindComplete
     socket.flush().await?;
-    Ok(())
+    Ok(result_format_codes)
 }
 
 /// Handle Describe message for extended query protocol
@@ -4786,10 +4792,117 @@ async fn handle_describe(
     }
 }
 
+/// Handle Describe message for extended query protocol with format codes for binary support
+/// Returns (sent_row_description, column_count, column_types) tuple:
+/// - sent_row_description: true if RowDescription was sent, false if NoData was sent
+/// - column_count: number of columns declared in RowDescription (0 if NoData)
+/// - column_types: vector of column type names for binary encoding
+async fn handle_describe_with_formats(
+    socket: &mut tokio::net::TcpStream,
+    buf: &mut [u8; 4],
+    prepared_query: Option<&str>,
+    worker_client: &WorkerClient,
+    user_id: &str,
+    format_codes: &[i16],
+) -> anyhow::Result<(bool, usize, Vec<String>)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    socket.read_exact(buf).await?;
+    let len = u32::from_be_bytes(*buf) as usize - 4;
+    let mut data = vec![0u8; len];
+    socket.read_exact(&mut data).await?;
+    
+    // Describe message: first byte is 'S' (statement) or 'P' (portal)
+    let describe_type = if data.is_empty() { b'S' } else { data[0] };
+    
+    debug!("Extended query protocol (with formats) - Describe type: {}", describe_type as char);
+    
+    if let Some(sql) = prepared_query {
+        if let Some(result) = handle_pg_specific_command(sql) {
+            if describe_type == b'S' {
+                socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
+            }
+            
+            if result.columns.is_empty() {
+                socket.write_all(&[b'n', 0, 0, 0, 4]).await?;
+                return Ok((false, 0, vec![]));
+            } else {
+                let col_count = result.columns.len();
+                let col_types: Vec<String> = result.columns.iter().map(|(_, t)| t.clone()).collect();
+                send_row_description_for_describe_with_formats(socket, &result.columns, format_codes).await?;
+                return Ok((true, col_count, col_types));
+            }
+        } else {
+            let has_parameters = sql.contains("$1") || sql.contains("$2") || sql.contains("$3");
+            
+            let schema_sql = if has_parameters {
+                sql.replace("$1", "NULL")
+                    .replace("$2", "NULL")
+                    .replace("$3", "NULL")
+                    .replace("$4", "NULL")
+                    .replace("$5", "NULL")
+                    .replace("$6", "NULL")
+                    .replace("$7", "NULL")
+                    .replace("$8", "NULL")
+                    .replace("$9", "NULL")
+            } else {
+                sql.to_string()
+            };
+            
+            let schema_sql_rewritten = pg_compat::rewrite_pg_to_duckdb(&schema_sql);
+            let schema_query = format!("SELECT * FROM ({}) AS _schema_query LIMIT 0", 
+                schema_sql_rewritten.trim_end_matches(';'));
+            
+            match worker_client.execute_query(&schema_query, user_id).await {
+                Ok(result) => {
+                    if describe_type == b'S' {
+                        socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
+                    }
+                    
+                    let columns: Vec<(String, String)> = result.columns.iter()
+                        .map(|c| (c.name.clone(), c.type_name.clone()))
+                        .collect();
+                    
+                    if columns.is_empty() {
+                        socket.write_all(&[b'n', 0, 0, 0, 4]).await?;
+                        return Ok((false, 0, vec![]));
+                    } else {
+                        let col_count = columns.len();
+                        let col_types: Vec<String> = columns.iter().map(|(_, t)| t.clone()).collect();
+                        info!("Extended Protocol (non-TLS with formats) - Describe: {} columns", col_count);
+                        send_row_description_for_describe_with_formats(socket, &columns, format_codes).await?;
+                        return Ok((true, col_count, col_types));
+                    }
+                }
+                Err(e) => {
+                    warn!("Extended Protocol (non-TLS with formats) - Describe failed: {}", e);
+                    if describe_type == b'S' {
+                        socket.write_all(&[b't', 0, 0, 0, 6, 0, 0]).await?;
+                    }
+                    socket.write_all(&[b'n', 0, 0, 0, 4]).await?;
+                    return Ok((false, 0, vec![]));
+                }
+            }
+        }
+    } else {
+        socket.write_all(&[b'n', 0, 0, 0, 4]).await?;
+        socket.flush().await?;
+        return Ok((false, 0, vec![]));
+    }
+}
+
 /// Send RowDescription message for Describe response (columns with types)
 async fn send_row_description_for_describe(
     socket: &mut tokio::net::TcpStream,
     columns: &[(String, String)],
+) -> anyhow::Result<()> {
+    send_row_description_for_describe_with_formats(socket, columns, &[]).await
+}
+
+/// Send RowDescription message for Describe response with format codes for binary support
+async fn send_row_description_for_describe_with_formats(
+    socket: &mut tokio::net::TcpStream,
+    columns: &[(String, String)],
+    format_codes: &[i16],
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
     
@@ -4798,7 +4911,14 @@ async fn send_row_description_for_describe(
     msg.extend_from_slice(&[0, 0, 0, 0]); // Length placeholder
     msg.extend_from_slice(&(columns.len() as i16).to_be_bytes()); // Field count
     
-    for (name, type_name) in columns {
+    for (i, (name, type_name)) in columns.iter().enumerate() {
+        // Get format code for this column
+        let format = match format_codes.len() {
+            0 => 0i16, // Default to text
+            1 => format_codes[0], // Single format for all columns
+            _ => format_codes.get(i).copied().unwrap_or(0),
+        };
+        
         // Field name (null-terminated)
         msg.extend_from_slice(name.as_bytes());
         msg.push(0);
@@ -4813,8 +4933,8 @@ async fn send_row_description_for_describe(
         msg.extend_from_slice(&pg_type_len(type_name).to_be_bytes());
         // Type modifier (-1 = no modifier)
         msg.extend_from_slice(&(-1i32).to_be_bytes());
-        // Format code (0 = text)
-        msg.extend_from_slice(&0i16.to_be_bytes());
+        // Format code
+        msg.extend_from_slice(&format.to_be_bytes());
     }
     
     // Fill in the length
@@ -5103,6 +5223,149 @@ async fn handle_execute_extended(
         Err(queue_error) => {
             let error_msg = format!("Query queue error: {}", queue_error);
             warn!(query_id = %query_id, "Extended query failed to queue: {}", error_msg);
+            send_error(socket, &error_msg).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle Execute message for extended query protocol with binary format support
+async fn handle_execute_extended_with_formats(
+    socket: &mut tokio::net::TcpStream,
+    buf: &mut [u8; 4],
+    worker_client: &WorkerClient,
+    query_router: &QueryRouter,
+    sql: &str,
+    user_id: &str,
+    smart_scaler: Option<&SmartScaler>,
+    query_queue: &Arc<QueryQueue>,
+    format_codes: &[i16],
+    column_types: &[String],
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use futures::StreamExt;
+    
+    socket.read_exact(buf).await?;
+    let len = u32::from_be_bytes(*buf) as usize - 4;
+    let mut data = vec![0u8; len];
+    socket.read_exact(&mut data).await?;
+    
+    debug!(
+        "Extended query protocol (with formats) - Execute: {}",
+        &sql[..sql.len().min(100)]
+    );
+
+    // Check if this is an intercepted command
+    if let Some(result) = handle_pg_specific_command(sql) {
+        if !result.rows.is_empty() {
+            info!("Extended query protocol (with formats) - Execute: Intercepted command returns {} rows", result.rows.len());
+            for row in &result.rows {
+                let data_row = build_data_row_with_formats(&row.iter().map(|s| s.clone()).collect::<Vec<_>>(), column_types, format_codes);
+                socket.write_all(&data_row).await?;
+            }
+            let cmd_tag = result.command_tag.unwrap_or_else(|| format!("SELECT {}", result.rows.len()));
+            send_command_complete(socket, &cmd_tag).await?;
+            socket.flush().await?;
+            return Ok(());
+        }
+    }
+
+    let query_id = uuid::Uuid::new_v4().to_string();
+    let estimate = query_router.route(sql).await;
+    let estimated_data_mb = estimate.data_size_mb;
+
+    let enqueue_result = query_queue
+        .enqueue(query_id.clone(), estimated_data_mb)
+        .await;
+
+    match enqueue_result {
+        Ok(query_token) => {
+            let start = std::time::Instant::now();
+            
+            // Rewrite SQL for DuckDB compatibility
+            let rewritten_sql = pg_compat::rewrite_pg_to_duckdb(sql);
+            
+            // Execute with streaming and binary format support
+            let stream_result = worker_client.execute_query_streaming(&rewritten_sql, user_id).await;
+            
+            match stream_result {
+                Ok(mut stream) => {
+                    let mut rows_sent = 0usize;
+                    let mut bytes_since_flush = 0usize;
+                    let mut stream_error: Option<String> = None;
+                    let mut local_column_types: Vec<String> = column_types.to_vec();
+                    
+                    while let Some(batch) = stream.next().await {
+                        match batch {
+                            Ok(StreamingBatch::Metadata { columns: _, column_types: types }) => {
+                                // Use streaming types if available (more accurate than Describe types)
+                                if !types.is_empty() {
+                                    local_column_types = types;
+                                }
+                            }
+                            Ok(StreamingBatch::Rows(batch_rows)) => {
+                                for row in batch_rows {
+                                    let data_row = build_data_row_with_formats(&row, &local_column_types, format_codes);
+                                    bytes_since_flush += data_row.len();
+                                    socket.write_all(&data_row).await?;
+                                    rows_sent += 1;
+                                    
+                                    // Flush periodically for backpressure
+                                    if bytes_since_flush >= 65536 {
+                                        socket.flush().await?;
+                                        bytes_since_flush = 0;
+                                    }
+                                }
+                            }
+                            Ok(StreamingBatch::Error(msg)) => {
+                                stream_error = Some(msg);
+                                break;
+                            }
+                            Err(e) => {
+                                stream_error = Some(e.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    
+                    socket.flush().await?;
+                    
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    
+                    if let Some(err) = stream_error {
+                        error!("Extended query (with formats) error: {}", err);
+                        send_error(socket, &err).await?;
+                        query_queue.complete(query_token, QueryOutcome::Failure {
+                            error: err,
+                            duration_ms,
+                        }).await;
+                    } else {
+                        let cmd_tag = format!("SELECT {}", rows_sent);
+                        send_command_complete(socket, &cmd_tag).await?;
+                        socket.flush().await?;
+                        info!("Extended query (with formats) completed: {} rows in {}ms", rows_sent, duration_ms);
+                        query_queue.complete(query_token, QueryOutcome::Success {
+                            rows: rows_sent as u64,
+                            bytes: 0,
+                            duration_ms,
+                        }).await;
+                    }
+                }
+                Err(e) => {
+                    error!("Extended query (with formats) stream error: {}", e);
+                    send_error(socket, &e.to_string()).await?;
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    query_queue.complete(query_token, QueryOutcome::Failure {
+                        error: e.to_string(),
+                        duration_ms,
+                    }).await;
+                }
+            }
+        }
+        Err(queue_error) => {
+            let error_msg = format!("Query queue error: {}", queue_error);
+            warn!(query_id = %query_id, "Extended query (with formats) failed to queue: {}", error_msg);
             send_error(socket, &error_msg).await?;
         }
     }
