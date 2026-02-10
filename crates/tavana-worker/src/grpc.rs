@@ -642,6 +642,15 @@ fn serialize_batch_to_binary(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u
 /// 
 /// Format: Arrow IPC stream format with embedded schema
 /// 
+/// ## Performance Notes
+/// 
+/// This creates a new Vec per batch. Attempts to pool buffers were considered but:
+/// - gRPC takes ownership of the Vec, so we can't reuse it
+/// - Clone would add a copy operation anyway
+/// - Vec's geometric growth means allocation overhead amortizes after first few batches
+/// 
+/// For true zero-copy, clients should use Flight SQL which streams Arrow IPC directly.
+/// 
 /// Reference: https://arrow.apache.org/docs/format/IPC.html
 fn serialize_batch_to_arrow_ipc(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u8> {
     use arrow_ipc::writer::StreamWriter;
