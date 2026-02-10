@@ -2624,9 +2624,9 @@ where
     metrics::query_started();
     let start_time = std::time::Instant::now();
 
-    // TRUE STREAMING: Use streaming API instead of buffered
-    // This is the key change for OOM-proof execution
-    match worker_client.execute_query_streaming(sql, user_id).await {
+    // NATIVE ARROW STREAMING: Arrow RecordBatch → PG DataRow directly
+    // Uses arrow_encoder for zero-copy encoding - no intermediate String conversion
+    match worker_client.execute_query_native_streaming(sql, user_id).await {
         Ok(mut stream) => {
             let mut columns_sent = false;
             let mut total_rows: usize = 0;
@@ -2636,16 +2636,14 @@ where
 
             while let Some(batch) = stream.next().await {
                 match batch? {
-                    StreamingBatch::Metadata { columns, column_types: types } => {
+                    NativeStreamingBatch::Metadata { columns, column_types: types, schema: _ } => {
                         column_names = columns;
                         _column_types = types;
                         
                         if !columns_sent {
                             if is_copy_command {
-                                // Send CopyOutResponse for COPY commands
                                 send_copy_out_response_header_generic(socket, column_names.len()).await?;
                             } else {
-                                // Send RowDescription for SELECT
                                 let col_pairs: Vec<(String, String)> = column_names.iter()
                                     .zip(_column_types.iter())
                                     .map(|(n, t)| (n.clone(), t.clone()))
@@ -2655,35 +2653,30 @@ where
                             columns_sent = true;
                         }
                     }
-                    StreamingBatch::Rows(rows) => {
-                        for row in rows {
-                            if is_copy_command {
-                                send_copy_data_row_generic(socket, &row).await?;
-                            } else {
-                                send_data_row_generic(socket, &row, column_names.len()).await?;
-                            }
+                    NativeStreamingBatch::RecordBatch(record_batch) => {
+                        // DIRECT ENCODING: Arrow → PG DataRow (no intermediate String!)
+                        for row_idx in 0..record_batch.num_rows() {
+                            let data_row = encode_arrow_row(&record_batch, row_idx, &[0]); // text format
+                            socket.write_all(&data_row).await?;
                             total_rows += 1;
                             batch_rows += 1;
 
-                            // Flush periodically to provide backpressure and prevent client timeout
                             if batch_rows >= STREAMING_BATCH_SIZE {
                                 socket.flush().await?;
                                 batch_rows = 0;
                             }
                         }
                     }
-                    StreamingBatch::Error(msg) => {
+                    NativeStreamingBatch::Error(msg) => {
                         return Err(anyhow::anyhow!("{}", msg));
                     }
                 }
             }
 
-            // Send completion messages
             if is_copy_command {
                 send_copy_done_generic(socket).await?;
             }
             
-            // If no columns were sent (empty result), send empty row description
             if !columns_sent && !is_copy_command {
                 send_row_description_generic(socket, &[]).await?;
             }
@@ -2696,13 +2689,13 @@ where
             debug!(
                 rows = total_rows,
                 elapsed_ms = start_time.elapsed().as_millis(),
-                "Query completed (TRUE STREAMING - OOM-proof)"
+                "Query completed (NATIVE ARROW STREAMING)"
             );
             
             Ok(total_rows)
         }
         Err(e) => {
-            error!("Streaming query failed: {}", e);
+            error!("Native arrow streaming failed: {}", e);
             Err(e)
         }
     }
@@ -3630,138 +3623,10 @@ async fn execute_query_streaming_default_impl(
     user_id: &str,
     skip_row_description: bool,
 ) -> anyhow::Result<usize> {
-    // Load backpressure config
-    let config = PgWireConfig::default();
-    let bp_config = BackpressureConfig {
-        flush_threshold_bytes: config.flush_threshold_bytes,
-        flush_threshold_rows: config.flush_threshold_rows,
-        flush_timeout_secs: config.flush_timeout_secs,
-        connection_check_interval_rows: config.connection_check_interval_rows,
-        write_buffer_size: config.write_buffer_size,
-    };
-
-    // For the default path, we still need to use the existing client
-    // but we'll stream the results to the client as they come
-    match worker_client.execute_query_streaming(sql, user_id).await {
-        Ok(mut stream) => {
-            // Create backpressure-aware writer with reborrow
-            let mut writer = BackpressureWriter::new(&mut *socket, bp_config);
-            let mut columns_sent = false;
-
-            while let Some(batch) = stream.next().await {
-                match batch? {
-                    StreamingBatch::Metadata {
-                        columns,
-                        column_types,
-                    } => {
-                        // Send RowDescription once (unless in Extended Protocol where Describe already sent it)
-                        if !columns_sent && !skip_row_description {
-                            let row_desc = build_row_description(&columns, &column_types);
-                            writer.write_bytes(&row_desc).await?;
-                        }
-                        columns_sent = true;
-                    }
-                    StreamingBatch::Rows(rows) => {
-                        for row in rows {
-                            // Build and write DataRow with backpressure tracking
-                            let data_row = build_data_row(&row);
-                            
-                            match writer.write_bytes(&data_row).await {
-                                Ok(_) => {}
-                                Err(e) if is_disconnect_error(&e) => {
-                                    let stats = writer.stats();
-                                    warn!("Client disconnected during streaming after {} rows", stats.rows_sent);
-                                    return Err(anyhow::anyhow!("Client disconnected"));
-                                }
-                                Err(e) => return Err(e.into()),
-                            }
-                            writer.row_sent();
-
-                            // Check if we should flush (based on bytes AND rows)
-                            if writer.should_flush() {
-                                match writer.flush_with_backpressure().await {
-                                    Ok(true) => {} // Normal flush
-                                    Ok(false) => {
-                                        // Slow client - continue but log
-                                        let stats = writer.stats();
-                                        debug!("Slow client detected after {} rows", stats.rows_sent);
-                                    }
-                                    Err(e) if is_disconnect_error(&e) => {
-                                        let stats = writer.stats();
-                                        warn!("Client disconnected during flush after {} rows", stats.rows_sent);
-                                        return Err(anyhow::anyhow!("Client disconnected"));
-                                    }
-                                    Err(e) => {
-                                        warn!("Flush failed: {} - client may be overwhelmed", e);
-                                        return Err(anyhow::anyhow!("Client too slow: {}", e));
-                                    }
-                                }
-                            }
-
-                            // Periodically check if client is still connected
-                            if writer.should_check_connection() {
-                                if !writer.is_connected().await {
-                                    let stats = writer.stats();
-                                    warn!("Client disconnected during streaming after {} rows", stats.rows_sent);
-                                    return Err(anyhow::anyhow!("Client disconnected"));
-                                }
-                            }
-
-                            // Check for large transfer warning (16GB, then every 2GB)
-                            // Non-blocking: just sends a NOTICE, doesn't slow streaming
-                            if let Some(current_gb) = writer.stats_mut().should_warn_large_transfer() {
-                                let notice_msg = format!(
-                                    "Large data transfer: {}GB sent. Consider using LIMIT or CURSOR for very large results.",
-                                    current_gb
-                                );
-                                warn!("Large transfer warning: {}GB sent to client", current_gb);
-                                // Send notice inline - non-blocking, just adds to buffer
-                                let notice_bytes = build_notice_message(&notice_msg);
-                                if let Err(e) = writer.write_bytes(&notice_bytes).await {
-                                    debug!("Failed to send large transfer notice: {}", e);
-                                }
-                            }
-                        }
-                    }
-                    StreamingBatch::Error(msg) => {
-                        return Err(anyhow::anyhow!("{}", msg));
-                    }
-                }
-            }
-
-            // If no columns were sent and not in extended protocol, send empty row description
-            if !columns_sent && !skip_row_description {
-                let row_desc = build_row_description(&[], &[]);
-                writer.write_bytes(&row_desc).await?;
-            }
-
-            let stats = writer.stats();
-            let tag = format!("SELECT {}", stats.rows_sent);
-            let cmd_complete = build_command_complete(&tag);
-            writer.write_bytes(&cmd_complete).await?;
-
-            // Final flush
-            writer.force_flush().await?;
-
-            let final_stats = writer.stats();
-            debug!(
-                "Streaming complete: {} rows, {} bytes, {} flushes",
-                final_stats.rows_sent, final_stats.bytes_sent, final_stats.flush_count
-            );
-
-            Ok(final_stats.rows_sent)
-        }
-        Err(e) => {
-            // Fallback to non-streaming for compatibility
-            warn!("Streaming not available, falling back to buffered: {}", e);
-            let result = execute_query_buffered(worker_client, sql, user_id).await?;
-            if skip_row_description {
-                send_query_result_data_only(socket, result).await
-            } else {
-                send_query_result_immediate(socket, result).await
-            }
-        }
-    }
+    // Use NATIVE ARROW STREAMING: Arrow RecordBatch → PG DataRow directly
+    // No intermediate String conversion - uses arrow_encoder for zero-copy encoding
+    // Text format by default (format_codes = [0]); clients can request binary via Bind
+    execute_query_native_streaming(socket, worker_client, sql, user_id, skip_row_description, &[0]).await
 }
 
 /// Execute query with NATIVE ARROW STREAMING (ZERO-COPY OPTIMIZED)
@@ -3885,9 +3750,14 @@ async fn execute_query_native_streaming(
             Ok(rows_sent)
         }
         Err(e) => {
-            // Fallback to string-based streaming
-            warn!("Native streaming not available, falling back to string-based: {}", e);
-            execute_query_streaming_default_impl(socket, worker_client, sql, user_id, skip_row_description).await
+            // Fallback to buffered execution
+            warn!("Native arrow streaming not available, falling back to buffered: {}", e);
+            let result = execute_query_buffered(worker_client, sql, user_id).await?;
+            if skip_row_description {
+                send_query_result_data_only(socket, result).await
+            } else {
+                send_query_result_immediate(socket, result).await
+            }
         }
     }
 }
@@ -4002,17 +3872,46 @@ fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
     }
 
     if sql_trimmed.starts_with("SHOW ") {
-        if sql_trimmed.contains("TRANSACTION ISOLATION") {
-            return Some(QueryExecutionResult {
-                columns: vec![("transaction_isolation".to_string(), "text".to_string())],
-                rows: vec![vec!["read committed".to_string()]],
-                row_count: 1,
-                command_tag: None,
-            });
-        }
+        // Extract parameter name from SHOW command
+        let param_name = sql_trimmed.strip_prefix("SHOW ")
+            .unwrap_or("")
+            .trim_end_matches(';')
+            .trim()
+            .to_lowercase();
+
+        // Return proper defaults for known PG parameters (like duckgres)
+        let (col_name, value) = match param_name.as_str() {
+            "transaction_isolation" | "transaction isolation level" 
+                => ("transaction_isolation", "read committed"),
+            "default_transaction_isolation" => ("default_transaction_isolation", "read committed"),
+            "server_version" => ("server_version", "15.0"),
+            "server_version_num" => ("server_version_num", "150000"),
+            "server_encoding" => ("server_encoding", "UTF8"),
+            "client_encoding" => ("client_encoding", "UTF8"),
+            "extra_float_digits" => ("extra_float_digits", "1"),
+            "application_name" => ("application_name", ""),
+            "standard_conforming_strings" => ("standard_conforming_strings", "on"),
+            "integer_datetimes" => ("integer_datetimes", "on"),
+            "datestyle" => ("DateStyle", "ISO, MDY"),
+            "intervalstyle" => ("IntervalStyle", "postgres"),
+            "timezone" => ("TimeZone", "UTC"),
+            "search_path" => ("search_path", "\"$user\", public"),
+            "client_min_messages" => ("client_min_messages", "notice"),
+            "statement_timeout" => ("statement_timeout", "0"),
+            "lock_timeout" => ("lock_timeout", "0"),
+            "bytea_output" => ("bytea_output", "hex"),
+            "lc_collate" => ("lc_collate", "en_US.UTF-8"),
+            "lc_ctype" => ("lc_ctype", "en_US.UTF-8"),
+            "max_identifier_length" => ("max_identifier_length", "63"),
+            "is_superuser" => ("is_superuser", "on"),
+            "session_authorization" => ("session_authorization", ""),
+            "work_mem" => ("work_mem", "4MB"),
+            _ => (&*param_name, ""),
+        };
+
         return Some(QueryExecutionResult {
-            columns: vec![("setting".to_string(), "text".to_string())],
-            rows: vec![vec!["".to_string()]],
+            columns: vec![(col_name.to_string(), "text".to_string())],
+            rows: vec![vec![value.to_string()]],
             row_count: 1,
             command_tag: None,
         });
@@ -5452,78 +5351,39 @@ async fn handle_execute_extended_with_formats(
             // Rewrite SQL for DuckDB compatibility
             let rewritten_sql = pg_compat::rewrite_pg_to_duckdb(sql);
             
-            // Execute with streaming and binary format support
-            let stream_result = worker_client.execute_query_streaming(&rewritten_sql, user_id).await;
+            // NATIVE ARROW STREAMING: Arrow RecordBatch → PG DataRow directly
+            // Uses arrow_encoder for zero-copy encoding with proper format code support
+            // skip_row_description=true because Describe already sent RowDescription
+            let result = execute_query_native_streaming(
+                socket,
+                worker_client,
+                &rewritten_sql,
+                user_id,
+                true, // skip_row_description - Describe already sent it
+                format_codes,
+            ).await;
             
-            match stream_result {
-                Ok(mut stream) => {
-                    let mut rows_sent = 0usize;
-                    let mut bytes_since_flush = 0usize;
-                    let mut stream_error: Option<String> = None;
-                    let mut local_column_types: Vec<String> = column_types.to_vec();
-                    
-                    while let Some(batch) = stream.next().await {
-                        match batch {
-                            Ok(StreamingBatch::Metadata { columns: _, column_types: types }) => {
-                                // Use streaming types if available (more accurate than Describe types)
-                                if !types.is_empty() {
-                                    local_column_types = types;
-                                }
-                            }
-                            Ok(StreamingBatch::Rows(batch_rows)) => {
-                                for row in batch_rows {
-                                    let data_row = build_data_row_with_formats(&row, &local_column_types, format_codes);
-                                    bytes_since_flush += data_row.len();
-                                    socket.write_all(&data_row).await?;
-                                    rows_sent += 1;
-                                    
-                                    // Flush periodically for backpressure
-                                    if bytes_since_flush >= 65536 {
-                                        socket.flush().await?;
-                                        bytes_since_flush = 0;
-                                    }
-                                }
-                            }
-                            Ok(StreamingBatch::Error(msg)) => {
-                                stream_error = Some(msg);
-                                break;
-                            }
-                            Err(e) => {
-                                stream_error = Some(e.to_string());
-                                break;
-                            }
-                        }
-                    }
-                    
-                    socket.flush().await?;
-                    
-                    let duration_ms = start.elapsed().as_millis() as u64;
-                    
-                    if let Some(err) = stream_error {
-                        error!("Extended query (with formats) error: {}", err);
-                        send_error(socket, &err).await?;
-                        query_queue.complete(query_token, QueryOutcome::Failure {
-                            error: err,
-                            duration_ms,
-                        }).await;
-                    } else {
-                        let cmd_tag = format!("SELECT {}", rows_sent);
-                        send_command_complete(socket, &cmd_tag).await?;
-                        socket.flush().await?;
-                        info!("Extended query (with formats) completed: {} rows in {}ms", rows_sent, duration_ms);
-                        query_queue.complete(query_token, QueryOutcome::Success {
-                            rows: rows_sent as u64,
-                            bytes: 0,
-                            duration_ms,
-                        }).await;
-                    }
+            let duration_ms = start.elapsed().as_millis() as u64;
+            
+            match result {
+                Ok(rows_sent) => {
+                    info!("Extended query (native arrow) completed: {} rows in {}ms", rows_sent, duration_ms);
+                    query_queue.complete(query_token, QueryOutcome::Success {
+                        rows: rows_sent as u64,
+                        bytes: 0,
+                        duration_ms,
+                    }).await;
                 }
                 Err(e) => {
-                    error!("Extended query (with formats) stream error: {}", e);
-                    send_error(socket, &e.to_string()).await?;
-                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let err_msg = e.to_string();
+                    if err_msg.contains("Client disconnected") {
+                        debug!("Client disconnected during extended query: {}", err_msg);
+                    } else {
+                        error!("Extended query (native arrow) error: {}", err_msg);
+                        send_error(socket, &err_msg).await?;
+                    }
                     query_queue.complete(query_token, QueryOutcome::Failure {
-                        error: e.to_string(),
+                        error: err_msg,
                         duration_ms,
                     }).await;
                 }
@@ -5531,7 +5391,7 @@ async fn handle_execute_extended_with_formats(
         }
         Err(queue_error) => {
             let error_msg = format!("Query queue error: {}", queue_error);
-            warn!(query_id = %query_id, "Extended query (with formats) failed to queue: {}", error_msg);
+            warn!(query_id = %query_id, "Extended query (native arrow) failed to queue: {}", error_msg);
             send_error(socket, &error_msg).await?;
         }
     }

@@ -106,6 +106,10 @@ static REGCLASS_CAST_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)::reg(class|type|proc|oper|namespace|role)").unwrap()
 });
 
+static CURRENT_SETTING_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)current_setting\s*\(\s*'([^']+)'\s*\)").unwrap()
+});
+
 /// Convert PostgreSQL date format to strftime format
 fn pg_format_to_strftime(pg_format: &str) -> String {
     let mut result = pg_format.to_string();
@@ -223,6 +227,40 @@ pub fn rewrite_pg_to_duckdb(sql: &str) -> String {
         modified = true;
     }
 
+    // current_setting('param') → inline value
+    // DuckDB doesn't have current_setting(); JDBC/DBeaver call this for server metadata
+    // Follows duckgres pattern: return sensible defaults for known PG parameters
+    if CURRENT_SETTING_REGEX.is_match(&result) {
+        result = CURRENT_SETTING_REGEX
+            .replace_all(&result, |caps: &regex::Captures| {
+                let param = caps[1].to_lowercase();
+                let value = match param.as_str() {
+                    "server_version" => "15.0",
+                    "server_version_num" => "150000",
+                    "server_encoding" => "UTF8",
+                    "client_encoding" => "UTF8",
+                    "extra_float_digits" => "1",
+                    "standard_conforming_strings" => "on",
+                    "integer_datetimes" => "on",
+                    "datestyle" | "DateStyle" => "ISO, MDY",
+                    "intervalstyle" | "IntervalStyle" => "postgres",
+                    "timezone" | "TimeZone" => "UTC",
+                    "search_path" => "\"$user\", public",
+                    "transaction_isolation" => "read committed",
+                    "is_superuser" => "on",
+                    "session_authorization" => "",
+                    "max_identifier_length" => "63",
+                    "bytea_output" => "hex",
+                    "lc_collate" => "en_US.UTF-8",
+                    "lc_ctype" => "en_US.UTF-8",
+                    _ => "",
+                };
+                format!("'{}'", value)
+            })
+            .to_string();
+        modified = true;
+    }
+
     if modified {
         debug!(
             original = sql,
@@ -248,6 +286,7 @@ pub fn needs_rewrite(sql: &str) -> bool {
         || sql_upper.contains("::REGPROC")
         || sql_upper.contains("::REGOPER")
         || sql_upper.contains("::REGNAMESPACE")
+        || sql_upper.contains("CURRENT_SETTING")
         || sql_upper.contains("::REGROLE")
 }
 
