@@ -1008,6 +1008,8 @@ async fn run_query_loop(
     // ReadyForQuery message - updated when transaction status changes
     let mut ready = [b'Z', 0, 0, 0, 5, transaction_status];
     let mut prepared_query: Option<String> = None;
+    // Track whether Describe was called at all (to distinguish "not called" from "called but NoData")
+    let mut describe_was_called = false;
     // Track whether Describe sent RowDescription (true) or NoData (false)
     let mut describe_sent_row_description = false;
     // Cache the column count from Describe to ensure Execute sends matching data
@@ -1255,6 +1257,7 @@ async fn run_query_loop(
                 result_format_codes_nontls = handle_bind(socket, &mut buf).await?;
             }
             b'D' => {
+                describe_was_called = true;
                 let (sent_row_desc, col_count, col_types) = handle_describe_with_formats(socket, &mut buf, prepared_query.as_deref(), worker_client, user_id, &result_format_codes_nontls).await?;
                 describe_sent_row_description = sent_row_desc;
                 __describe_column_count = col_count;
@@ -1262,8 +1265,9 @@ async fn run_query_loop(
             }
             b'E' => {
                 if let Some(ref query) = prepared_query {
-                    // If Describe sent NoData, we must not send DataRows
-                    if !describe_sent_row_description {
+                    // Only skip DataRows if Describe was actually called AND sent NoData
+                    // If Describe was never called, we should still execute normally
+                    if describe_was_called && !describe_sent_row_description {
                         // Read Execute message data
                         socket.read_exact(&mut buf).await?;
                         let len = u32::from_be_bytes(buf) as usize - 4;
@@ -1303,6 +1307,7 @@ async fn run_query_loop(
                     handle_execute_empty(socket, &mut buf).await?;
                 }
                 prepared_query = None;
+                describe_was_called = false;
                 describe_sent_row_description = false;
                 result_format_codes_nontls.clear();
                 cached_column_types_nontls.clear();
@@ -1316,6 +1321,7 @@ async fn run_query_loop(
                 
                 // Clear prepared query state
                 prepared_query = None;
+                describe_was_called = false;
                 describe_sent_row_description = false;
                 __describe_column_count = 0;
                 
@@ -1434,6 +1440,8 @@ where
     // ReadyForQuery message - updated when transaction status changes
     let mut ready = [b'Z', 0, 0, 0, 5, transaction_status];
     let mut prepared_query: Option<String> = None;
+    // Track whether Describe was called at all (to distinguish "not called" from "called but NoData")
+    let mut describe_was_called = false;
     // Track whether Describe sent RowDescription (true) or NoData (false)
     // This ensures Execute phase is consistent with Describe phase
     let mut describe_sent_row_description = false;
@@ -1873,6 +1881,9 @@ where
                 let mut data = vec![0u8; len];
                 socket.read_exact(&mut data).await?;
                 
+                // Mark that Describe was called (to distinguish from "never called" in Execute)
+                describe_was_called = true;
+                
                 // PROTOCOL FIX: Parse describe type - 'S' for Statement, 'P' for Portal
                 // Portal describe should NOT receive ParameterDescription
                 let describe_type = if data.is_empty() { b'S' } else { data[0] };
@@ -2120,6 +2131,7 @@ where
                                 let cmd_tag = format!("SELECT {}", portal.rows_sent);
                                 send_command_complete_generic(socket, &cmd_tag).await?;
                                 prepared_query = None;
+                                describe_was_called = false;
                                 describe_sent_row_description = false;
                                 __describe_column_count = 0;
                                 bound_parameters.clear();
@@ -2183,6 +2195,7 @@ where
                                     let cmd_tag = format!("SELECT {}", portal.rows.len());
                                     send_command_complete_generic(socket, &cmd_tag).await?;
                                     prepared_query = None;
+                                    describe_was_called = false;
                                     describe_sent_row_description = false;
                                     __describe_column_count = 0;
                                     bound_parameters.clear();
@@ -2225,8 +2238,9 @@ where
                     // This converts ::regclass, ::regtype, and other PG-specific syntax to DuckDB
                     let final_sql = pg_compat::rewrite_pg_to_duckdb(&final_sql);
                     
-                    // CRITICAL: If Describe sent NoData, we MUST NOT send DataRows
-                    if !describe_sent_row_description {
+                    // CRITICAL: If Describe was called AND sent NoData, we MUST NOT send DataRows
+                    // If Describe was never called, we should still execute normally
+                    if describe_was_called && !describe_sent_row_description {
                         let cmd_tag = if let Some(result) = handle_pg_specific_command(&final_sql) {
                             result.command_tag.unwrap_or_else(|| "SELECT 0".to_string())
                         } else {
@@ -2249,6 +2263,7 @@ where
                                 socket.flush().await?;
                                 info!("Extended Protocol - Execute: sent intercepted CommandComplete ({}), flushed", cmd_tag);
                                 prepared_query = None;
+                                describe_was_called = false;
                                 describe_sent_row_description = false;
                                 __describe_column_count = 0;
                                 bound_parameters.clear();
@@ -2383,6 +2398,7 @@ where
                     
                     // Clear state only if no more rows
                     prepared_query = None;
+                    describe_was_called = false;
                     describe_sent_row_description = false;
                     __describe_column_count = 0;
                     bound_parameters.clear();
@@ -2407,6 +2423,7 @@ where
                 
                 // Clear ALL state when closing
                 prepared_query = None;
+                describe_was_called = false;
                 describe_sent_row_description = false;
                 __describe_column_count = 0;
                 portal_state = None; // Clear buffered rows
