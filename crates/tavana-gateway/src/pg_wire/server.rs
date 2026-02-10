@@ -1371,8 +1371,8 @@ enum PortalState {
 
 /// Streaming portal - holds a live gRPC stream for true streaming
 struct StreamingPortal {
-    /// The gRPC streaming result from worker (owns the receiver)
-    stream: StreamingResult,
+    /// The gRPC native Arrow streaming result from worker (owns the receiver)
+    stream: crate::worker_client::NativeStreamingResult,
     /// Column metadata from first batch
     columns: Vec<(String, String)>,
     /// Total rows sent so far (for CommandComplete)
@@ -1380,7 +1380,7 @@ struct StreamingPortal {
     /// Column count for DataRow consistency
     column_count: usize,
     /// Buffer for partial batch consumption (when max_rows < batch size)
-    /// Rows that were read from stream but not yet sent to client
+    /// Rows that were read from stream but not yet sent to client (converted to strings for portal)
     pending_rows: Vec<Vec<String>>,
 }
 
@@ -1395,8 +1395,8 @@ struct BufferedPortal {
 }
 
 impl PortalState {
-    /// Create a new streaming portal
-    fn new_streaming(stream: StreamingResult, columns: Vec<(String, String)>) -> Self {
+    /// Create a new streaming portal (native Arrow)
+    fn new_streaming(stream: crate::worker_client::NativeStreamingResult, columns: Vec<(String, String)>) -> Self {
         let column_count = columns.len();
         PortalState::Streaming(StreamingPortal {
             stream,
@@ -2082,36 +2082,42 @@ where
                                 }
                             }
                             
-                            // Then read from stream until we reach max_rows or stream exhausted
+                            // Then read from native Arrow stream until max_rows or exhausted
                             while !client_disconnected && rows_sent_this_batch < max_rows_to_send {
                                 match portal.stream.next().await {
-                                    Some(Ok(StreamingBatch::Rows(batch_rows))) => {
-                                        for row in batch_rows {
+                                    Some(Ok(NativeStreamingBatch::RecordBatch(record_batch))) => {
+                                        for row_idx in 0..record_batch.num_rows() {
                                             if rows_sent_this_batch >= max_rows_to_send {
-                                                // Save remaining rows for next Execute
-                                                portal.pending_rows.push(row);
-                                            } else {
-                                                let data_row = build_data_row_with_formats(&row, &cached_column_types, &result_format_codes);
-                                                bytes_since_flush += data_row.len();
-                                                if let Err(e) = socket.write_all(&data_row).await {
+                                                // Save remaining rows as strings for next Execute
+                                                let string_rows = arrow_batch_to_string_rows(&record_batch);
+                                                for r in row_idx..record_batch.num_rows() {
+                                                    if r < string_rows.len() {
+                                                        portal.pending_rows.push(string_rows[r].clone());
+                                                    }
+                                                }
+                                                break;
+                                            }
+                                            
+                                            let data_row = encode_arrow_row(&record_batch, row_idx, &result_format_codes);
+                                            bytes_since_flush += data_row.len();
+                                            if let Err(e) = socket.write_all(&data_row).await {
+                                                if is_disconnect_error(&e) { client_disconnected = true; break; }
+                                                return Err(e.into());
+                                            }
+                                            rows_sent_this_batch += 1;
+                                            portal.rows_sent += 1;
+                                            
+                                            if bytes_since_flush >= config.flush_threshold_bytes {
+                                                if let Err(e) = socket.flush().await {
                                                     if is_disconnect_error(&e) { client_disconnected = true; break; }
                                                     return Err(e.into());
                                                 }
-                                                rows_sent_this_batch += 1;
-                                                portal.rows_sent += 1;
-                                                
-                                                if bytes_since_flush >= config.flush_threshold_bytes {
-                                                    if let Err(e) = socket.flush().await {
-                                                        if is_disconnect_error(&e) { client_disconnected = true; break; }
-                                                        return Err(e.into());
-                                                    }
-                                                    bytes_since_flush = 0;
-                                                }
+                                                bytes_since_flush = 0;
                                             }
                                         }
                                     }
-                                    Some(Ok(StreamingBatch::Metadata { .. })) => continue,
-                                    Some(Ok(StreamingBatch::Error(msg))) => { stream_error = Some(msg); break; }
+                                    Some(Ok(NativeStreamingBatch::Metadata { .. })) => continue,
+                                    Some(Ok(NativeStreamingBatch::Error(msg))) => { stream_error = Some(msg); break; }
                                     Some(Err(e)) => { stream_error = Some(e.to_string()); break; }
                                     None => { stream_exhausted = true; break; }
                                 }
@@ -2251,8 +2257,8 @@ where
                         send_command_complete_generic(socket, &cmd_tag).await?;
                         socket.flush().await?;
                     } else {
-                        // FIRST: Check if this is an intercepted command (like Tableau temp table SELECT)
-                        // If so, return the fake rows instead of executing against worker
+                        // Check if this is a PG-specific command (SET, SHOW, BEGIN, etc.)
+                        // MUST handle both empty-row commands (SET/BEGIN/COMMIT) AND row-returning commands (SHOW)
                         if let Some(result) = handle_pg_specific_command(&final_sql) {
                             if !result.rows.is_empty() {
                                 info!("Extended Protocol - Execute: Intercepted command returns {} rows", result.rows.len());
@@ -2262,25 +2268,30 @@ where
                                 let cmd_tag = result.command_tag.unwrap_or_else(|| format!("SELECT {}", result.rows.len()));
                                 send_command_complete_generic(socket, &cmd_tag).await?;
                                 socket.flush().await?;
-                                info!("Extended Protocol - Execute: sent intercepted CommandComplete ({}), flushed", cmd_tag);
-                                prepared_query = None;
-                                describe_was_called = false;
-                                describe_sent_row_description = false;
-                                __describe_column_count = 0;
-                                bound_parameters.clear();
-                                result_format_codes.clear();
-                                cached_describe_columns = None;
-                                cached_column_types.clear();
-                                continue;
+                            } else {
+                                // Empty-row commands: SET, BEGIN, COMMIT, ROLLBACK, RESET, DISCARD, etc.
+                                let cmd_tag = result.command_tag.unwrap_or_else(|| "OK".to_string());
+                                debug!("Extended Protocol - Execute: Intercepted empty command ({})", cmd_tag);
+                                send_command_complete_generic(socket, &cmd_tag).await?;
+                                socket.flush().await?;
                             }
+                            prepared_query = None;
+                            describe_was_called = false;
+                            describe_sent_row_description = false;
+                            __describe_column_count = 0;
+                            bound_parameters.clear();
+                            result_format_codes.clear();
+                            cached_describe_columns = None;
+                            cached_column_types.clear();
+                            continue;
                         }
                         
-                        // TRUE STREAMING: Execute query with streaming to prevent OOM
-                        // Rows are sent to client as they arrive from worker
-                        info!("Extended Protocol - Execute: TRUE STREAMING mode, max_rows={}, executing query", max_rows);
+                        // NATIVE ARROW STREAMING: Execute query with native Arrow encoding
+                        // Arrow RecordBatch → PG DataRow directly, no intermediate String conversion
+                        info!("Extended Protocol - Execute: NATIVE ARROW STREAMING mode, max_rows={}, executing query", max_rows);
                         
-                        // Start streaming query
-                        let stream_result = worker_client.execute_query_streaming(&final_sql, user_id).await;
+                        // Start native arrow streaming query
+                        let stream_result = worker_client.execute_query_native_streaming(&final_sql, user_id).await;
                         
                         match stream_result {
                             Ok(mut stream) => {
@@ -2292,53 +2303,59 @@ where
                                 let mut stream_error: Option<String> = None;
                                 let mut pending_rows: Vec<Vec<String>> = Vec::new();
                                 let mut columns: Vec<(String, String)> = Vec::new();
-                                let mut local_column_types: Vec<String> = Vec::new();
+                                let mut _local_column_types: Vec<String> = Vec::new();
                                 
-                                // Stream rows directly to client
+                                // NATIVE ARROW STREAMING: encode Arrow → PG DataRow directly
                                 'stream_loop: loop {
                                     if rows_sent >= max_rows_to_send {
-                                        break; // Reached max_rows limit
+                                        break;
                                     }
                                     
                                     match stream.next().await {
-                                        Some(Ok(StreamingBatch::Metadata { columns: cols, column_types: types })) => {
-                                            // Convert to (name, type) pairs and store types for binary encoding
-                                            local_column_types = types.clone();
+                                        Some(Ok(NativeStreamingBatch::Metadata { columns: cols, column_types: types, schema: _ })) => {
+                                            _local_column_types = types.clone();
                                             columns = cols.into_iter().zip(types.into_iter()).collect();
                                             continue;
                                         }
-                                        Some(Ok(StreamingBatch::Rows(batch_rows))) => {
-                                            for row in batch_rows {
+                                        Some(Ok(NativeStreamingBatch::RecordBatch(record_batch))) => {
+                                            // DIRECT ENCODING: Arrow → PG DataRow (no intermediate String!)
+                                            for row_idx in 0..record_batch.num_rows() {
                                                 if rows_sent >= max_rows_to_send {
-                                                    // Save remaining rows for portal resumption
-                                                    pending_rows.push(row);
-                                                } else {
-                                                    let data_row = build_data_row_with_formats(&row, &local_column_types, &result_format_codes);
-                                                    bytes_since_flush += data_row.len();
-                                                    if let Err(e) = socket.write_all(&data_row).await {
+                                                    // For portal suspension with native Arrow, we'd need to save the batch.
+                                                    // For now, convert remaining rows to strings for the pending buffer.
+                                                    let string_rows = arrow_batch_to_string_rows(&record_batch);
+                                                    for r in row_idx..record_batch.num_rows() {
+                                                        if r < string_rows.len() {
+                                                            pending_rows.push(string_rows[r].clone());
+                                                        }
+                                                    }
+                                                    break;
+                                                }
+                                                
+                                                let data_row = encode_arrow_row(&record_batch, row_idx, &result_format_codes);
+                                                bytes_since_flush += data_row.len();
+                                                if let Err(e) = socket.write_all(&data_row).await {
+                                                    if is_disconnect_error(&e) {
+                                                        client_disconnected = true;
+                                                        break 'stream_loop;
+                                                    }
+                                                    return Err(e.into());
+                                                }
+                                                rows_sent += 1;
+                                                
+                                                if bytes_since_flush >= config.flush_threshold_bytes {
+                                                    if let Err(e) = socket.flush().await {
                                                         if is_disconnect_error(&e) {
                                                             client_disconnected = true;
                                                             break 'stream_loop;
                                                         }
                                                         return Err(e.into());
                                                     }
-                                                    rows_sent += 1;
-                                                    
-                                                    // Backpressure: flush periodically
-                                                    if bytes_since_flush >= config.flush_threshold_bytes {
-                                                        if let Err(e) = socket.flush().await {
-                                                            if is_disconnect_error(&e) {
-                                                                client_disconnected = true;
-                                                                break 'stream_loop;
-                                                            }
-                                                            return Err(e.into());
-                                                        }
-                                                        bytes_since_flush = 0;
-                                                    }
+                                                    bytes_since_flush = 0;
                                                 }
                                             }
                                         }
-                                        Some(Ok(StreamingBatch::Error(msg))) => {
+                                        Some(Ok(NativeStreamingBatch::Error(msg))) => {
                                             stream_error = Some(msg);
                                             break;
                                         }
