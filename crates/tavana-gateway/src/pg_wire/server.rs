@@ -26,7 +26,8 @@ use crate::metrics;
 use crate::pg_compat;
 use crate::pg_wire::backpressure::{
     BackpressureConfig, BackpressureWriter,
-    build_row_description, build_command_complete, build_data_row,
+    build_row_description, build_row_description_with_formats,
+    build_command_complete, build_data_row, build_data_row_with_formats,
     is_disconnect_error,
 };
 use crate::pg_wire::protocol::types::{pg_type_len, pg_type_oid};
@@ -1436,6 +1437,11 @@ where
     let mut portal_state: Option<PortalState> = None;
     // Bound parameter values from Bind message (for parameterized queries)
     let mut bound_parameters: Vec<Option<String>> = Vec::new();
+    // Result format codes from Bind message (0=text, 1=binary)
+    // Stored to pass to Execute phase for proper DataRow encoding
+    let mut result_format_codes: Vec<i16> = Vec::new();
+    // Cached column types from Describe phase for binary encoding in Execute
+    let mut cached_column_types: Vec<String> = Vec::new();
     
     // Schema cache for parameterized queries - avoids re-executing LIMIT 0 queries
     // Key: SQL template (with $1, $2 placeholders), Value: column schemas
@@ -1825,39 +1831,27 @@ where
                     }
                 }
                 
-                // Parse result format codes - check for binary requests
-                let mut client_wants_binary = false;
+                // Parse and store result format codes for binary support
+                result_format_codes.clear();
                 if offset + 2 <= data.len() {
                     let result_format_count = i16::from_be_bytes([data[offset], data[offset+1]]) as usize;
                     offset += 2;
                     
-                    // Check if client wants binary for any column
-                    if result_format_count == 1 && offset + 2 <= data.len() {
-                        // Single format applies to all columns
-                        let fmt = i16::from_be_bytes([data[offset], data[offset + 1]]);
-                        if fmt == 1 {
-                            client_wants_binary = true;
-                        }
-                    } else if result_format_count > 1 && offset + result_format_count * 2 <= data.len() {
-                        // Per-column formats
+                    // Store format codes for use in Execute phase
+                    if result_format_count > 0 && offset + result_format_count * 2 <= data.len() {
                         for i in 0..result_format_count {
                             let fmt = i16::from_be_bytes([data[offset + i*2], data[offset + i*2 + 1]]);
-                            if fmt == 1 {
-                                client_wants_binary = true;
-                                break;
-                            }
+                            result_format_codes.push(fmt);
                         }
                     }
                 }
                 
-                if client_wants_binary {
-                    // Client requested binary format but we only support text
-                    // Accept the bind anyway - we'll send text format in response
-                    // Most clients (including Tableau, JDBC drivers) handle this gracefully
-                    debug!("Bind (TLS): client requested BINARY format, will respond with TEXT (DuckDB limitation)");
+                if result_format_codes.iter().any(|&f| f == 1) {
+                    debug!("Bind (TLS): client requested BINARY format for {} columns, will encode appropriately", 
+                        result_format_codes.iter().filter(|&&f| f == 1).count());
                 }
                 
-                // Always send BindComplete - we'll respond with text format regardless
+                // Send BindComplete
                 debug!("Bind (TLS): sending BindComplete");
                 socket.write_all(&[b'2', 0, 0, 0, 4]).await?; // BindComplete
                 socket.flush().await?;
@@ -1895,7 +1889,8 @@ where
                         } else {
                             info!("Extended Protocol - Describe: PG command returns {} columns", result.columns.len());
                             __describe_column_count = result.columns.len();
-                            send_row_description_generic(socket, &result.columns).await?;
+                            cached_column_types = result.columns.iter().map(|(_, t)| t.clone()).collect();
+                            send_row_description_generic_with_formats(socket, &result.columns, &result_format_codes).await?;
                             describe_sent_row_description = true;
                         }
                     } else {
@@ -1912,7 +1907,8 @@ where
                                 debug!("Extended Protocol - Describe: using cached schema for parameterized query ({} columns)", cached_columns.len());
                                 __describe_column_count = cached_columns.len();
                                 cached_describe_columns = Some(cached_columns.clone());
-                                send_row_description_generic(socket, cached_columns).await?;
+                                cached_column_types = cached_columns.iter().map(|(_, t)| t.clone()).collect();
+                                send_row_description_generic_with_formats(socket, cached_columns, &result_format_codes).await?;
                                 describe_sent_row_description = true;
                             } else {
                                 // For parameterized queries, try to get schema by replacing params with NULL
@@ -1951,7 +1947,8 @@ where
                                             // Cache the schema for future use
                                             schema_cache.insert(sql.clone(), columns.clone());
                                             cached_describe_columns = Some(columns.clone());
-                                            send_row_description_generic(socket, &columns).await?;
+                                            cached_column_types = columns.iter().map(|(_, t)| t.clone()).collect();
+                                            send_row_description_generic_with_formats(socket, &columns, &result_format_codes).await?;
                                             describe_sent_row_description = true;
                                         }
                                     }
@@ -1990,7 +1987,8 @@ where
                                         __describe_column_count = columns.len();
                                         // Cache columns for potential reuse
                                         cached_describe_columns = Some(columns.clone());
-                                        send_row_description_generic(socket, &columns).await?;
+                                        cached_column_types = columns.iter().map(|(_, t)| t.clone()).collect();
+                                        send_row_description_generic_with_formats(socket, &columns, &result_format_codes).await?;
                                         describe_sent_row_description = true;
                                     }
                                 }
@@ -2044,7 +2042,7 @@ where
                             // First, send any pending rows from previous partial batch
                             while !portal.pending_rows.is_empty() && rows_sent_this_batch < max_rows_to_send {
                                 let row = portal.pending_rows.remove(0);
-                                let data_row = build_data_row(&row);
+                                let data_row = build_data_row_with_formats(&row, &cached_column_types, &result_format_codes);
                                 bytes_since_flush += data_row.len();
                                 if let Err(e) = socket.write_all(&data_row).await {
                                     if is_disconnect_error(&e) { client_disconnected = true; break; }
@@ -2071,7 +2069,7 @@ where
                                                 // Save remaining rows for next Execute
                                                 portal.pending_rows.push(row);
                                             } else {
-                                                let data_row = build_data_row(&row);
+                                                let data_row = build_data_row_with_formats(&row, &cached_column_types, &result_format_codes);
                                                 bytes_since_flush += data_row.len();
                                                 if let Err(e) = socket.write_all(&data_row).await {
                                                     if is_disconnect_error(&e) { client_disconnected = true; break; }
@@ -2115,7 +2113,9 @@ where
                                 describe_sent_row_description = false;
                                 __describe_column_count = 0;
                                 bound_parameters.clear();
+                                result_format_codes.clear();
                                 cached_describe_columns = None;
+                                cached_column_types.clear();
                                 (true, false) // continue, don't keep state
                             } else {
                                 // More rows available - send PortalSuspended
@@ -2142,7 +2142,7 @@ where
                             let mut client_disconnected = false;
                             
                             for row in &portal.rows[portal.offset..end] {
-                                let data_row = build_data_row(row);
+                                let data_row = build_data_row_with_formats(row, &cached_column_types, &result_format_codes);
                                 bytes_since_flush += data_row.len();
                                 rows_since_flush += 1;
                                 socket.write_all(&data_row).await?;
@@ -2176,7 +2176,9 @@ where
                                     describe_sent_row_description = false;
                                     __describe_column_count = 0;
                                     bound_parameters.clear();
+                                    result_format_codes.clear();
                                     cached_describe_columns = None;
+                                    cached_column_types.clear();
                                     (true, false) // continue, don't keep state
                                 } else {
                                     // More rows available - send PortalSuspended
@@ -2240,7 +2242,9 @@ where
                                 describe_sent_row_description = false;
                                 __describe_column_count = 0;
                                 bound_parameters.clear();
+                                result_format_codes.clear();
                                 cached_describe_columns = None;
+                                cached_column_types.clear();
                                 continue;
                             }
                         }
@@ -2262,6 +2266,7 @@ where
                                 let mut stream_error: Option<String> = None;
                                 let mut pending_rows: Vec<Vec<String>> = Vec::new();
                                 let mut columns: Vec<(String, String)> = Vec::new();
+                                let mut local_column_types: Vec<String> = Vec::new();
                                 
                                 // Stream rows directly to client
                                 'stream_loop: loop {
@@ -2271,7 +2276,8 @@ where
                                     
                                     match stream.next().await {
                                         Some(Ok(StreamingBatch::Metadata { columns: cols, column_types: types })) => {
-                                            // Convert to (name, type) pairs
+                                            // Convert to (name, type) pairs and store types for binary encoding
+                                            local_column_types = types.clone();
                                             columns = cols.into_iter().zip(types.into_iter()).collect();
                                             continue;
                                         }
@@ -2281,7 +2287,7 @@ where
                                                     // Save remaining rows for portal resumption
                                                     pending_rows.push(row);
                                                 } else {
-                                                    let data_row = build_data_row(&row);
+                                                    let data_row = build_data_row_with_formats(&row, &local_column_types, &result_format_codes);
                                                     bytes_since_flush += data_row.len();
                                                     if let Err(e) = socket.write_all(&data_row).await {
                                                         if is_disconnect_error(&e) {
@@ -2370,7 +2376,9 @@ where
                     describe_sent_row_description = false;
                     __describe_column_count = 0;
                     bound_parameters.clear();
+                    result_format_codes.clear();
                     cached_describe_columns = None;
+                    cached_column_types.clear();
                 } else {
                     // No prepared statement - send empty CommandComplete
                     debug!("Extended Protocol - Execute: no prepared query");
@@ -2393,7 +2401,9 @@ where
                 __describe_column_count = 0;
                 portal_state = None; // Clear buffered rows
                 bound_parameters.clear();
+                result_format_codes.clear();
                 cached_describe_columns = None;
+                cached_column_types.clear();
                 
                 // Send CloseComplete
                 socket.write_all(&[b'3', 0, 0, 0, 4]).await?;
@@ -4823,12 +4833,38 @@ async fn send_row_description_generic<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    send_row_description_generic_with_formats(socket, columns, &[]).await
+}
+
+/// Send RowDescription with format codes for binary support
+/// 
+/// # Arguments
+/// * `columns` - Column (name, type) pairs
+/// * `format_codes` - Format codes (0=text, 1=binary). Per PostgreSQL spec:
+///   - Empty: all columns use text (0)
+///   - Single element: applies to all columns
+///   - Multiple: format_codes[i] applies to column i
+async fn send_row_description_generic_with_formats<S>(
+    socket: &mut S,
+    columns: &[(String, String)],
+    format_codes: &[i16],
+) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let mut msg = Vec::new();
     msg.push(b'T'); // RowDescription
     msg.extend_from_slice(&[0, 0, 0, 0]); // Length placeholder
     msg.extend_from_slice(&(columns.len() as i16).to_be_bytes()); // Field count
     
-    for (name, type_name) in columns {
+    for (i, (name, type_name)) in columns.iter().enumerate() {
+        // Get format code for this column
+        let format = match format_codes.len() {
+            0 => 0i16, // Default to text
+            1 => format_codes[0], // Single format for all columns
+            _ => format_codes.get(i).copied().unwrap_or(0),
+        };
+        
         msg.extend_from_slice(name.as_bytes());
         msg.push(0);
         msg.extend_from_slice(&0u32.to_be_bytes()); // table OID
@@ -4836,7 +4872,7 @@ where
         msg.extend_from_slice(&pg_type_oid(type_name).to_be_bytes());
         msg.extend_from_slice(&pg_type_len(type_name).to_be_bytes());
         msg.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
-        msg.extend_from_slice(&0i16.to_be_bytes()); // format code
+        msg.extend_from_slice(&format.to_be_bytes()); // format code
     }
     
     let len = (msg.len() - 1) as u32;

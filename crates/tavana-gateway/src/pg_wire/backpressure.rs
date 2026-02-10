@@ -378,20 +378,47 @@ pub async fn send_data_row_with_backpressure<W: AsyncWrite + Unpin>(
     }
 }
 
-/// Build a PostgreSQL DataRow message
+/// Build a PostgreSQL DataRow message (text format only - legacy)
 pub fn build_data_row(row: &[String]) -> Vec<u8> {
+    build_data_row_with_formats(row, &[], &[])
+}
+
+/// Build a PostgreSQL DataRow message with binary format support
+/// 
+/// # Arguments
+/// * `row` - Row values as strings
+/// * `column_types` - PostgreSQL type names for each column (e.g., "int4", "text")
+/// * `format_codes` - Format codes for each column (0=text, 1=binary). 
+///                    Empty or single-element arrays are handled per PostgreSQL spec.
+/// 
+/// If format_codes is empty, all columns use text format.
+/// If format_codes has one element, that format applies to all columns.
+/// Otherwise, format_codes[i] applies to column i.
+pub fn build_data_row_with_formats(
+    row: &[String],
+    column_types: &[String],
+    format_codes: &[i16],
+) -> Vec<u8> {
     let mut data_row = Vec::with_capacity(5 + row.len() * 20);
     data_row.push(b'D'); // DataRow type
 
     let mut row_data = Vec::with_capacity(2 + row.len() * 20);
     row_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
 
-    for value in row {
+    for (i, value) in row.iter().enumerate() {
+        // Determine format for this column
+        let format = get_format_for_column(i, format_codes);
+        let type_name = column_types.get(i).map(|s| s.as_str()).unwrap_or("text");
+        
         if value == "NULL" {
             row_data.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
         } else if value.is_empty() {
             row_data.extend_from_slice(&0i32.to_be_bytes()); // Empty string
+        } else if format == 1 {
+            // Binary format requested
+            encode_binary_value(&mut row_data, value, type_name);
         } else {
+            // Text format
             // Sanitize: remove NULL bytes that could break protocol parsing
             let sanitized: String = value.chars().filter(|&c| c != '\0').collect();
             row_data.extend_from_slice(&(sanitized.len() as i32).to_be_bytes());
@@ -407,8 +434,376 @@ pub fn build_data_row(row: &[String]) -> Vec<u8> {
     data_row
 }
 
-/// Build a PostgreSQL RowDescription message
+/// Get the format code for a specific column index
+/// 
+/// Per PostgreSQL spec:
+/// - If format_codes is empty, use text (0) for all
+/// - If format_codes has one element, use that for all columns
+/// - Otherwise use format_codes[i] for column i
+fn get_format_for_column(column_index: usize, format_codes: &[i16]) -> i16 {
+    match format_codes.len() {
+        0 => 0, // Default to text
+        1 => format_codes[0], // Single format for all columns
+        _ => format_codes.get(column_index).copied().unwrap_or(0),
+    }
+}
+
+/// Encode a value in PostgreSQL binary format
+/// 
+/// Supports all common DuckDB types that have PostgreSQL binary equivalents.
+/// Falls back to text format for unsupported or complex types.
+/// 
+/// Reference: https://duckdb.org/docs/stable/sql/data_types/overview
+fn encode_binary_value(buf: &mut Vec<u8>, value: &str, type_name: &str) {
+    let type_lower = type_name.to_lowercase();
+    
+    match type_lower.as_str() {
+        // === SIGNED INTEGERS ===
+        // 1-byte signed integer (TINYINT) - promoted to INT2 for PostgreSQL compatibility
+        // We tell the client it's INT2 (OID 21), so we must send 2 bytes
+        "int1" | "tinyint" => {
+            if let Ok(v) = value.parse::<i8>() {
+                buf.extend_from_slice(&2i32.to_be_bytes()); // 2 bytes, not 1
+                buf.extend_from_slice(&(v as i16).to_be_bytes()); // Promote to i16
+            } else {
+                encode_text_fallback(buf, value);
+            }
+        }
+        // 2-byte signed integer (SMALLINT)
+        "int2" | "smallint" | "int16" | "short" => {
+            if let Ok(v) = value.parse::<i16>() {
+                buf.extend_from_slice(&2i32.to_be_bytes());
+                buf.extend_from_slice(&v.to_be_bytes());
+            } else {
+                encode_text_fallback(buf, value);
+            }
+        }
+        // 4-byte signed integer (INTEGER)
+        "int4" | "integer" | "int" | "int32" | "signed" => {
+            if let Ok(v) = value.parse::<i32>() {
+                buf.extend_from_slice(&4i32.to_be_bytes());
+                buf.extend_from_slice(&v.to_be_bytes());
+            } else {
+                encode_text_fallback(buf, value);
+            }
+        }
+        // 8-byte signed integer (BIGINT)
+        "int8" | "bigint" | "int64" | "long" => {
+            if let Ok(v) = value.parse::<i64>() {
+                buf.extend_from_slice(&8i32.to_be_bytes());
+                buf.extend_from_slice(&v.to_be_bytes());
+            } else {
+                encode_text_fallback(buf, value);
+            }
+        }
+        // 16-byte signed integer (HUGEINT) - sent as text, no PG binary equivalent
+        "int128" | "hugeint" => {
+            encode_text_fallback(buf, value);
+        }
+        
+        // === UNSIGNED INTEGERS ===
+        // 1-byte unsigned integer (UTINYINT)
+        "uint1" | "utinyint" => {
+            if let Ok(v) = value.parse::<u8>() {
+                // PostgreSQL doesn't have unsigned types, send as int2
+                buf.extend_from_slice(&2i32.to_be_bytes());
+                buf.extend_from_slice(&(v as i16).to_be_bytes());
+            } else {
+                encode_text_fallback(buf, value);
+            }
+        }
+        // 2-byte unsigned integer (USMALLINT)
+        "uint2" | "usmallint" => {
+            if let Ok(v) = value.parse::<u16>() {
+                // Send as int4 to avoid overflow
+                buf.extend_from_slice(&4i32.to_be_bytes());
+                buf.extend_from_slice(&(v as i32).to_be_bytes());
+            } else {
+                encode_text_fallback(buf, value);
+            }
+        }
+        // 4-byte unsigned integer (UINTEGER)
+        "uint4" | "uinteger" => {
+            if let Ok(v) = value.parse::<u32>() {
+                // Send as int8 to avoid overflow
+                buf.extend_from_slice(&8i32.to_be_bytes());
+                buf.extend_from_slice(&(v as i64).to_be_bytes());
+            } else {
+                encode_text_fallback(buf, value);
+            }
+        }
+        // 8-byte unsigned integer (UBIGINT) - send as text, may overflow int8
+        "uint8" | "ubigint" => {
+            encode_text_fallback(buf, value);
+        }
+        // 16-byte unsigned integer (UHUGEINT) - send as text
+        "uint128" | "uhugeint" => {
+            encode_text_fallback(buf, value);
+        }
+        
+        // === FLOATING POINT ===
+        // 4-byte floating point (FLOAT/REAL)
+        "float4" | "real" | "float" => {
+            if let Ok(v) = value.parse::<f32>() {
+                buf.extend_from_slice(&4i32.to_be_bytes());
+                buf.extend_from_slice(&v.to_be_bytes());
+            } else {
+                encode_text_fallback(buf, value);
+            }
+        }
+        // 8-byte floating point (DOUBLE)
+        "float8" | "double" | "float64" | "double precision" => {
+            if let Ok(v) = value.parse::<f64>() {
+                buf.extend_from_slice(&8i32.to_be_bytes());
+                buf.extend_from_slice(&v.to_be_bytes());
+            } else {
+                encode_text_fallback(buf, value);
+            }
+        }
+        
+        // === DECIMAL/NUMERIC ===
+        // Variable precision - send as text (PostgreSQL binary NUMERIC is complex)
+        "decimal" | "numeric" => {
+            encode_text_fallback(buf, value);
+        }
+        
+        // === BOOLEAN ===
+        "bool" | "boolean" | "logical" => {
+            let v: u8 = match value.to_lowercase().as_str() {
+                "t" | "true" | "1" | "yes" | "on" => 1,
+                _ => 0,
+            };
+            buf.extend_from_slice(&1i32.to_be_bytes());
+            buf.push(v);
+        }
+        
+        // === DATE/TIME TYPES ===
+        // DATE - PostgreSQL binary: days since 2000-01-01
+        "date" => {
+            if let Some(days) = parse_date_to_pg_days(value) {
+                buf.extend_from_slice(&4i32.to_be_bytes());
+                buf.extend_from_slice(&days.to_be_bytes());
+            } else {
+                encode_text_fallback(buf, value);
+            }
+        }
+        // TIMESTAMP - PostgreSQL binary: microseconds since 2000-01-01 00:00:00
+        "timestamp" | "datetime" => {
+            if let Some(micros) = parse_timestamp_to_pg_micros(value) {
+                buf.extend_from_slice(&8i32.to_be_bytes());
+                buf.extend_from_slice(&micros.to_be_bytes());
+            } else {
+                encode_text_fallback(buf, value);
+            }
+        }
+        // TIMESTAMPTZ - same as timestamp for wire format
+        "timestamptz" | "timestamp with time zone" => {
+            if let Some(micros) = parse_timestamp_to_pg_micros(value) {
+                buf.extend_from_slice(&8i32.to_be_bytes());
+                buf.extend_from_slice(&micros.to_be_bytes());
+            } else {
+                encode_text_fallback(buf, value);
+            }
+        }
+        // TIME - PostgreSQL binary: microseconds since midnight
+        "time" | "time without time zone" => {
+            if let Some(micros) = parse_time_to_micros(value) {
+                buf.extend_from_slice(&8i32.to_be_bytes());
+                buf.extend_from_slice(&micros.to_be_bytes());
+            } else {
+                encode_text_fallback(buf, value);
+            }
+        }
+        // INTERVAL - complex binary format, use text
+        "interval" => {
+            encode_text_fallback(buf, value);
+        }
+        
+        // === UUID ===
+        "uuid" => {
+            if let Some(bytes) = parse_uuid(value) {
+                buf.extend_from_slice(&16i32.to_be_bytes());
+                buf.extend_from_slice(&bytes);
+            } else {
+                encode_text_fallback(buf, value);
+            }
+        }
+        
+        // === BINARY DATA ===
+        // BYTEA/BLOB - the value is already hex-encoded or escaped
+        "bytea" | "blob" | "binary" | "varbinary" => {
+            // DuckDB returns blob as hex string like \x0102...
+            if let Some(bytes) = parse_bytea(value) {
+                buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                buf.extend_from_slice(&bytes);
+            } else {
+                encode_text_fallback(buf, value);
+            }
+        }
+        
+        // === TEXT TYPES (always text format) ===
+        "varchar" | "char" | "bpchar" | "text" | "string" | "json" | "bit" | "bitstring" => {
+            encode_text_fallback(buf, value);
+        }
+        
+        // === NESTED TYPES (always text format) ===
+        "list" | "array" | "map" | "struct" | "union" => {
+            encode_text_fallback(buf, value);
+        }
+        
+        // Unsupported/unknown types: fall back to text format
+        _ => {
+            encode_text_fallback(buf, value);
+        }
+    }
+}
+
+/// Parse a date string to PostgreSQL binary format (days since 2000-01-01)
+fn parse_date_to_pg_days(value: &str) -> Option<i32> {
+    // PostgreSQL epoch is 2000-01-01, Unix epoch is 1970-01-01
+    // Difference is 10957 days
+    const PG_EPOCH_JDATE: i32 = 2451545; // Julian date for 2000-01-01
+    const UNIX_EPOCH_JDATE: i32 = 2440588; // Julian date for 1970-01-01
+    const DAYS_DIFF: i32 = PG_EPOCH_JDATE - UNIX_EPOCH_JDATE; // 10957
+    
+    // Try to parse YYYY-MM-DD format
+    let parts: Vec<&str> = value.split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    
+    let year: i32 = parts[0].parse().ok()?;
+    let month: u32 = parts[1].parse().ok()?;
+    let day: u32 = parts[2].parse().ok()?;
+    
+    // Convert to days since Unix epoch using a simplified algorithm
+    // This handles dates from year 1 to 9999
+    let a = (14 - month) / 12;
+    let y = year as u32 + 4800 - a;
+    let m = month + 12 * a - 3;
+    
+    let jdn = day + (153 * m + 2) / 5 + 365 * y + y / 4 - y / 100 + y / 400 - 32045;
+    let days_since_pg_epoch = jdn as i32 - PG_EPOCH_JDATE;
+    
+    Some(days_since_pg_epoch)
+}
+
+/// Parse a timestamp string to PostgreSQL binary format (microseconds since 2000-01-01 00:00:00)
+fn parse_timestamp_to_pg_micros(value: &str) -> Option<i64> {
+    // Split into date and time parts
+    let parts: Vec<&str> = value.split(|c| c == ' ' || c == 'T').collect();
+    if parts.is_empty() {
+        return None;
+    }
+    
+    // Parse date part
+    let days = parse_date_to_pg_days(parts[0])?;
+    
+    // Parse time part if present
+    let time_micros = if parts.len() > 1 {
+        parse_time_to_micros(parts[1])?
+    } else {
+        0
+    };
+    
+    // Convert days to microseconds and add time
+    let day_micros = days as i64 * 24 * 60 * 60 * 1_000_000;
+    Some(day_micros + time_micros)
+}
+
+/// Parse a time string to microseconds since midnight
+fn parse_time_to_micros(value: &str) -> Option<i64> {
+    // Handle timezone suffix if present (e.g., "12:30:45+00")
+    let time_str = value.split(|c| c == '+' || c == '-').next()?;
+    
+    // Split HH:MM:SS or HH:MM:SS.fraction
+    let parts: Vec<&str> = time_str.split(':').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    
+    let hours: i64 = parts[0].parse().ok()?;
+    let minutes: i64 = parts[1].parse().ok()?;
+    
+    let (seconds, micros) = if parts.len() > 2 {
+        // Handle fractional seconds
+        let sec_parts: Vec<&str> = parts[2].split('.').collect();
+        let secs: i64 = sec_parts[0].parse().ok()?;
+        let frac_micros: i64 = if sec_parts.len() > 1 {
+            // Pad or truncate to 6 digits
+            let frac = sec_parts[1];
+            let padded = format!("{:0<6}", frac);
+            padded[..6].parse().unwrap_or(0)
+        } else {
+            0
+        };
+        (secs, frac_micros)
+    } else {
+        (0, 0)
+    };
+    
+    Some(hours * 3_600_000_000 + minutes * 60_000_000 + seconds * 1_000_000 + micros)
+}
+
+/// Parse a UUID string to 16 bytes
+fn parse_uuid(value: &str) -> Option<[u8; 16]> {
+    // Remove hyphens and parse as hex
+    let hex: String = value.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    
+    let mut bytes = [0u8; 16];
+    for i in 0..16 {
+        bytes[i] = u8::from_str_radix(&hex[i*2..i*2+2], 16).ok()?;
+    }
+    Some(bytes)
+}
+
+/// Parse bytea/blob hex string to bytes
+fn parse_bytea(value: &str) -> Option<Vec<u8>> {
+    // DuckDB returns blobs as \x followed by hex
+    if value.starts_with("\\x") || value.starts_with("\\X") {
+        let hex = &value[2..];
+        let mut bytes = Vec::with_capacity(hex.len() / 2);
+        for i in (0..hex.len()).step_by(2) {
+            if i + 2 <= hex.len() {
+                bytes.push(u8::from_str_radix(&hex[i..i+2], 16).ok()?);
+            }
+        }
+        Some(bytes)
+    } else {
+        // Plain bytes (shouldn't happen normally)
+        Some(value.as_bytes().to_vec())
+    }
+}
+
+/// Encode a value as text (fallback for unsupported binary types)
+fn encode_text_fallback(buf: &mut Vec<u8>, value: &str) {
+    let sanitized: String = value.chars().filter(|&c| c != '\0').collect();
+    buf.extend_from_slice(&(sanitized.len() as i32).to_be_bytes());
+    buf.extend_from_slice(sanitized.as_bytes());
+}
+
+/// Build a PostgreSQL RowDescription message (text format for all columns)
 pub fn build_row_description(columns: &[String], column_types: &[String]) -> Vec<u8> {
+    build_row_description_with_formats(columns, column_types, &[])
+}
+
+/// Build a PostgreSQL RowDescription message with format codes
+/// 
+/// # Arguments
+/// * `columns` - Column names
+/// * `column_types` - PostgreSQL type names for each column
+/// * `format_codes` - Format codes (0=text, 1=binary). Per PostgreSQL spec:
+///   - Empty: all columns use text (0)
+///   - Single element: applies to all columns
+///   - Multiple: format_codes[i] applies to column i
+pub fn build_row_description_with_formats(
+    columns: &[String],
+    column_types: &[String],
+    format_codes: &[i16],
+) -> Vec<u8> {
     use super::protocol::types::{pg_type_len, pg_type_oid};
 
     let mut msg = Vec::new();
@@ -418,6 +813,7 @@ pub fn build_row_description(columns: &[String], column_types: &[String]) -> Vec
 
     for (i, name) in columns.iter().enumerate() {
         let type_name = column_types.get(i).map(|s| s.as_str()).unwrap_or("text");
+        let format = get_format_for_column(i, format_codes);
 
         msg.extend_from_slice(name.as_bytes());
         msg.push(0); // Null terminator
@@ -426,7 +822,7 @@ pub fn build_row_description(columns: &[String], column_types: &[String]) -> Vec
         msg.extend_from_slice(&pg_type_oid(type_name).to_be_bytes());
         msg.extend_from_slice(&pg_type_len(type_name).to_be_bytes());
         msg.extend_from_slice(&(-1i32).to_be_bytes()); // Type modifier
-        msg.extend_from_slice(&0i16.to_be_bytes()); // Format code (text)
+        msg.extend_from_slice(&format.to_be_bytes()); // Format code
     }
 
     // Fill in length
@@ -498,6 +894,259 @@ mod tests {
         let config = BackpressureConfig::default();
         assert_eq!(config.flush_threshold_bytes, 64 * 1024);
         assert_eq!(config.flush_threshold_rows, 100);
-        assert_eq!(config.flush_timeout_secs, 5);
+        assert_eq!(config.flush_timeout_secs, 300); // StarRocks-style 5 minute timeout
+    }
+
+    #[test]
+    fn test_build_data_row_with_formats_text() {
+        let row = vec!["42".to_string(), "hello".to_string()];
+        let types = vec!["int4".to_string(), "text".to_string()];
+        let formats = vec![0i16, 0i16]; // All text
+        
+        let data_row = build_data_row_with_formats(&row, &types, &formats);
+        
+        // Check message type
+        assert_eq!(data_row[0], b'D');
+        
+        // Text format: "42" is 2 bytes, "hello" is 5 bytes
+        // Length: 4 (length) + 2 (column count) + 4 (len) + 2 (42) + 4 (len) + 5 (hello) = 21
+        let len = u32::from_be_bytes([data_row[1], data_row[2], data_row[3], data_row[4]]);
+        assert_eq!(len as usize + 1, data_row.len());
+    }
+
+    #[test]
+    fn test_build_data_row_with_formats_binary_int4() {
+        let row = vec!["42".to_string()];
+        let types = vec!["int4".to_string()];
+        let formats = vec![1i16]; // Binary
+        
+        let data_row = build_data_row_with_formats(&row, &types, &formats);
+        
+        // Check message type
+        assert_eq!(data_row[0], b'D');
+        
+        // Binary int4: 4 bytes value
+        // Message: D + len(4) + col_count(2) + val_len(4) + value(4) = 15 bytes total
+        assert_eq!(data_row.len(), 15);
+        
+        // Check the binary value (last 4 bytes should be 42 in big-endian)
+        let value = i32::from_be_bytes([
+            data_row[11], data_row[12], data_row[13], data_row[14]
+        ]);
+        assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn test_build_data_row_with_formats_binary_int8() {
+        let row = vec!["9223372036854775807".to_string()]; // i64::MAX
+        let types = vec!["int8".to_string()];
+        let formats = vec![1i16]; // Binary
+        
+        let data_row = build_data_row_with_formats(&row, &types, &formats);
+        
+        // Binary int8: 8 bytes value
+        // Message: D + len(4) + col_count(2) + val_len(4) + value(8) = 19 bytes total
+        assert_eq!(data_row.len(), 19);
+        
+        // Check the binary value
+        let value = i64::from_be_bytes([
+            data_row[11], data_row[12], data_row[13], data_row[14],
+            data_row[15], data_row[16], data_row[17], data_row[18]
+        ]);
+        assert_eq!(value, i64::MAX);
+    }
+
+    #[test]
+    fn test_build_data_row_with_formats_binary_float8() {
+        let row = vec!["3.14159".to_string()];
+        let types = vec!["float8".to_string()];
+        let formats = vec![1i16]; // Binary
+        
+        let data_row = build_data_row_with_formats(&row, &types, &formats);
+        
+        // Binary float8: 8 bytes value
+        assert_eq!(data_row.len(), 19);
+        
+        // Check the binary value
+        let value = f64::from_be_bytes([
+            data_row[11], data_row[12], data_row[13], data_row[14],
+            data_row[15], data_row[16], data_row[17], data_row[18]
+        ]);
+        assert!((value - 3.14159).abs() < 0.00001);
+    }
+
+    #[test]
+    fn test_build_data_row_mixed_formats() {
+        let row = vec!["42".to_string(), "hello".to_string(), "100".to_string()];
+        let types = vec!["int4".to_string(), "text".to_string(), "int8".to_string()];
+        let formats = vec![1i16, 0i16, 1i16]; // Binary, Text, Binary
+        
+        let data_row = build_data_row_with_formats(&row, &types, &formats);
+        
+        // Check message type
+        assert_eq!(data_row[0], b'D');
+        
+        // Verify message is valid (has correct length prefix)
+        let len = u32::from_be_bytes([data_row[1], data_row[2], data_row[3], data_row[4]]);
+        assert_eq!(len as usize + 1, data_row.len());
+    }
+
+    #[test]
+    fn test_get_format_for_column() {
+        // Empty format codes -> all text
+        assert_eq!(get_format_for_column(0, &[]), 0);
+        assert_eq!(get_format_for_column(5, &[]), 0);
+        
+        // Single format code -> applies to all
+        assert_eq!(get_format_for_column(0, &[1]), 1);
+        assert_eq!(get_format_for_column(5, &[1]), 1);
+        
+        // Per-column format codes
+        assert_eq!(get_format_for_column(0, &[0, 1, 0]), 0);
+        assert_eq!(get_format_for_column(1, &[0, 1, 0]), 1);
+        assert_eq!(get_format_for_column(2, &[0, 1, 0]), 0);
+        assert_eq!(get_format_for_column(3, &[0, 1, 0]), 0); // Out of bounds -> default
+    }
+
+    #[test]
+    fn test_parse_date_to_pg_days() {
+        // 2000-01-01 is PostgreSQL epoch (day 0)
+        assert_eq!(parse_date_to_pg_days("2000-01-01"), Some(0));
+        
+        // 2000-01-02 is day 1
+        assert_eq!(parse_date_to_pg_days("2000-01-02"), Some(1));
+        
+        // 1999-12-31 is day -1
+        assert_eq!(parse_date_to_pg_days("1999-12-31"), Some(-1));
+        
+        // A known date: 2024-01-15 is 8780 days after 2000-01-01
+        let days = parse_date_to_pg_days("2024-01-15").unwrap();
+        assert!(days > 8000 && days < 9000); // Sanity check
+    }
+
+    #[test]
+    fn test_parse_time_to_micros() {
+        // Midnight
+        assert_eq!(parse_time_to_micros("00:00:00"), Some(0));
+        
+        // 1 hour
+        assert_eq!(parse_time_to_micros("01:00:00"), Some(3_600_000_000));
+        
+        // 12:30:45
+        let expected = 12 * 3_600_000_000 + 30 * 60_000_000 + 45 * 1_000_000;
+        assert_eq!(parse_time_to_micros("12:30:45"), Some(expected));
+        
+        // With fractional seconds
+        let expected_frac = 12 * 3_600_000_000 + 30 * 60_000_000 + 45 * 1_000_000 + 123456;
+        assert_eq!(parse_time_to_micros("12:30:45.123456"), Some(expected_frac));
+    }
+
+    #[test]
+    fn test_parse_uuid() {
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        let bytes = parse_uuid(uuid).unwrap();
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(bytes[0], 0x55);
+        assert_eq!(bytes[1], 0x0e);
+        assert_eq!(bytes[15], 0x00);
+    }
+
+    #[test]
+    fn test_parse_bytea() {
+        // Hex format with \x prefix
+        let bytes = parse_bytea("\\x48656c6c6f").unwrap();
+        assert_eq!(bytes, b"Hello");
+        
+        // Empty
+        let empty = parse_bytea("\\x").unwrap();
+        assert_eq!(empty, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_build_data_row_with_formats_date() {
+        let row = vec!["2000-01-01".to_string()];
+        let types = vec!["date".to_string()];
+        let formats = vec![1i16]; // Binary
+        
+        let data_row = build_data_row_with_formats(&row, &types, &formats);
+        
+        // Binary date: 4 bytes
+        // Message: D + len(4) + col_count(2) + val_len(4) + value(4) = 15 bytes
+        assert_eq!(data_row.len(), 15);
+        
+        // Check the value (2000-01-01 = day 0)
+        let value = i32::from_be_bytes([
+            data_row[11], data_row[12], data_row[13], data_row[14]
+        ]);
+        assert_eq!(value, 0);
+    }
+
+    #[test]
+    fn test_build_data_row_with_formats_timestamp() {
+        let row = vec!["2000-01-01 00:00:00".to_string()];
+        let types = vec!["timestamp".to_string()];
+        let formats = vec![1i16]; // Binary
+        
+        let data_row = build_data_row_with_formats(&row, &types, &formats);
+        
+        // Binary timestamp: 8 bytes
+        // Message: D + len(4) + col_count(2) + val_len(4) + value(8) = 19 bytes
+        assert_eq!(data_row.len(), 19);
+        
+        // Check the value (2000-01-01 00:00:00 = 0 microseconds)
+        let value = i64::from_be_bytes([
+            data_row[11], data_row[12], data_row[13], data_row[14],
+            data_row[15], data_row[16], data_row[17], data_row[18]
+        ]);
+        assert_eq!(value, 0);
+    }
+
+    #[test]
+    fn test_build_data_row_with_formats_uuid() {
+        let row = vec!["550e8400-e29b-41d4-a716-446655440000".to_string()];
+        let types = vec!["uuid".to_string()];
+        let formats = vec![1i16]; // Binary
+        
+        let data_row = build_data_row_with_formats(&row, &types, &formats);
+        
+        // Binary UUID: 16 bytes
+        // Message: D + len(4) + col_count(2) + val_len(4) + value(16) = 27 bytes
+        assert_eq!(data_row.len(), 27);
+        
+        // Check first byte of UUID
+        assert_eq!(data_row[11], 0x55);
+    }
+
+    #[test]
+    fn test_build_data_row_with_formats_bool() {
+        let row = vec!["true".to_string(), "false".to_string()];
+        let types = vec!["boolean".to_string(), "boolean".to_string()];
+        let formats = vec![1i16, 1i16]; // Binary
+        
+        let data_row = build_data_row_with_formats(&row, &types, &formats);
+        
+        // Check message type
+        assert_eq!(data_row[0], b'D');
+        
+        // Verify both booleans are encoded
+        let len = u32::from_be_bytes([data_row[1], data_row[2], data_row[3], data_row[4]]);
+        assert_eq!(len as usize + 1, data_row.len());
+    }
+
+    #[test]
+    fn test_build_data_row_with_formats_tinyint() {
+        let row = vec!["127".to_string()];
+        let types = vec!["tinyint".to_string()];
+        let formats = vec![1i16]; // Binary
+        
+        let data_row = build_data_row_with_formats(&row, &types, &formats);
+        
+        // TINYINT is promoted to INT2 (2 bytes) for PostgreSQL compatibility
+        // Message: D + len(4) + col_count(2) + val_len(4) + value(2) = 13 bytes
+        assert_eq!(data_row.len(), 13);
+        
+        // Check the value (promoted to i16)
+        let value = i16::from_be_bytes([data_row[11], data_row[12]]);
+        assert_eq!(value, 127);
     }
 }
