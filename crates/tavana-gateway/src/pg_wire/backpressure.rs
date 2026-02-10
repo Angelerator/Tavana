@@ -6,6 +6,7 @@
 //! 2. **Adaptive flush timeouts**: Detect slow clients early
 //! 3. **TCP send buffer monitoring**: True backpressure via socket pressure
 //! 4. **Bounded write buffers**: Prevent unbounded memory growth
+//! 5. **Buffer pooling**: Reuse BytesMut buffers to minimize allocations
 //!
 //! ## How it works
 //!
@@ -16,17 +17,53 @@
 //! - Flushes after hitting byte threshold (not just row count)
 //! - Uses short timeouts on flush to detect slow clients
 //! - Polls socket writability to ensure true backpressure
+//! - Reuses buffers via thread-local pools to minimize allocations
 //!
 //! This mirrors what StarRocks/MySQL does with `writeBlocking()` - the server
 //! can't produce data faster than the client can consume it.
 
+use bytes::BytesMut;
+use std::cell::RefCell;
 use std::io::ErrorKind;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
+
+// ============= Thread-Local Buffer Pool =============
+// Reuse buffers to avoid per-row allocations
+
+thread_local! {
+    /// Thread-local buffer pool for DataRow construction
+    /// Each thread gets its own pool to avoid synchronization overhead
+    static BUFFER_POOL: RefCell<BufferPool> = RefCell::new(BufferPool::new());
+}
+
+/// Simple buffer pool that reuses BytesMut buffers
+struct BufferPool {
+    /// Primary buffer for DataRow body
+    row_buffer: BytesMut,
+    /// Secondary buffer for final DataRow message
+    message_buffer: BytesMut,
+}
+
+impl BufferPool {
+    fn new() -> Self {
+        Self {
+            // Pre-allocate reasonable sizes
+            row_buffer: BytesMut::with_capacity(4096),
+            message_buffer: BytesMut::with_capacity(4096),
+        }
+    }
+    
+    /// Get buffers for building a DataRow, clearing previous contents
+    fn get_buffers(&mut self) -> (&mut BytesMut, &mut BytesMut) {
+        self.row_buffer.clear();
+        self.message_buffer.clear();
+        (&mut self.row_buffer, &mut self.message_buffer)
+    }
+}
 
 /// Configuration for backpressure-aware streaming
 #[derive(Debug, Clone)]
@@ -394,44 +431,81 @@ pub fn build_data_row(row: &[String]) -> Vec<u8> {
 /// If format_codes is empty, all columns use text format.
 /// If format_codes has one element, that format applies to all columns.
 /// Otherwise, format_codes[i] applies to column i.
+/// 
+/// # Performance
+/// Uses thread-local buffer pools to minimize allocations.
+/// Only allocates new memory when buffer capacity is exceeded.
 pub fn build_data_row_with_formats(
     row: &[String],
     column_types: &[String],
     format_codes: &[i16],
 ) -> Vec<u8> {
-    let mut data_row = Vec::with_capacity(5 + row.len() * 20);
-    data_row.push(b'D'); // DataRow type
-
-    let mut row_data = Vec::with_capacity(2 + row.len() * 20);
-    row_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
-
-    for (i, value) in row.iter().enumerate() {
-        // Determine format for this column
-        let format = get_format_for_column(i, format_codes);
-        let type_name = column_types.get(i).map(|s| s.as_str()).unwrap_or("text");
+    BUFFER_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let (row_data, message_buf) = pool.get_buffers();
         
-        if value == "NULL" {
-            row_data.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
-        } else if value.is_empty() {
-            row_data.extend_from_slice(&0i32.to_be_bytes()); // Empty string
-        } else if format == 1 {
-            // Binary format requested
-            encode_binary_value(&mut row_data, value, type_name);
-        } else {
-            // Text format
-            // Sanitize: remove NULL bytes that could break protocol parsing
-            let sanitized: String = value.chars().filter(|&c| c != '\0').collect();
-            row_data.extend_from_slice(&(sanitized.len() as i32).to_be_bytes());
-            row_data.extend_from_slice(sanitized.as_bytes());
+        // Write column count
+        row_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
+
+        for (i, value) in row.iter().enumerate() {
+            // Determine format for this column
+            let format = get_format_for_column(i, format_codes);
+            let type_name = column_types.get(i).map(|s| s.as_str()).unwrap_or("text");
+            
+            if value == "NULL" {
+                row_data.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
+            } else if value.is_empty() {
+                row_data.extend_from_slice(&0i32.to_be_bytes()); // Empty string
+            } else if format == 1 {
+                // Binary format requested
+                encode_binary_value_bytes(row_data, value, type_name);
+            } else {
+                // Text format - optimized sanitization
+                encode_text_value_optimized(row_data, value);
+            }
         }
+
+        // Build final message: 'D' + length + row_data
+        message_buf.extend_from_slice(&[b'D']);
+        let len = (4 + row_data.len()) as u32;
+        message_buf.extend_from_slice(&len.to_be_bytes());
+        message_buf.extend_from_slice(row_data);
+
+        // Return owned Vec - this is the only allocation per row
+        message_buf.to_vec()
+    })
+}
+
+/// Encode text value with optimized sanitization
+/// 
+/// Only allocates a new String if NULL bytes are actually present.
+/// Most strings don't contain NULL bytes, so this avoids allocation in the common case.
+#[inline]
+fn encode_text_value_optimized(buf: &mut BytesMut, value: &str) {
+    // Fast path: check if sanitization is needed
+    if value.as_bytes().contains(&0) {
+        // Slow path: value contains NULL bytes, need to filter
+        let sanitized: String = value.chars().filter(|&c| c != '\0').collect();
+        buf.extend_from_slice(&(sanitized.len() as i32).to_be_bytes());
+        buf.extend_from_slice(sanitized.as_bytes());
+    } else {
+        // Fast path: no NULL bytes, use value directly (zero-copy)
+        buf.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        buf.extend_from_slice(value.as_bytes());
     }
+}
 
-    // Fill in length
-    let len = (4 + row_data.len()) as u32;
-    data_row.extend_from_slice(&len.to_be_bytes());
-    data_row.extend_from_slice(&row_data);
-
-    data_row
+/// Encode binary value into BytesMut buffer
+/// Same logic as encode_binary_value but works with BytesMut
+#[inline]
+fn encode_binary_value_bytes(buf: &mut BytesMut, value: &str, type_name: &str) {
+    // Reuse Vec<u8> logic - convert BytesMut to Vec temporarily
+    // This is slightly suboptimal but maintains compatibility
+    let start_len = buf.len();
+    let mut temp = Vec::with_capacity(32);
+    encode_binary_value(&mut temp, value, type_name);
+    buf.extend_from_slice(&temp);
+    let _ = start_len; // Suppress unused warning
 }
 
 /// Get the format code for a specific column index
