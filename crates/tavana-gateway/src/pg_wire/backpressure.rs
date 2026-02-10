@@ -22,7 +22,7 @@
 //! This mirrors what StarRocks/MySQL does with `writeBlocking()` - the server
 //! can't produce data faster than the client can consume it.
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use std::cell::RefCell;
 use std::io::ErrorKind;
 use std::pin::Pin;
@@ -31,37 +31,78 @@ use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
-// ============= Thread-Local Buffer Pool =============
-// Reuse buffers to avoid per-row allocations
+// ============= Thread-Local DataRow Encoder (pgwire-inspired) =============
+// 
+// Based on pgwire's DataRowEncoder pattern: https://github.com/sunng87/pgwire
+// Key optimization: BytesMut::split() takes data WITHOUT copying, leaving
+// the buffer with its capacity for the next row.
 
 thread_local! {
-    /// Thread-local buffer pool for DataRow construction
-    /// Each thread gets its own pool to avoid synchronization overhead
-    static BUFFER_POOL: RefCell<BufferPool> = RefCell::new(BufferPool::new());
+    /// Thread-local encoder for DataRow construction
+    /// Each thread gets its own encoder to avoid synchronization overhead
+    static DATA_ROW_ENCODER: RefCell<DataRowEncoder> = RefCell::new(DataRowEncoder::new());
 }
 
-/// Simple buffer pool that reuses BytesMut buffers
-struct BufferPool {
-    /// Primary buffer for DataRow body
-    row_buffer: BytesMut,
-    /// Secondary buffer for final DataRow message
-    message_buffer: BytesMut,
+/// Efficient DataRow encoder that reuses buffers between rows
+/// 
+/// Inspired by pgwire's DataRowEncoder. Uses BytesMut::split() for zero-copy
+/// extraction of encoded data while retaining buffer capacity.
+/// 
+/// Key optimization: Pre-reserves header space so we can write data in-place
+/// and fill in the header at the end, avoiding any data copying.
+struct DataRowEncoder {
+    /// Buffer for complete DataRow message (header + field data)
+    /// Layout: [1 byte type] [4 bytes length] [2 bytes field count] [field data...]
+    buffer: BytesMut,
 }
 
-impl BufferPool {
+/// DataRow header size: 'D' (1) + length (4) + field count (2) = 7 bytes
+const DATAROW_HEADER_SIZE: usize = 7;
+
+impl DataRowEncoder {
     fn new() -> Self {
         Self {
-            // Pre-allocate reasonable sizes
-            row_buffer: BytesMut::with_capacity(4096),
-            message_buffer: BytesMut::with_capacity(4096),
+            // Pre-allocate reasonable size (will grow as needed and retain capacity)
+            buffer: BytesMut::with_capacity(8192),
         }
     }
     
-    /// Get buffers for building a DataRow, clearing previous contents
-    fn get_buffers(&mut self) -> (&mut BytesMut, &mut BytesMut) {
-        self.row_buffer.clear();
-        self.message_buffer.clear();
-        (&mut self.row_buffer, &mut self.message_buffer)
+    /// Prepare buffer for a new row by reserving header space
+    #[inline]
+    fn prepare(&mut self) {
+        self.buffer.clear();
+        // Reserve space for header - will fill in later
+        self.buffer.resize(DATAROW_HEADER_SIZE, 0);
+    }
+    
+    /// Take the encoded row using split() - TRUE zero copy!
+    /// Buffer retains its capacity for the next row.
+    /// 
+    /// This works by:
+    /// 1. We pre-reserved DATAROW_HEADER_SIZE bytes at the start
+    /// 2. Data was written after the header space
+    /// 3. Now we fill in the header
+    /// 4. split() takes all data without copying
+    #[inline]
+    fn take_row(&mut self, field_count: i16) -> Bytes {
+        // Calculate the length field (excludes the 'D' type byte)
+        let data_len = self.buffer.len() - DATAROW_HEADER_SIZE;
+        let length_value = (4 + 2 + data_len) as u32; // length + field_count + data
+        
+        // Fill in the header in-place (no copying!)
+        self.buffer[0] = b'D';
+        self.buffer[1..5].copy_from_slice(&length_value.to_be_bytes());
+        self.buffer[5..7].copy_from_slice(&field_count.to_be_bytes());
+        
+        // split() takes the data WITHOUT copying, leaving buffer with capacity
+        self.buffer.split().freeze()
+    }
+    
+    /// Get mutable reference to buffer for encoding field data
+    /// Data is written after the pre-reserved header space
+    #[inline]
+    fn data_buffer(&mut self) -> &mut BytesMut {
+        &mut self.buffer
     }
 }
 
@@ -416,7 +457,7 @@ pub async fn send_data_row_with_backpressure<W: AsyncWrite + Unpin>(
 }
 
 /// Build a PostgreSQL DataRow message (text format only - legacy)
-pub fn build_data_row(row: &[String]) -> Vec<u8> {
+pub fn build_data_row(row: &[String]) -> Bytes {
     build_data_row_with_formats(row, &[], &[])
 }
 
@@ -433,19 +474,25 @@ pub fn build_data_row(row: &[String]) -> Vec<u8> {
 /// Otherwise, format_codes[i] applies to column i.
 /// 
 /// # Performance
-/// Uses thread-local buffer pools to minimize allocations.
-/// Only allocates new memory when buffer capacity is exceeded.
+/// Uses thread-local DataRowEncoder inspired by pgwire library.
+/// Uses BytesMut for efficient buffer management.
+/// Buffer capacity is retained between rows for reuse.
+/// 
+/// # Returns
+/// Returns `Bytes` (immutable, cheaply clonable) instead of `Vec<u8>`.
+/// `Bytes` can be used directly with `write_all()` via `&*bytes` or `.as_ref()`.
 pub fn build_data_row_with_formats(
     row: &[String],
     column_types: &[String],
     format_codes: &[i16],
-) -> Vec<u8> {
-    BUFFER_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        let (row_data, message_buf) = pool.get_buffers();
+) -> Bytes {
+    DATA_ROW_ENCODER.with(|encoder| {
+        let mut encoder = encoder.borrow_mut();
         
-        // Write column count
-        row_data.extend_from_slice(&(row.len() as i16).to_be_bytes());
+        // Prepare buffer with pre-reserved header space
+        encoder.prepare();
+        
+        let buf = encoder.data_buffer();
 
         for (i, value) in row.iter().enumerate() {
             // Determine format for this column
@@ -453,26 +500,21 @@ pub fn build_data_row_with_formats(
             let type_name = column_types.get(i).map(|s| s.as_str()).unwrap_or("text");
             
             if value == "NULL" {
-                row_data.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
+                buf.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
             } else if value.is_empty() {
-                row_data.extend_from_slice(&0i32.to_be_bytes()); // Empty string
+                buf.extend_from_slice(&0i32.to_be_bytes()); // Empty string
             } else if format == 1 {
                 // Binary format requested
-                encode_binary_value_bytes(row_data, value, type_name);
+                encode_binary_value_bytes(buf, value, type_name);
             } else {
                 // Text format - optimized sanitization
-                encode_text_value_optimized(row_data, value);
+                encode_text_value_optimized(buf, value);
             }
         }
 
-        // Build final message: 'D' + length + row_data
-        message_buf.extend_from_slice(&[b'D']);
-        let len = (4 + row_data.len()) as u32;
-        message_buf.extend_from_slice(&len.to_be_bytes());
-        message_buf.extend_from_slice(row_data);
-
-        // Return owned Vec - this is the only allocation per row
-        message_buf.to_vec()
+        // Take the row using split() - TRUE zero copy!
+        // Buffer retains capacity for next row
+        encoder.take_row(row.len() as i16)
     })
 }
 
