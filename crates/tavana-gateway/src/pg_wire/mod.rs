@@ -5,12 +5,19 @@
 //!
 //! ## Module Structure
 //!
-//! - `config` - Server configuration (environment-driven)
-//! - `protocol` - Wire protocol messages, types, and constants
-//! - `query` - SQL manipulation and PostgreSQL command interception
-//! - `auth` - Authentication handlers
-//! - `connection` - TCP keepalive and connectivity utilities
-//! - `server` - Main PgWireServer implementation
+//! - `handler` - Main PgWireServer implementation (modular)
+//!   - `config` - Server configuration (environment-driven)
+//!   - `core` - PgWireServer struct and lifecycle
+//!   - `connection` - TLS negotiation, startup handling, TCP keepalive
+//!   - `query_loop` - Main query processing loops
+//!   - `execution` - Query execution (streaming, buffered, SmartScaler)
+//!   - `messages` - Protocol message building and sending
+//!   - `auth` - Authentication handlers
+//!   - `extended` - Extended Query Protocol handlers
+//!   - `portal` - Portal state for cursor streaming
+//!   - `utils` - Utility functions, constants, and types
+//! - `backpressure` - Backpressure-aware streaming writer
+//! - `protocol` - Wire protocol types and constants
 //!
 //! ## Architecture
 //!
@@ -21,19 +28,12 @@
 //! 5. Execute query with streaming (true streaming, OOM-proof)
 //! 6. Complete → release capacity for next query
 
-// Utility modules (extracted protocol helpers)
-pub mod auth;
+// Shared protocol helpers (used by handler modules)
 pub mod backpressure;
-pub mod config;
-pub mod connection;
 pub mod protocol;
-pub mod query;
 
-// Modular server implementation (replaces monolithic server.rs)
+// Main server implementation
 pub mod handler;
-
-// Legacy monolithic implementation (kept for reference, not used)
-// mod server;
 
 // Re-export PgWireServer and PgWireConfig as the main public API
 pub use handler::PgWireServer;
