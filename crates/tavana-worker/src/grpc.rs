@@ -170,10 +170,11 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                 
                 // On first batch, send metadata and log timing
                 if !metadata_sent {
-                    first_batch_time = Some(start.elapsed());
+                    let elapsed = start.elapsed();
+                    first_batch_time = Some(elapsed);
                     info!(
                         query_id = %query_id_clone,
-                        first_batch_ms = first_batch_time.unwrap().as_millis(),
+                        first_batch_ms = elapsed.as_millis(),
                         batch_rows = batch.num_rows(),
                         "First batch received from DuckDB"
                     );

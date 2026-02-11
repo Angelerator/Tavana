@@ -16,7 +16,7 @@ use super::providers::{
     AuthContext, AuthProvider, Credentials, PassthroughProvider, SeparProvider,
     StaticKeysProvider,
 };
-use super::tokens::{ApiKeyValidator, JwtValidator};
+use super::tokens::{ApiKeyValidator, JwtValidator, JWT_PREFIX};
 
 /// The main authentication gateway
 pub struct AuthGateway {
@@ -179,7 +179,7 @@ impl AuthGateway {
 
         // Try local JWT validation if configured (fast path)
         if let Some(ref jwt_validator) = self.jwt_validator {
-            if password.starts_with("eyJ") && password.contains('.') {
+            if password.starts_with(JWT_PREFIX) && password.contains('.') {
                 match jwt_validator.validate(password) {
                     Ok(principal) => {
                         self.cache_result(&credentials, &principal);

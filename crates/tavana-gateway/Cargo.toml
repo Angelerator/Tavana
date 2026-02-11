@@ -61,7 +61,6 @@ serde_json = { workspace = true }
 # Utils
 uuid = { workspace = true }
 chrono = { workspace = true }
-chrono-tz = "0.10"
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
@@ -86,11 +85,9 @@ tokio-util = { version = "0.7", features = ["compat"] }
 # Kubernetes (for creating DuckDBQuery CRs)
 kube = { workspace = true, features = ["rustls-tls", "derive"] }
 k8s-openapi = { workspace = true }
-schemars = "0.8"
 
 # HTTP client for Prometheus queries
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-urlencoding = "2.1"
 
 # HTTP types for K8s API requests
 http = "1.1"

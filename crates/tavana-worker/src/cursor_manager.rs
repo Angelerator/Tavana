@@ -400,8 +400,7 @@ impl CursorManager {
             if has_more && !batches.is_empty() {
                 // Trim the last batch if needed
                 let excess = total_rows - batch_size;
-                if excess > 0 && !batches.is_empty() {
-                    let last_batch = batches.last().unwrap();
+                if let Some(last_batch) = batches.last() {
                     if last_batch.num_rows() <= excess {
                         // Remove entire last batch
                         batches.pop();

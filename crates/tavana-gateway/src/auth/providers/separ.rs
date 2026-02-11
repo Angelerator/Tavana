@@ -18,6 +18,7 @@ use std::time::Duration;
 use super::{AuthProvider, Credentials};
 use crate::auth::config::{SeparConfig, TenantExtractionStrategy};
 use crate::auth::identity::{AuthResult, AuthenticatedPrincipal, PrincipalType};
+use crate::auth::tokens::TokenType;
 
 /// Separ authentication provider
 pub struct SeparProvider {
@@ -65,17 +66,12 @@ impl SeparProvider {
 
     /// Detect the credential type from the secret
     fn detect_credential_type(secret: &str) -> CredentialType {
-        if secret.starts_with("eyJ") && secret.contains('.') {
-            CredentialType::Jwt
-        } else if secret.starts_with("pat_") {
-            CredentialType::PersonalAccessToken
-        } else if secret.starts_with("sak_") {
-            CredentialType::ServiceAccountKey
-        } else if secret.starts_with("sk_") || secret.starts_with("tvn_") {
-            CredentialType::ApiKey
-        } else {
-            // Could be a password or unknown token format
-            CredentialType::Password
+        match TokenType::detect(secret) {
+            TokenType::Jwt => CredentialType::Jwt,
+            TokenType::PersonalAccessToken => CredentialType::PersonalAccessToken,
+            TokenType::ServiceAccountKey => CredentialType::ServiceAccountKey,
+            TokenType::ApiKey => CredentialType::ApiKey,
+            TokenType::Unknown => CredentialType::Password,
         }
     }
 

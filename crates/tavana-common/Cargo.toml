@@ -11,10 +11,6 @@ tonic = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 
-# Arrow
-arrow = { workspace = true }
-arrow-schema = { workspace = true }
-
 # Async
 tokio = { workspace = true }
 async-trait = { workspace = true }
@@ -35,18 +31,15 @@ serde_json = { workspace = true }
 
 # Observability
 tracing = { workspace = true }
-opentelemetry = { workspace = true }
 
 # Utils
 rand = { workspace = true }
-uuid = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 base64 = { workspace = true }
-hex = { workspace = true }
 config = { workspace = true }
 
 [build-dependencies]

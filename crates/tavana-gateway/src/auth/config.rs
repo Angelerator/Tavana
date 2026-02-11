@@ -10,9 +10,9 @@ use std::time::Duration;
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
     /// No authentication required (development/internal use)
+    #[default]
     Passthrough,
     /// Require authentication via configured providers
-    #[default]
     Required,
     /// Authentication optional - allow anonymous if no credentials
     Optional,
