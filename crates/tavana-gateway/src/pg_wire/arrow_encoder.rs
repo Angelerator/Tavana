@@ -383,44 +383,55 @@ fn encode_boolean(encoder: &mut ArrowDataRowEncoder, array: &dyn Array, row_idx:
     }
 }
 
-// ============= String Encoders (ZERO-COPY!) =============
+// ============= String Encoders =============
+
+/// Encode a string value to the PG wire protocol buffer.
+/// 
+/// Ensures valid UTF-8 output for the PostgreSQL wire protocol:
+/// - Source data from Parquet/Delta may contain invalid UTF-8 (e.g., Latin-1 encoded
+///   patent titles with accented characters like "Système D'antenne")
+/// - PostgreSQL wire protocol requires valid UTF-8 in text mode
+/// - Invalid bytes are replaced with U+FFFD (Unicode replacement character)
+/// - NULL bytes (0x00) are stripped (PG wire protocol uses null-terminated strings)
+///
+/// Fast path: if bytes are valid UTF-8 and contain no NULLs, zero-copy.
+/// Slow path: only allocates when sanitization is needed.
+#[inline]
+fn encode_string_bytes(encoder: &mut ArrowDataRowEncoder, bytes: &[u8]) {
+    // Fast path: check if bytes are clean (valid UTF-8, no NULL bytes)
+    let needs_null_filter = bytes.contains(&0);
+    let is_valid_utf8 = std::str::from_utf8(bytes).is_ok();
+    
+    if is_valid_utf8 && !needs_null_filter {
+        // Fast path: direct copy (zero allocation)
+        encoder.buffer.put_i32(bytes.len() as i32);
+        encoder.buffer.extend_from_slice(bytes);
+    } else {
+        // Slow path: sanitize invalid UTF-8 and/or NULL bytes
+        let sanitized = String::from_utf8_lossy(bytes); // replaces invalid bytes with U+FFFD
+        let clean: Vec<u8> = sanitized.as_bytes().iter().copied().filter(|&b| b != 0).collect();
+        encoder.buffer.put_i32(clean.len() as i32);
+        encoder.buffer.extend_from_slice(&clean);
+    }
+}
 
 #[inline]
 fn encode_utf8(encoder: &mut ArrowDataRowEncoder, array: &dyn Array, row_idx: usize) {
     let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
-    let value = arr.value(row_idx);
-
-    // ZERO-COPY: Arrow's string slice is used directly
-    // Only the length and pointer are copied, not the string data
-    let bytes = value.as_bytes();
-
-    // Sanitize NULL bytes (required by PostgreSQL wire protocol)
-    if bytes.contains(&0) {
-        // Slow path: filter NULL bytes
-        let filtered: Vec<u8> = bytes.iter().copied().filter(|&b| b != 0).collect();
-        encoder.buffer.put_i32(filtered.len() as i32);
-        encoder.buffer.extend_from_slice(&filtered);
-    } else {
-        // Fast path: direct copy
-        encoder.buffer.put_i32(bytes.len() as i32);
-        encoder.buffer.extend_from_slice(bytes);
-    }
+    // Access raw bytes to handle potentially invalid UTF-8 from source data
+    let start = arr.value_offsets()[row_idx] as usize;
+    let end = arr.value_offsets()[row_idx + 1] as usize;
+    let bytes = &arr.value_data()[start..end];
+    encode_string_bytes(encoder, bytes);
 }
 
 #[inline]
 fn encode_large_utf8(encoder: &mut ArrowDataRowEncoder, array: &dyn Array, row_idx: usize) {
     let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-    let value = arr.value(row_idx);
-
-    let bytes = value.as_bytes();
-    if bytes.contains(&0) {
-        let filtered: Vec<u8> = bytes.iter().copied().filter(|&b| b != 0).collect();
-        encoder.buffer.put_i32(filtered.len() as i32);
-        encoder.buffer.extend_from_slice(&filtered);
-    } else {
-        encoder.buffer.put_i32(bytes.len() as i32);
-        encoder.buffer.extend_from_slice(bytes);
-    }
+    let start = arr.value_offsets()[row_idx] as usize;
+    let end = arr.value_offsets()[row_idx + 1] as usize;
+    let bytes = &arr.value_data()[start..end];
+    encode_string_bytes(encoder, bytes);
 }
 
 // ============= Date/Time Encoders =============
@@ -609,16 +620,7 @@ fn encode_decimal128(encoder: &mut ArrowDataRowEncoder, array: &dyn Array, row_i
 fn encode_utf8_view(encoder: &mut ArrowDataRowEncoder, array: &dyn Array, row_idx: usize) {
     let arr = array.as_any().downcast_ref::<StringViewArray>().unwrap();
     let value = arr.value(row_idx);
-
-    let bytes = value.as_bytes();
-    if bytes.contains(&0) {
-        let filtered: Vec<u8> = bytes.iter().copied().filter(|&b| b != 0).collect();
-        encoder.buffer.put_i32(filtered.len() as i32);
-        encoder.buffer.extend_from_slice(&filtered);
-    } else {
-        encoder.buffer.put_i32(bytes.len() as i32);
-        encoder.buffer.extend_from_slice(bytes);
-    }
+    encode_string_bytes(encoder, value.as_bytes());
 }
 
 // ============= Binary Encoder =============
@@ -660,15 +662,7 @@ fn encode_fallback(encoder: &mut ArrowDataRowEncoder, array: &dyn Array, row_idx
         Err(_) => format!("<{:?}>", array.data_type()),
     };
 
-    let bytes = s.as_bytes();
-    if bytes.contains(&0) {
-        let filtered: Vec<u8> = bytes.iter().copied().filter(|&b| b != 0).collect();
-        encoder.buffer.put_i32(filtered.len() as i32);
-        encoder.buffer.extend_from_slice(&filtered);
-    } else {
-        encoder.buffer.put_i32(bytes.len() as i32);
-        encoder.buffer.extend_from_slice(bytes);
-    }
+    encode_string_bytes(encoder, s.as_bytes());
 }
 
 #[cfg(test)]
