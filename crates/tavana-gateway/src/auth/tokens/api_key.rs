@@ -116,12 +116,12 @@ impl ApiKeyValidator {
         }
     }
 
-    /// Check if a string looks like an API key
+    /// Check if a string looks like an API key (any known key prefix)
     pub fn is_api_key(s: &str) -> bool {
-        s.starts_with(PREFIX_TAVANA)
-            || s.starts_with(PREFIX_SECRET)
-            || s.starts_with(PREFIX_PAT)
-            || s.starts_with(PREFIX_SERVICE)
+        matches!(
+            super::TokenType::detect(s),
+            super::TokenType::ApiKey | super::TokenType::PersonalAccessToken | super::TokenType::ServiceAccountKey
+        )
     }
 
     /// Get the key type from prefix

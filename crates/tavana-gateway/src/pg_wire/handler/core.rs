@@ -2,7 +2,7 @@
 //!
 //! Main server struct with constructors and the start() method.
 
-use crate::auth::{AuthService, AuthGateway};
+use crate::auth::AuthService;
 use crate::metrics;
 use crate::query_queue::QueryQueue;
 use crate::query_router::QueryRouter;
@@ -18,10 +18,10 @@ use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 
 /// PostgreSQL wire protocol server with SmartScaler and Query Queue
+#[allow(dead_code)]
 pub struct PgWireServer {
     addr: SocketAddr,
     auth_service: Arc<AuthService>,
-    auth_gateway: Option<Arc<AuthGateway>>,
     worker_client: Arc<WorkerClient>,
     worker_client_pool: Arc<WorkerClientPool>,
     query_router: Arc<QueryRouter>,
@@ -43,7 +43,6 @@ impl PgWireServer {
             .parse()
             .expect("Invalid port number for SocketAddr");
         
-        let auth_gateway = auth_service.gateway().cloned();
         let worker_client_pool = Arc::new(WorkerClientPool::new(worker_client.worker_addr().to_string()));
         let config = Arc::new(PgWireConfig::default());
         info!(
@@ -56,7 +55,6 @@ impl PgWireServer {
         Self {
             addr,
             auth_service,
-            auth_gateway,
             worker_client,
             worker_client_pool,
             query_router,
@@ -93,12 +91,11 @@ impl PgWireServer {
         pool_manager: Option<Arc<WorkerPoolManager>>,
     ) -> Self {
         let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().expect("Invalid port number for SocketAddr");
-        let auth_gateway = auth_service.gateway().cloned();
         let worker_client_pool = Arc::new(WorkerClientPool::new(worker_client.worker_addr().to_string()));
         let config = Arc::new(PgWireConfig::default());
 
         Self {
-            addr, auth_service, auth_gateway, worker_client, worker_client_pool,
+            addr, auth_service, worker_client, worker_client_pool,
             query_router, pool_manager, smart_scaler: None,
             query_queue: QueryQueue::new(), tls_config: None, config,
         }
@@ -138,20 +135,14 @@ impl PgWireServer {
             config.query_timeout_secs
         );
 
-        let auth_gateway = auth_service.gateway().cloned();
-
         Self {
-            addr, auth_service, auth_gateway, worker_client, worker_client_pool,
+            addr, auth_service, worker_client, worker_client_pool,
             query_router, pool_manager, smart_scaler, query_queue, tls_config: None, config,
         }
     }
 
     pub fn set_tls(&mut self, tls_config: Option<TlsConfig>) {
         self.tls_config = tls_config.map(Arc::new);
-    }
-
-    pub fn auth_gateway(&self) -> Option<&Arc<AuthGateway>> {
-        self.auth_gateway.as_ref()
     }
 
     pub async fn start(&self) -> anyhow::Result<()> {
@@ -203,7 +194,6 @@ impl PgWireServer {
             let worker_client = self.worker_client.clone();
             let worker_client_pool = self.worker_client_pool.clone();
             let query_router = self.query_router.clone();
-            let pool_manager = self.pool_manager.clone();
             let smart_scaler = self.smart_scaler.clone();
             let query_queue = self.query_queue.clone();
             let tls_config = self.tls_config.clone();
@@ -212,7 +202,7 @@ impl PgWireServer {
             tokio::spawn(async move {
                 if let Err(e) = handle_connection_with_tls(
                     socket, auth_service, worker_client, worker_client_pool,
-                    query_router, pool_manager, smart_scaler, query_queue, tls_config, config,
+                    query_router, smart_scaler, query_queue, tls_config, config,
                 ).await {
                     let err_str = e.to_string();
                     if err_str.contains("early eof") || err_str.contains("connection reset") {

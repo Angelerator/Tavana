@@ -136,9 +136,6 @@ impl QueryRouter {
         // Calculate CPU cores estimate for metrics
         let cpu_cores = self.estimate_cpu_cores(size_estimate.total_mb, has_join, has_aggregation);
 
-        // Tenant routing removed - not implemented
-        // if let Some(ref tm) = self.tenant_manager { ... }
-
         // Pre-sizing on shared pool
         let (target, required_memory_mb, was_resized) = if let Some(ref pm) = self.pool_manager {
             if pm.is_enabled() {

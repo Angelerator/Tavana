@@ -1,16 +1,13 @@
 //! PostgreSQL wire protocol handler - modular implementation
 //!
-//! This module replaces the monolithic `server.rs` with a clean module structure:
-//!
 //! - `config` - Server configuration (environment-driven)
 //! - `core` - PgWireServer struct and lifecycle
 //! - `connection` - TLS negotiation, startup handling, TCP keepalive
-//! - `query_loop` - Main query processing loops (TLS and non-TLS)
-//! - `execution` - Query execution (streaming, buffered, SmartScaler)
-//! - `messages` - Protocol message building and sending
-//! - `auth` - Authentication handlers
-//! - `extended` - Extended Query Protocol handlers (non-TLS)
-//! - `portal` - Portal state for cursor streaming
+//! - `query_loop` - Main query processing loop (generic, handles Simple + Extended)
+//! - `execution` - Query execution (streaming, routing, SmartScaler, COPY)
+//! - `messages` - Protocol message building and sending (all generic)
+//! - `auth` - Authentication handler (generic)
+//! - `portal` - Portal state for cursor streaming (Extended Protocol)
 //! - `utils` - Utility functions, constants, and types
 
 pub mod config;
@@ -20,7 +17,6 @@ mod query_loop;
 mod execution;
 mod messages;
 mod auth;
-mod extended;
 mod portal;
 pub mod utils;
 

@@ -106,6 +106,15 @@ static REGCLASS_CAST_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)::reg(class|type|proc|oper|namespace|role)").unwrap()
 });
 
+/// pg_catalog schema-qualified function calls
+/// PostgreSQL allows `pg_catalog.function_name(...)` syntax for calling system functions.
+/// DuckDB supports the pg_catalog schema for table/view access (e.g., `FROM pg_catalog.pg_type`)
+/// but does NOT support schema-qualified function calls. This rewrites them to unqualified calls
+/// so DuckDB's own built-in functions handle them (e.g., `version()`, `current_setting()`, etc.).
+static PG_CATALOG_FUNC_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bpg_catalog\.(\w+)\s*\(").unwrap()
+});
+
 /// Convert PostgreSQL date format to strftime format
 fn pg_format_to_strftime(pg_format: &str) -> String {
     let mut result = pg_format.to_string();
@@ -223,6 +232,19 @@ pub fn rewrite_pg_to_duckdb(sql: &str) -> String {
         modified = true;
     }
 
+    // pg_catalog.function_name(...) → function_name(...)
+    // DuckDB supports pg_catalog schema for tables/views but not for function calls.
+    // Strip the schema qualifier so DuckDB's built-in functions handle them natively.
+    // Examples: pg_catalog.version() → version(), pg_catalog.current_setting('x') → current_setting('x')
+    if PG_CATALOG_FUNC_REGEX.is_match(&result) {
+        result = PG_CATALOG_FUNC_REGEX
+            .replace_all(&result, |caps: &regex::Captures| {
+                format!("{}(", &caps[1])
+            })
+            .to_string();
+        modified = true;
+    }
+
     if modified {
         debug!(
             original = sql,
@@ -249,6 +271,7 @@ pub fn needs_rewrite(sql: &str) -> bool {
         || sql_upper.contains("::REGOPER")
         || sql_upper.contains("::REGNAMESPACE")
         || sql_upper.contains("::REGROLE")
+        || sql_upper.contains("PG_CATALOG.")
 }
 
 #[cfg(test)]
@@ -355,6 +378,35 @@ mod tests {
     fn test_needs_rewrite_regclass() {
         assert!(needs_rewrite("SELECT 'foo'::regclass"));
         assert!(needs_rewrite("SELECT typname::regtype FROM pg_type"));
+    }
+
+    #[test]
+    fn test_pg_catalog_version_rewrite() {
+        let input = "select pg_catalog.version()";
+        let output = rewrite_pg_to_duckdb(input);
+        assert_eq!(output, "select version()");
+    }
+
+    #[test]
+    fn test_pg_catalog_function_rewrite() {
+        let input = "SELECT pg_catalog.current_setting('server_version')";
+        let output = rewrite_pg_to_duckdb(input);
+        assert_eq!(output, "SELECT current_setting('server_version')");
+    }
+
+    #[test]
+    fn test_pg_catalog_table_not_rewritten() {
+        // Table references like FROM pg_catalog.pg_type should NOT be affected
+        // The regex only matches pg_catalog.name( — with a parenthesis (function calls)
+        let input = "SELECT * FROM pg_catalog.pg_type";
+        let output = rewrite_pg_to_duckdb(input);
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn test_needs_rewrite_pg_catalog() {
+        assert!(needs_rewrite("select pg_catalog.version()"));
+        assert!(needs_rewrite("SELECT PG_CATALOG.current_setting('x')"));
     }
 }
 

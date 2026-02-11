@@ -8,6 +8,11 @@ pub mod api_key;
 pub use jwt::JwtValidator;
 pub use api_key::{ApiKeyValidator, ApiKeyResult};
 
+use api_key::{PREFIX_TAVANA, PREFIX_SECRET, PREFIX_PAT, PREFIX_SERVICE};
+
+/// JWT token prefix (base64-encoded JSON header)
+pub const JWT_PREFIX: &str = "eyJ";
+
 /// Token type detection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenType {
@@ -26,13 +31,13 @@ pub enum TokenType {
 impl TokenType {
     /// Detect token type from a string
     pub fn detect(token: &str) -> Self {
-        if token.starts_with("eyJ") && token.contains('.') {
+        if token.starts_with(JWT_PREFIX) && token.contains('.') {
             TokenType::Jwt
-        } else if token.starts_with("pat_") {
+        } else if token.starts_with(PREFIX_PAT) {
             TokenType::PersonalAccessToken
-        } else if token.starts_with("sak_") {
+        } else if token.starts_with(PREFIX_SERVICE) {
             TokenType::ServiceAccountKey
-        } else if token.starts_with("sk_") || token.starts_with("tvn_") {
+        } else if token.starts_with(PREFIX_SECRET) || token.starts_with(PREFIX_TAVANA) {
             TokenType::ApiKey
         } else {
             TokenType::Unknown

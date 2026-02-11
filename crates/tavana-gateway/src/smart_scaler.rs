@@ -1217,8 +1217,9 @@ impl SmartScaler {
         // Sort candidates by preference
         let mut sorted_names = candidate_names;
         sorted_names.sort_by(|a_name, b_name| {
-            let a = workers.get(a_name).unwrap();
-            let b = workers.get(b_name).unwrap();
+            let (Some(a), Some(b)) = (workers.get(a_name), workers.get(b_name)) else {
+                return std::cmp::Ordering::Equal;
+            };
             
             let a_can_accept = a.can_accept_query(estimated_memory_mb);
             let b_can_accept = b.can_accept_query(estimated_memory_mb);
@@ -1731,10 +1732,6 @@ impl SmartScaler {
                     last_hpa_check = Instant::now();
                 }
 
-                // Step 5: Shrink idle worker memory (VPA) - temporarily disabled for stability
-                // if let Err(e) = scaler.shrink_idle_workers().await {
-                //     debug!("Shrink check: {}", e);
-                // }
             }
         })
     }
@@ -1769,10 +1766,6 @@ impl SmartScaler {
                     warn!("Failed to check scale-down: {}", e);
                 }
 
-                // Step 5: Shrink idle worker memory (VPA) - temporarily disabled
-                // if let Err(e) = scaler.shrink_idle_workers().await {
-                //     debug!("Shrink check: {}", e);
-                // }
             }
         })
     }

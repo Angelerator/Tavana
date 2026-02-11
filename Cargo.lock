@@ -1222,16 +1222,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "chrono-tz"
-version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
-dependencies = [
- "chrono",
- "phf",
-]
-
-[[package]]
 name = "clap"
 version = "4.5.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3941,24 +3931,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "phf"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
-dependencies = [
- "phf_shared",
-]
-
-[[package]]
-name = "phf_shared"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
-dependencies = [
- "siphasher",
-]
-
-[[package]]
 name = "pin-project"
 version = "1.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5194,12 +5166,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "siphasher"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56199f7ddabf13fe5074ce809e7d3f42b42ae711800501b5b16ea82ad029c39d"
-
-[[package]]
 name = "slab"
 version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5440,8 +5406,6 @@ name = "tavana-common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arrow",
- "arrow-schema",
  "async-trait",
  "base64 0.22.1",
  "blake3",
@@ -5449,9 +5413,7 @@ dependencies = [
  "chrono",
  "config",
  "futures",
- "hex",
  "jsonwebtoken",
- "opentelemetry",
  "prost",
  "prost-types",
  "rand 0.8.5",
@@ -5465,7 +5427,6 @@ dependencies = [
  "tonic 0.13.1",
  "tonic-build",
  "tracing",
- "uuid",
  "webpki-roots 0.26.11",
 ]
 
@@ -5487,7 +5448,6 @@ dependencies = [
  "blake3",
  "bytes",
  "chrono",
- "chrono-tz",
  "clap",
  "dashmap",
  "dotenvy",
@@ -5513,7 +5473,6 @@ dependencies = [
  "reqwest",
  "rustls 0.23.35",
  "rustls-pemfile",
- "schemars 0.8.22",
  "serde",
  "serde_json",
  "socket2 0.5.10",
@@ -5529,7 +5488,6 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
- "urlencoding",
  "uuid",
 ]
 
