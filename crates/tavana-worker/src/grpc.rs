@@ -133,7 +133,7 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
         let req = request.into_inner();
         info!(query_id = %req.query_id, "Executing query with TRUE STREAMING");
 
-        let (tx, rx) = mpsc::channel(64); // Larger buffer for streaming
+        let (tx, rx) = mpsc::channel(16); // Bounded buffer: limits memory to ~16 batches
         let executor = self.executor.clone();
         let sql = req.sql.clone();
         let query_id = req.query_id.clone();
@@ -191,25 +191,22 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                         total_bytes: 0,
                     };
                     
-                    // Use blocking send since we're in spawn_blocking
-                    let rt = tokio::runtime::Handle::current();
-                    rt.block_on(async {
-                        let _ = tx_clone.send(Ok(proto::QueryResultBatch {
-                            result: Some(proto::query_result_batch::Result::Metadata(metadata)),
-                        })).await;
-                    });
+                    // blocking_send: efficient for spawn_blocking (no nested async overhead)
+                    let _ = tx_clone.blocking_send(Ok(proto::QueryResultBatch {
+                        result: Some(proto::query_result_batch::Result::Metadata(metadata)),
+                    }));
                     
                     metadata_sent = true;
                     debug!("Sent metadata: {} columns", columns.len());
                 }
 
-                // Serialize batch using JSON for reliable cross-crate compatibility
-                // Arrow IPC has issues with DuckDB's bundled Arrow vs standalone Arrow crate
+                // Serialize batch using Arrow IPC for ~10-50x faster serialization
+                // Arrow IPC preserves native typed columnar data (no per-cell string conversion)
                 // TRUE STREAMING: batches are sent as they're produced, never buffered
                 total_rows += batch.num_rows() as u64;
                 
-                // Use JSON serialization for reliable data transfer
-                let ipc_data = serialize_batch_to_json(&batch);
+                // Use Arrow IPC serialization for high-performance data transfer
+                let ipc_data = serialize_batch_to_arrow_ipc(&batch);
                 
                 let arrow_batch = proto::ArrowRecordBatch {
                     schema: vec![], // Schema sent in metadata
@@ -217,13 +214,10 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                     row_count: batch.num_rows() as u64,
                 };
 
-                // Send batch immediately - TRUE STREAMING
-                let rt = tokio::runtime::Handle::current();
-                rt.block_on(async {
-                    let _ = tx_clone.send(Ok(proto::QueryResultBatch {
-                        result: Some(proto::query_result_batch::Result::RecordBatch(arrow_batch)),
-                    })).await;
-                });
+                // blocking_send: efficient for spawn_blocking (no nested async overhead)
+                let _ = tx_clone.blocking_send(Ok(proto::QueryResultBatch {
+                    result: Some(proto::query_result_batch::Result::RecordBatch(arrow_batch)),
+                }));
 
                 // Log progress every 10 seconds for visibility
                 if last_progress_log.elapsed().as_secs() >= 10 {
@@ -265,12 +259,9 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                             total_rows: 0,
                             total_bytes: 0,
                         };
-                        let rt = tokio::runtime::Handle::current();
-                        rt.block_on(async {
-                            let _ = tx.send(Ok(proto::QueryResultBatch {
-                                result: Some(proto::query_result_batch::Result::Metadata(metadata)),
-                            })).await;
-                        });
+                        let _ = tx.blocking_send(Ok(proto::QueryResultBatch {
+                            result: Some(proto::query_result_batch::Result::Metadata(metadata)),
+                        }));
                     }
 
                     // Send profile at the end
@@ -286,12 +277,9 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                         tables_accessed: vec![],
                     };
 
-                    let rt = tokio::runtime::Handle::current();
-                    rt.block_on(async {
-                        let _ = tx.send(Ok(proto::QueryResultBatch {
-                            result: Some(proto::query_result_batch::Result::Profile(profile)),
-                        })).await;
-                    });
+                    let _ = tx.blocking_send(Ok(proto::QueryResultBatch {
+                        result: Some(proto::query_result_batch::Result::Profile(profile)),
+                    }));
                     
                     info!("Query completed: {} rows streamed in {:?}", rows, elapsed);
                 }
@@ -302,12 +290,9 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                         message: e.to_string(),
                         details: Default::default(),
                     };
-                    let rt = tokio::runtime::Handle::current();
-                    rt.block_on(async {
-                        let _ = tx.send(Ok(proto::QueryResultBatch {
-                            result: Some(proto::query_result_batch::Result::Error(error)),
-                        })).await;
-                    });
+                    let _ = tx.blocking_send(Ok(proto::QueryResultBatch {
+                        result: Some(proto::query_result_batch::Result::Error(error)),
+                    }));
                 }
             }
         });
@@ -495,25 +480,29 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                 }))
                 .await;
 
-            // Fetch rows from cursor (no re-scanning!)
-            match cursor_manager.fetch_cursor(&cursor_id, max_rows) {
-                Ok((rows, exhausted)) => {
-                    if !rows.is_empty() {
-                        // Serialize to JSON
-                        let json_data = serde_json::to_vec(&rows).unwrap_or_default();
+            // Fetch Arrow RecordBatch slices from cursor (zero-copy, no string conversion)
+            match cursor_manager.fetch_cursor_arrow(&cursor_id, max_rows) {
+                Ok((batches, exhausted)) => {
+                    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    
+                    for batch in &batches {
+                        if batch.num_rows() == 0 { continue; }
+                        
+                        // Serialize via Arrow IPC (same as execute_query path)
+                        let ipc_data = serialize_batch_to_arrow_ipc(batch);
 
                         debug!(
                             cursor_id = %cursor_id,
-                            rows = rows.len(),
-                            bytes = json_data.len(),
+                            batch_rows = batch.num_rows(),
+                            bytes = ipc_data.len(),
                             exhausted = exhausted,
-                            "Sending cursor fetch batch"
+                            "Sending cursor fetch Arrow IPC batch"
                         );
 
                         let arrow_batch = proto::ArrowRecordBatch {
                             schema: vec![],
-                            data: json_data,
-                            row_count: rows.len() as u64,
+                            data: ipc_data,
+                            row_count: batch.num_rows() as u64,
                         };
 
                         let _ = tx
@@ -531,7 +520,7 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                         execution_time_ms: elapsed.as_millis() as u64,
                         rows_scanned: 0,
                         bytes_scanned: 0,
-                        rows_returned: rows.len() as u64,
+                        rows_returned: total_rows as u64,
                         bytes_returned: 0,
                         peak_memory_bytes: 0,
                         cpu_seconds: elapsed.as_secs_f32(),
@@ -586,10 +575,41 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
     }
 }
 
-/// Serialize a RecordBatch to JSON format for streaming
-fn serialize_batch_to_json(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u8> {
-    let mut rows_json: Vec<Vec<String>> = Vec::with_capacity(batch.num_rows());
+/// Serialize a RecordBatch to Arrow IPC streaming format
+/// 
+/// Arrow IPC is ~10-50x faster than JSON serialization because:
+/// - No per-cell string conversion (preserves native typed data)
+/// - Near zero-copy serialization of columnar buffers
+/// - Gateway can deserialize with matching arrow-rs v56
+fn serialize_batch_to_arrow_ipc(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u8> {
+    use duckdb::arrow::ipc::writer::StreamWriter;
     
+    // Pre-allocate: ~8 bytes per cell + schema overhead is a reasonable estimate
+    let estimated_size = batch.num_rows() * batch.num_columns() * 8 + 1024;
+    let mut buf = Vec::with_capacity(estimated_size);
+    let schema = batch.schema();
+    match StreamWriter::try_new(&mut buf, &schema) {
+        Ok(mut writer) => {
+            if let Err(e) = writer.write(batch) {
+                tracing::warn!("Arrow IPC write failed, falling back to JSON: {}", e);
+                return serialize_batch_to_json_fallback(batch);
+            }
+            if let Err(e) = writer.finish() {
+                tracing::warn!("Arrow IPC finish failed, falling back to JSON: {}", e);
+                return serialize_batch_to_json_fallback(batch);
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Arrow IPC writer creation failed, falling back to JSON: {}", e);
+            return serialize_batch_to_json_fallback(batch);
+        }
+    }
+    buf
+}
+
+/// JSON serialization fallback (only used if Arrow IPC fails)
+fn serialize_batch_to_json_fallback(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u8> {
+    let mut rows_json: Vec<Vec<String>> = Vec::with_capacity(batch.num_rows());
     for row_idx in 0..batch.num_rows() {
         let mut row: Vec<String> = Vec::with_capacity(batch.num_columns());
         for col_idx in 0..batch.num_columns() {
@@ -599,7 +619,6 @@ fn serialize_batch_to_json(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u8>
         }
         rows_json.push(row);
     }
-    
     serde_json::to_vec(&rows_json).unwrap_or_default()
 }
 
