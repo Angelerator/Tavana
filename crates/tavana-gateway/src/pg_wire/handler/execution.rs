@@ -7,9 +7,9 @@
 use crate::metrics;
 use crate::pg_compat;
 use crate::pg_wire::backpressure::{
-    BackpressureConfig, BackpressureWriter,
+    BackpressureConfig, BackpressureWriter, ArrowBatchEncoder,
     build_row_description_with_formats,
-    build_command_complete, build_data_row_with_formats,
+    build_command_complete, build_data_row_with_formats, build_data_row_from_arrow,
     is_disconnect_error,
 };
 use crate::query_router::{QueryRouter, QueryTarget};
@@ -99,6 +99,34 @@ where
                         if !columns_sent {
                             send_copy_out_response_header(socket, column_names.len()).await?;
                             columns_sent = true;
+                        }
+                    }
+                    StreamingBatch::ArrowBatches(batches) => {
+                        // COPY uses tab-separated text, need string conversion
+                        for batch in &batches {
+                            for row_idx in 0..batch.num_rows() {
+                                let row: Vec<String> = (0..batch.num_columns())
+                                    .map(|col_idx| {
+                                        let col = batch.column(col_idx);
+                                        if col.is_null(row_idx) {
+                                            "\\N".to_string()
+                                        } else {
+                                            use arrow::util::display::ArrayFormatter;
+                                            match ArrayFormatter::try_new(col.as_ref(), &Default::default()) {
+                                                Ok(f) => f.value(row_idx).to_string(),
+                                                Err(_) => String::new(),
+                                            }
+                                        }
+                                    })
+                                    .collect();
+                                send_copy_data_row(socket, &row).await?;
+                                total_rows += 1;
+                                batch_rows += 1;
+                                if batch_rows >= STREAMING_BATCH_SIZE {
+                                    socket.flush().await?;
+                                    batch_rows = 0;
+                                }
+                            }
                         }
                     }
                     StreamingBatch::Rows(rows) => {
@@ -388,55 +416,83 @@ where
             }
             Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
                 if !batch.data.is_empty() {
-                    if let Ok(rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                    // Try Arrow IPC first (primary format), JSON fallback for backward compat
+                    let arrow_batches = {
+                        use arrow_ipc::reader::StreamReader;
+                        use std::io::Cursor;
+                        StreamReader::try_new(Cursor::new(&batch.data), None)
+                            .and_then(|reader| reader.collect::<Result<Vec<_>, _>>())
+                            .ok()
+                    };
+
+                    if let Some(record_batches) = arrow_batches {
+                        // Arrow IPC path: direct RecordBatch → PG DataRow
+                        for rb in &record_batches {
+                            for row_idx in 0..rb.num_rows() {
+                                let data_row = build_data_row_from_arrow(rb, row_idx, &streaming_column_types, format_codes);
+
+                                match writer.write_bytes(&data_row).await {
+                                    Ok(_) => {}
+                                    Err(e) if is_disconnect_error(&e) => {
+                                        let stats = writer.stats();
+                                        warn!("Client disconnected during streaming after {} rows, {} bytes", stats.rows_sent, stats.bytes_sent);
+                                        return Err(anyhow::anyhow!("Client disconnected"));
+                                    }
+                                    Err(e) => return Err(e.into()),
+                                }
+                                writer.row_sent();
+
+                                if writer.should_flush() {
+                                    match writer.flush_with_backpressure().await {
+                                        Ok(true) => {}
+                                        Ok(false) => {
+                                            let stats = writer.stats();
+                                            debug!("Slow client detected after {} rows", stats.rows_sent);
+                                        }
+                                        Err(e) if is_disconnect_error(&e) => {
+                                            let stats = writer.stats();
+                                            warn!("Client disconnected during flush after {} rows", stats.rows_sent);
+                                            return Err(anyhow::anyhow!("Client disconnected"));
+                                        }
+                                        Err(e) => {
+                                            warn!("Flush failed: {} - client may be overwhelmed", e);
+                                            return Err(anyhow::anyhow!("Client too slow: {}", e));
+                                        }
+                                    }
+                                }
+
+                                if let Some(current_gb) = writer.stats_mut().should_warn_large_transfer() {
+                                    let notice_msg = format!(
+                                        "Large data transfer: {}GB sent. Consider using LIMIT or CURSOR for very large results.",
+                                        current_gb
+                                    );
+                                    warn!("Large transfer warning: {}GB sent to client", current_gb);
+                                    let notice_bytes = build_notice_message(&notice_msg);
+                                    if let Err(e) = writer.write_bytes(&notice_bytes).await {
+                                        debug!("Failed to send large transfer notice: {}", e);
+                                    }
+                                }
+
+                                let stats = writer.stats();
+                                if stats.rows_sent % 1_000_000 == 0 && stats.rows_sent > 0 {
+                                    info!("Streaming progress: {} rows, {} MB sent", stats.rows_sent, stats.bytes_sent / (1024 * 1024));
+                                }
+                            }
+                        }
+                    } else if let Ok(rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                        // JSON fallback for backward compatibility (cursor path)
                         for row in rows {
                             let data_row = build_data_row_with_formats(&row, &streaming_column_types, format_codes);
-
                             match writer.write_bytes(&data_row).await {
                                 Ok(_) => {}
                                 Err(e) if is_disconnect_error(&e) => {
-                                    let stats = writer.stats();
-                                    warn!("Client disconnected during streaming after {} rows, {} bytes", stats.rows_sent, stats.bytes_sent);
                                     return Err(anyhow::anyhow!("Client disconnected"));
                                 }
                                 Err(e) => return Err(e.into()),
                             }
                             writer.row_sent();
-
                             if writer.should_flush() {
-                                match writer.flush_with_backpressure().await {
-                                    Ok(true) => {}
-                                    Ok(false) => {
-                                        let stats = writer.stats();
-                                        debug!("Slow client detected after {} rows", stats.rows_sent);
-                                    }
-                                    Err(e) if is_disconnect_error(&e) => {
-                                        let stats = writer.stats();
-                                        warn!("Client disconnected during flush after {} rows", stats.rows_sent);
-                                        return Err(anyhow::anyhow!("Client disconnected"));
-                                    }
-                                    Err(e) => {
-                                        warn!("Flush failed: {} - client may be overwhelmed", e);
-                                        return Err(anyhow::anyhow!("Client too slow: {}", e));
-                                    }
-                                }
-                            }
-
-                            if let Some(current_gb) = writer.stats_mut().should_warn_large_transfer() {
-                                let notice_msg = format!(
-                                    "Large data transfer: {}GB sent. Consider using LIMIT or CURSOR for very large results.",
-                                    current_gb
-                                );
-                                warn!("Large transfer warning: {}GB sent to client", current_gb);
-                                let notice_bytes = build_notice_message(&notice_msg);
-                                if let Err(e) = writer.write_bytes(&notice_bytes).await {
-                                    debug!("Failed to send large transfer notice: {}", e);
-                                }
-                            }
-
-                            let stats = writer.stats();
-                            if stats.rows_sent % 1_000_000 == 0 && stats.rows_sent > 0 {
-                                info!("Streaming progress: {} rows, {} MB sent", stats.rows_sent, stats.bytes_sent / (1024 * 1024));
+                                writer.flush_with_backpressure().await.map_err(|e| anyhow::anyhow!("Flush error: {}", e))?;
                             }
                         }
                     }
@@ -509,6 +565,39 @@ where
                             streaming_column_types = column_types;
                         }
                         columns_sent = true;
+                    }
+                    StreamingBatch::ArrowBatches(batches) => {
+                        for batch in &batches {
+                            if batch.num_rows() == 0 { continue; }
+
+                            // Encode entire batch in one sync block (encoder is non-Send)
+                            // Single encoder per batch: pre-downcast + cached formatters amortized across all rows
+                            let (encoded_buf, num_rows) = {
+                                let encoder = ArrowBatchEncoder::new(batch, format_codes);
+                                let mut buf = Vec::with_capacity(batch.num_rows() * batch.num_columns() * 24);
+                                for ri in 0..batch.num_rows() {
+                                    encoder.encode_row(ri, batch, &mut buf);
+                                }
+                                (buf, batch.num_rows())
+                            }; // encoder dropped here (before any await)
+
+                            // Single write for entire batch
+                            match writer.write_bytes(&encoded_buf).await {
+                                Ok(_) => {}
+                                Err(e) if is_disconnect_error(&e) => {
+                                    return Err(anyhow::anyhow!("Client disconnected"));
+                                }
+                                Err(e) => return Err(e.into()),
+                            }
+                            for _ in 0..num_rows { writer.row_sent(); }
+
+                            if writer.should_flush() {
+                                writer.flush_with_backpressure().await.map_err(|e| {
+                                    if is_disconnect_error(&e) { anyhow::anyhow!("Client disconnected") }
+                                    else { anyhow::anyhow!("Client too slow: {}", e) }
+                                })?;
+                            }
+                        }
                     }
                     StreamingBatch::Rows(rows) => {
                         for row in rows {

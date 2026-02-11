@@ -26,8 +26,9 @@ pub(crate) struct StreamingPortal {
     pub rows_sent: usize,
     /// Column count for DataRow consistency
     pub column_count: usize,
-    /// Buffer for partial batch consumption (when max_rows < batch size)
-    /// Rows that were read from stream but not yet sent to client
+    /// Pending Arrow batches with start row offset (zero-copy overflow from ArrowBatches path)
+    pub pending_arrow: Vec<(arrow_array::RecordBatch, usize)>,
+    /// Pending string rows (legacy overflow from Rows path)
     pub pending_rows: Vec<Vec<String>>,
 }
 
@@ -50,6 +51,7 @@ impl PortalState {
             columns,
             rows_sent: 0,
             column_count,
+            pending_arrow: Vec::new(),
             pending_rows: Vec::new(),
         })
     }

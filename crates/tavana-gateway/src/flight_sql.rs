@@ -4,14 +4,14 @@
 //! Implements the full Flight SQL protocol for ADBC driver compatibility.
 //!
 //! Protocol: gRPC over HTTP/2
-//! Port: 9091 (configurable, 9091 allowed by Azure Policy)
+//! Port: 443 (default, configurable via FLIGHT_SQL_PORT)
 //!
 //! Clients can use:
 //! - Python: `adbc_driver_flightsql` with `adbc_driver_flightsql.dbapi.connect()`
 //! - Go: `github.com/apache/arrow-adbc/go/adbc/driver/flightsql`
 //! - Java: `org.apache.arrow.adbc:adbc-driver-flight-sql`
-//! - JDBC: `jdbc:arrow-flight-sql://host:9091`
-//! - pyarrow: `pyarrow.flight.connect('grpc://host:9091')`
+//! - JDBC: `jdbc:arrow-flight-sql://host:443`
+//! - pyarrow: `pyarrow.flight.connect('grpc://host:443')`
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray, builder::StringBuilder};
 use arrow_flight::{
@@ -230,6 +230,62 @@ impl TavanaFlightSqlService {
         Ok(vec![batch])
     }
 
+    /// Execute a query and return native Arrow RecordBatches (zero conversion)
+    /// 
+    /// Uses streaming to collect Arrow IPC batches directly from the worker,
+    /// preserving original DuckDB types instead of flattening to Utf8.
+    async fn execute_query_arrow(&self, sql: &str, user: &str) -> Result<(Vec<RecordBatch>, Vec<(String, String)>), Status> {
+        use crate::worker_client::StreamingBatch;
+        
+        let mut stream = self
+            .worker_client
+            .execute_query_streaming(sql, user)
+            .await
+            .map_err(|e| Status::internal(format!("Query failed: {}", e)))?;
+
+        let mut batches = Vec::new();
+        let mut columns_meta = Vec::new();
+
+        while let Some(result) = stream.next().await {
+            match result.map_err(|e| Status::internal(format!("Stream error: {}", e)))? {
+                StreamingBatch::ArrowBatches(arrow_batches) => {
+                    batches.extend(arrow_batches);
+                }
+                StreamingBatch::Metadata { columns, column_types } => {
+                    columns_meta = columns.into_iter().zip(column_types.into_iter()).collect();
+                }
+                StreamingBatch::Rows(rows) => {
+                    // Legacy path: convert string rows to Arrow (same as old execute_query)
+                    if !rows.is_empty() && !columns_meta.is_empty() {
+                        let fields: Vec<Field> = columns_meta.iter()
+                            .map(|(name, _)| Field::new(name, DataType::Utf8, true))
+                            .collect();
+                        let schema = Arc::new(Schema::new(fields));
+                        let arrays: Vec<ArrayRef> = (0..columns_meta.len())
+                            .map(|col_idx| {
+                                let values: Vec<Option<&str>> = rows.iter()
+                                    .map(|row| {
+                                        if col_idx < row.len() {
+                                            let v = &row[col_idx];
+                                            if v == "NULL" { None } else { Some(v.as_str()) }
+                                        } else { None }
+                                    }).collect();
+                                Arc::new(StringArray::from(values)) as ArrayRef
+                            }).collect();
+                        if let Ok(batch) = RecordBatch::try_new(schema, arrays) {
+                            batches.push(batch);
+                        }
+                    }
+                }
+                StreamingBatch::Error(msg) => {
+                    return Err(Status::internal(msg));
+                }
+            }
+        }
+
+        Ok((batches, columns_meta))
+    }
+
     /// Create a Flight stream from record batches
     fn batches_to_stream(
         schema: SchemaRef,
@@ -371,15 +427,15 @@ impl FlightSqlService for TavanaFlightSqlService {
 
         info!("Flight SQL do_get_statement: executing query for handle {}", handle);
 
-        // Execute query
-        let batches = self.execute_query(&sql, &user).await?;
+        // Execute query with native Arrow batches (zero conversion)
+        let (batches, _columns_meta) = self.execute_query_arrow(&sql, &user).await?;
         let schema = if batches.is_empty() {
             Arc::new(Schema::empty())
         } else {
             batches[0].schema()
         };
 
-        info!("Flight SQL do_get_statement: returning {} batches", batches.len());
+        info!("Flight SQL do_get_statement: returning {} batches with native types", batches.len());
 
         // Remove the statement after execution
         self.statements.remove(&handle);
@@ -402,7 +458,7 @@ impl FlightSqlService for TavanaFlightSqlService {
             let sql = statement.sql.clone();
             drop(statement);
             
-            let batches = self.execute_query(&sql, "fallback-user").await?;
+            let (batches, _) = self.execute_query_arrow(&sql, "fallback-user").await?;
             let schema = if batches.is_empty() {
                 Arc::new(Schema::empty())
             } else {
@@ -747,7 +803,7 @@ impl FlightSqlService for TavanaFlightSqlService {
 
         info!("Flight SQL do_get_prepared_statement: executing {}", handle);
 
-        let batches = self.execute_query(&sql, &user).await?;
+        let (batches, _columns_meta) = self.execute_query_arrow(&sql, &user).await?;
         
         // Use stored schema if available, otherwise use schema from results
         // This ensures consistency with get_flight_info_prepared_statement

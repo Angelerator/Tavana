@@ -99,6 +99,13 @@ socket2 = { version = "0.5", features = ["all"] }
 md5 = "0.7"
 rand = { workspace = true }
 
+# Fast number formatting (used in PG wire text encoding hot path)
+itoa = "1"
+ryu = "1"
+
+# Parallel encoding for PG wire (multi-core RecordBatch → DataRow)
+rayon = "1"
+
 # Base64 encoding for Flight SQL auth
 base64 = { workspace = true }
 

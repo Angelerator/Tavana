@@ -208,6 +208,53 @@ impl ActiveCursor {
         (rows, need_more, buffer_exhausted && cursor_exhausted)
     }
     
+    /// Fetch next N rows as Arrow RecordBatch slices (zero-copy, no string conversion)
+    /// Returns (batches, need_more_data, is_exhausted)
+    pub fn fetch_arrow_batches(&self, count: usize) -> (Vec<RecordBatch>, bool, bool) {
+        self.touch();
+
+        if self.exhausted.load(Ordering::Relaxed) {
+            let batches = self.batches.lock();
+            let batch_idx = self.batch_index.load(Ordering::Relaxed);
+            if batch_idx >= batches.len() {
+                return (vec![], false, true);
+            }
+        }
+
+        let batches = self.batches.lock();
+        let mut result = Vec::new();
+        let mut rows_collected = 0usize;
+        let mut batch_idx = self.batch_index.load(Ordering::Relaxed);
+        let mut row_idx = self.row_index.load(Ordering::Relaxed);
+
+        while rows_collected < count && batch_idx < batches.len() {
+            let batch = &batches[batch_idx];
+            let remaining_in_batch = batch.num_rows() - row_idx;
+            let rows_needed = count - rows_collected;
+            let rows_to_take = remaining_in_batch.min(rows_needed);
+
+            // slice() is zero-copy — just adjusts offset and length on the same buffer
+            result.push(batch.slice(row_idx, rows_to_take));
+            rows_collected += rows_to_take;
+            row_idx += rows_to_take;
+
+            if row_idx >= batch.num_rows() {
+                batch_idx += 1;
+                row_idx = 0;
+            }
+        }
+
+        self.batch_index.store(batch_idx, Ordering::Relaxed);
+        self.row_index.store(row_idx, Ordering::Relaxed);
+        self.rows_fetched.fetch_add(rows_collected, Ordering::Relaxed);
+
+        let buffer_exhausted = batch_idx >= batches.len();
+        let cursor_exhausted = self.exhausted.load(Ordering::Relaxed);
+        let need_more = rows_collected < count && buffer_exhausted && !cursor_exhausted;
+
+        (result, need_more, buffer_exhausted && cursor_exhausted)
+    }
+
     /// Legacy fetch method for backwards compatibility
     /// Returns (rows, is_exhausted)
     pub fn fetch(&self, count: usize) -> (Vec<Vec<String>>, bool) {
@@ -551,6 +598,31 @@ impl CursorManager {
         );
 
         Ok((rows, exhausted))
+    }
+
+    /// Fetch Arrow RecordBatch slices from a cursor (zero-copy, no string conversion)
+    pub fn fetch_cursor_arrow(
+        &self,
+        cursor_id: &str,
+        count: usize,
+    ) -> Result<(Vec<RecordBatch>, bool)> {
+        let cursor = self
+            .cursors
+            .get(cursor_id)
+            .ok_or_else(|| anyhow::anyhow!("Cursor '{}' not found", cursor_id))?;
+
+        let (batches, _need_more, exhausted) = cursor.fetch_arrow_batches(count);
+
+        debug!(
+            cursor_id = %cursor_id,
+            batches = batches.len(),
+            rows = batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            exhausted = exhausted,
+            total_fetched = cursor.rows_fetched.load(Ordering::Relaxed),
+            "Cursor arrow fetch completed"
+        );
+
+        Ok((batches, exhausted))
     }
 
     /// Close and remove a cursor

@@ -7,7 +7,7 @@
 use crate::cursors::{self, ConnectionCursors};
 use crate::pg_compat;
 use crate::pg_wire::backpressure::{
-    build_data_row_with_formats, is_disconnect_error,
+    build_data_row_with_formats, build_data_row_from_arrow, is_disconnect_error,
 };
 use crate::query_queue::{QueryOutcome, QueryQueue};
 use crate::query_router::QueryRouter;
@@ -497,7 +497,35 @@ where
 
                             debug!("Extended Protocol - Execute: streaming resume, max_rows={}", max_rows);
 
-                            // Send pending rows first
+                            // Send pending Arrow batches first (zero-copy)
+                            while !portal.pending_arrow.is_empty() && rows_sent_this_batch < max_rows_to_send {
+                                let (batch, start) = portal.pending_arrow.remove(0);
+                                let mut row_idx = start;
+                                while row_idx < batch.num_rows() && rows_sent_this_batch < max_rows_to_send {
+                                    let data_row = build_data_row_from_arrow(&batch, row_idx, &cached_column_types, &result_format_codes);
+                                    bytes_since_flush += data_row.len();
+                                    if let Err(e) = socket.write_all(&data_row).await {
+                                        if is_disconnect_error(&e) { client_disconnected = true; break; }
+                                        return Err(e.into());
+                                    }
+                                    rows_sent_this_batch += 1;
+                                    portal.rows_sent += 1;
+                                    row_idx += 1;
+                                    if bytes_since_flush >= config.flush_threshold_bytes {
+                                        if let Err(e) = socket.flush().await {
+                                            if is_disconnect_error(&e) { client_disconnected = true; break; }
+                                            return Err(e.into());
+                                        }
+                                        bytes_since_flush = 0;
+                                    }
+                                }
+                                // If we didn't finish this batch, put it back
+                                if row_idx < batch.num_rows() {
+                                    portal.pending_arrow.insert(0, (batch, row_idx));
+                                }
+                            }
+
+                            // Send pending string rows (legacy fallback)
                             while !portal.pending_rows.is_empty() && rows_sent_this_batch < max_rows_to_send {
                                 let row = portal.pending_rows.remove(0);
                                 let data_row = build_data_row_with_formats(&row, &cached_column_types, &result_format_codes);
@@ -520,6 +548,35 @@ where
                             // Continue from stream
                             while !client_disconnected && rows_sent_this_batch < max_rows_to_send {
                                 match portal.stream.next().await {
+                                    Some(Ok(StreamingBatch::ArrowBatches(batches))) => {
+                                        for batch in batches {
+                                            let mut row_idx = 0;
+                                            while row_idx < batch.num_rows() {
+                                                if rows_sent_this_batch >= max_rows_to_send {
+                                                    // Store remaining rows as zero-copy Arrow slice
+                                                    let remaining = batch.num_rows() - row_idx;
+                                                    portal.pending_arrow.push((batch.slice(row_idx, remaining), 0));
+                                                    break;
+                                                }
+                                                let data_row = build_data_row_from_arrow(&batch, row_idx, &cached_column_types, &result_format_codes);
+                                                bytes_since_flush += data_row.len();
+                                                if let Err(e) = socket.write_all(&data_row).await {
+                                                    if is_disconnect_error(&e) { client_disconnected = true; break; }
+                                                    return Err(e.into());
+                                                }
+                                                rows_sent_this_batch += 1;
+                                                portal.rows_sent += 1;
+                                                row_idx += 1;
+                                                if bytes_since_flush >= config.flush_threshold_bytes {
+                                                    if let Err(e) = socket.flush().await {
+                                                        if is_disconnect_error(&e) { client_disconnected = true; break; }
+                                                        return Err(e.into());
+                                                    }
+                                                    bytes_since_flush = 0;
+                                                }
+                                            }
+                                        }
+                                    }
                                     Some(Ok(StreamingBatch::Rows(batch_rows))) => {
                                         for row in batch_rows {
                                             if rows_sent_this_batch >= max_rows_to_send {
@@ -558,7 +615,7 @@ where
                             } else if let Some(err) = stream_error {
                                 send_error(socket, &err).await?;
                                 (true, false)
-                            } else if stream_exhausted && portal.pending_rows.is_empty() {
+                            } else if stream_exhausted && portal.pending_arrow.is_empty() && portal.pending_rows.is_empty() {
                                 let cmd_tag = format!("SELECT {}", portal.rows_sent);
                                 send_command_complete(socket, &cmd_tag).await?;
                                 prepared_query = None;
@@ -684,6 +741,7 @@ where
                                 let mut stream_exhausted = false;
                                 let mut stream_error: Option<String> = None;
                                 let mut pending_rows: Vec<Vec<String>> = Vec::new();
+                                let mut pending_arrow_batches: Vec<(arrow_array::RecordBatch, usize)> = Vec::new();
                                 let mut columns: Vec<(String, String)> = Vec::new();
                                 let mut local_column_types: Vec<String> = Vec::new();
 
@@ -695,6 +753,34 @@ where
                                             local_column_types = types.clone();
                                             columns = cols.into_iter().zip(types.into_iter()).collect();
                                             continue;
+                                        }
+                                        Some(Ok(StreamingBatch::ArrowBatches(batches))) => {
+                                            for batch in batches {
+                                                let mut row_idx = 0;
+                                                while row_idx < batch.num_rows() {
+                                                    if rows_sent >= max_rows_to_send {
+                                                        // Store remaining as zero-copy Arrow slice
+                                                        let remaining = batch.num_rows() - row_idx;
+                                                        pending_arrow_batches.push((batch.slice(row_idx, remaining), 0));
+                                                        break;
+                                                    }
+                                                    let data_row = build_data_row_from_arrow(&batch, row_idx, &local_column_types, &result_format_codes);
+                                                    bytes_since_flush += data_row.len();
+                                                    if let Err(e) = socket.write_all(&data_row).await {
+                                                        if is_disconnect_error(&e) { client_disconnected = true; break 'stream_loop; }
+                                                        return Err(e.into());
+                                                    }
+                                                    rows_sent += 1;
+                                                    row_idx += 1;
+                                                    if bytes_since_flush >= config.flush_threshold_bytes {
+                                                        if let Err(e) = socket.flush().await {
+                                                            if is_disconnect_error(&e) { client_disconnected = true; break 'stream_loop; }
+                                                            return Err(e.into());
+                                                        }
+                                                        bytes_since_flush = 0;
+                                                    }
+                                                }
+                                            }
                                         }
                                         Some(Ok(StreamingBatch::Rows(batch_rows))) => {
                                             for row in batch_rows {
@@ -734,7 +820,7 @@ where
                                     send_error(socket, &err).await?;
                                     ignore_till_sync = true;
                                     update_transaction_status!(TRANSACTION_STATUS_ERROR);
-                                } else if stream_exhausted && pending_rows.is_empty() {
+                                } else if stream_exhausted && pending_arrow_batches.is_empty() && pending_rows.is_empty() {
                                     let cmd_tag = format!("SELECT {}", rows_sent);
                                     send_command_complete(socket, &cmd_tag).await?;
                                     socket.flush().await?;
@@ -742,7 +828,8 @@ where
                                 } else {
                                     info!("Extended Protocol - Execute: streaming sent {} rows, storing portal", rows_sent);
                                     portal_state = Some(PortalState::Streaming(StreamingPortal {
-                                        stream, columns, rows_sent, column_count: describe_column_count, pending_rows,
+                                        stream, columns, rows_sent, column_count: describe_column_count,
+                                        pending_arrow: pending_arrow_batches, pending_rows,
                                     }));
                                     socket.write_all(&[b's', 0, 0, 0, 4]).await?; // PortalSuspended
                                     socket.flush().await?;
