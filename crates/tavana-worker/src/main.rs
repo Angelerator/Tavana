@@ -119,14 +119,23 @@ async fn main() -> anyhow::Result<()> {
         args.pool_size
     );
 
-    // Initialize gRPC service
+    // Initialize gRPC service (this performs infrastructure warmup: extensions, credentials)
     let query_service = QueryServiceImpl::new(executor_config)?;
+
+    // Set up gRPC Health service (standard grpc.health.v1.Health)
+    // K8s readiness probe uses this to gate traffic until worker is ready
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+    // Mark the query service as SERVING after warmup is complete
+    health_reporter
+        .set_serving::<QueryServiceServer<QueryServiceImpl>>()
+        .await;
+    info!("gRPC health service: SERVING (extensions loaded, credentials acquired)");
 
     let addr: SocketAddr = format!("0.0.0.0:{}", args.grpc_port).parse()?;
 
     info!("Tavana Worker listening on {}", addr);
 
-    // Start gRPC server with increased message size limits and http2 settings for large results
+    // Start gRPC server with health service + query service
     const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
 
     Server::builder()
@@ -136,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(10)))
         .http2_keepalive_timeout(Some(std::time::Duration::from_secs(60)))
         .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
+        .add_service(health_service)
         .add_service(
             QueryServiceServer::new(query_service)
                 .max_decoding_message_size(MAX_MESSAGE_SIZE)

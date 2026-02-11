@@ -948,14 +948,17 @@ impl DuckDbExecutor {
     /// This function runs at startup to:
     /// 1. Validate Azure connectivity and token
     /// 2. Pre-load Delta extension
-    /// 3. Test a simple delta_scan query (if Azure is configured)
+    /// 3. Acquire Azure credentials (if configured)
     /// 
-    /// Without warmup, the first query from DBeaver/Tableau may fail or be slow
-    /// because it triggers token acquisition, extension loading, etc.
+    /// Extensions are pre-downloaded in the Docker image at build time.
+    /// This function eagerly LOADs them into memory and acquires cloud credentials
+    /// so the first user query doesn't pay the initialization cost.
+    /// 
+    /// Data-specific warmup (Delta metadata caching) happens organically on the
+    /// first query per table — this is standard database behavior (like pg_prewarm).
     fn perform_warmup(&self) {
-        tracing::info!("Performing warmup to prevent cold start issues...");
+        tracing::info!("Performing infrastructure warmup...");
         
-        // Get a connection for warmup
         let pooled_conn = match self.connections.first() {
             Some(conn) => conn,
             None => {
@@ -972,48 +975,32 @@ impl DuckDbExecutor {
             }
         };
         
-        // Step 1: Verify Delta extension is loaded
-        match conn.execute("SELECT * FROM duckdb_extensions() WHERE extension_name = 'delta' AND loaded = true", params![]) {
-            Ok(_) => tracing::info!("Warmup: Delta extension verified"),
-            Err(e) => {
-                tracing::warn!("Warmup: Delta extension check failed: {}. Attempting to load...", e);
-                if let Err(e) = conn.execute("LOAD delta", params![]) {
-                    tracing::warn!("Warmup: Could not load delta extension: {}", e);
-                }
+        // Load core extensions eagerly (pre-downloaded in Docker image)
+        for ext in &["delta", "azure", "httpfs", "icu", "parquet", "json"] {
+            match conn.execute(&format!("LOAD {}", ext), params![]) {
+                Ok(_) => tracing::debug!("Warmup: loaded {} extension", ext),
+                Err(e) => tracing::debug!("Warmup: {} extension not available: {}", ext, e),
             }
         }
+        tracing::info!("Warmup: extensions loaded");
         
-        // Step 2: Verify Azure extension is loaded (if Azure is configured)
+        // Verify Azure credential chain works (if configured)
         if std::env::var("AZURE_STORAGE_ACCOUNT_NAME").is_ok() {
-            match conn.execute("SELECT * FROM duckdb_extensions() WHERE extension_name = 'azure' AND loaded = true", params![]) {
-                Ok(_) => tracing::info!("Warmup: Azure extension verified"),
-                Err(e) => {
-                    tracing::warn!("Warmup: Azure extension check failed: {}. Attempting to load...", e);
-                    if let Err(e) = conn.execute("LOAD azure", params![]) {
-                        tracing::warn!("Warmup: Could not load azure extension: {}", e);
-                    }
-                }
+            // CREATE SECRET triggers the Azure credential chain (managed identity, etc.)
+            // This acquires the token now instead of on the first query
+            match conn.execute(
+                "CREATE SECRET IF NOT EXISTS tavana_warmup (TYPE azure, PROVIDER credential_chain)",
+                params![],
+            ) {
+                Ok(_) => tracing::info!("Warmup: Azure credentials acquired"),
+                Err(e) => tracing::warn!("Warmup: Azure credential check failed (non-fatal): {}", e),
             }
-            
-            // Step 3: Run optional warmup queries from environment
-            // WARMUP_QUERIES: semicolon-separated SQL statements to run at startup
-            // Example: WARMUP_QUERIES="SELECT 1 FROM delta_scan('az://bucket/path/') LIMIT 1"
-            // This is opt-in per deployment - no hardcoded paths in the code
-            if let Ok(warmup_queries) = std::env::var("WARMUP_QUERIES") {
-                for query in warmup_queries.split(';').filter(|q| !q.trim().is_empty()) {
-                    let query = query.trim();
-                    tracing::info!("Warmup: executing '{}'", &query[..query.len().min(80)]);
-                    match conn.execute(query, params![]) {
-                        Ok(_) => tracing::info!("Warmup: query succeeded"),
-                        Err(e) => tracing::warn!("Warmup: query failed (non-fatal): {}", e),
-                    }
-                }
-            }
-        } else {
-            tracing::debug!("Warmup: Azure not configured, skipping Azure-specific warmup");
         }
         
-        tracing::info!("Warmup complete");
+        // Run a trivial query to fully initialize DuckDB's query engine
+        let _ = conn.execute("SELECT 1", params![]);
+        
+        tracing::info!("Warmup: infrastructure ready");
     }
 
     /// Configure S3 for all connections from environment variables

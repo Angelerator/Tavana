@@ -74,4 +74,5 @@ regex = "1.10"
 
 # Hash generation for Delta table aliases
 blake3 = { workspace = true }
+tonic-health = "0.13"
 
