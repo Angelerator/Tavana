@@ -21,7 +21,7 @@
 //! 5. Execute query with streaming (true streaming, OOM-proof)
 //! 6. Complete → release capacity for next query
 
-// Utility modules (new modular structure)
+// Utility modules (extracted protocol helpers)
 pub mod auth;
 pub mod backpressure;
 pub mod config;
@@ -29,9 +29,12 @@ pub mod connection;
 pub mod protocol;
 pub mod query;
 
-// Main server implementation (contains PgWireServer and connection handlers)
-mod server;
+// Modular server implementation (replaces monolithic server.rs)
+pub mod handler;
+
+// Legacy monolithic implementation (kept for reference, not used)
+// mod server;
 
 // Re-export PgWireServer and PgWireConfig as the main public API
-pub use server::PgWireServer;
-pub use server::PgWireConfig;
+pub use handler::PgWireServer;
+pub use handler::PgWireConfig;
