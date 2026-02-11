@@ -1,7 +1,5 @@
 //! PostgreSQL wire protocol definitions
 //!
-//! Contains type mappings, constants, and message builders for the PostgreSQL wire protocol.
+//! Contains type OID and length mappings for DuckDB → PostgreSQL type conversion.
 
-pub mod constants;
-pub mod messages;
 pub mod types;
