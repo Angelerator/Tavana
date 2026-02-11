@@ -45,7 +45,7 @@ Go to **Driver properties** tab and set:
 
 Run a test query:
 ```sql
-SELECT * FROM delta_scan('az://your-storage-container/dev/bronze/...') LIMIT 10000
+SELECT * FROM delta_scan('az://...') LIMIT 10000
 ```
 
 You should see results appearing progressively without memory spikes.
@@ -79,7 +79,7 @@ Add the `TAVANA:UNLIMITED` hint to your query:
 
 ```sql
 -- TAVANA:UNLIMITED
-SELECT * FROM delta_scan('az://your-storage-container/dev/bronze/...');
+SELECT * FROM delta_scan('az://...');
 ```
 
 Or as a block comment:

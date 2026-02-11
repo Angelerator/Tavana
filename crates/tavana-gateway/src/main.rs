@@ -180,6 +180,18 @@ async fn main() -> anyhow::Result<()> {
     // Create worker client (fallback for when pre-sizing is unavailable)
     let worker_client = Arc::new(WorkerClient::new(args.worker_addr.clone()));
 
+    // WARMUP: Pre-establish gRPC connection to worker
+    // This prevents cold start latency on the first user query by eagerly
+    // connecting and warming the HTTP/2 channel, TLS handshake, and worker round-trip
+    {
+        let warmup_client = worker_client.clone();
+        info!("Warming up gRPC connection to worker...");
+        match warmup_client.execute_query("SELECT 1", "warmup").await {
+            Ok(_) => info!("gRPC worker connection warmed up successfully"),
+            Err(e) => warn!("gRPC warmup failed (non-fatal, will retry on first query): {}", e),
+        }
+    }
+
     // Create SHARED QueryQueue for true FIFO queuing with K8s capacity awareness
     // This queue:
     // 1. Never rejects queries (always enqueues)

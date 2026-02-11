@@ -995,25 +995,18 @@ impl DuckDbExecutor {
                 }
             }
             
-            // Step 3: Test Azure connectivity with a simple query
-            // Use a known Delta table path from environment or default
-            let test_path = std::env::var("TAVANA_WARMUP_DELTA_PATH")
-                .unwrap_or_else(|_| "az://your-container/your/delta/table/".to_string());
-            
-            tracing::info!("Warmup: Testing delta_scan connectivity to {}", &test_path[..test_path.len().min(50)]);
-            
-            // Try to read just 1 row to validate the entire pipeline
-            let test_query = format!(
-                "SELECT 1 FROM delta_scan('{}') LIMIT 1",
-                test_path
-            );
-            
-            match conn.execute(&test_query, params![]) {
-                Ok(_) => tracing::info!("Warmup: delta_scan connectivity verified - ready for queries!"),
-                Err(e) => {
-                    tracing::warn!("Warmup: delta_scan test failed: {}. First queries may be slow.", e);
-                    // This is not fatal - the query might fail due to permissions or path issues
-                    // The important thing is that the token was acquired and extensions loaded
+            // Step 3: Run optional warmup queries from environment
+            // WARMUP_QUERIES: semicolon-separated SQL statements to run at startup
+            // Example: WARMUP_QUERIES="SELECT 1 FROM delta_scan('az://bucket/path/') LIMIT 1"
+            // This is opt-in per deployment - no hardcoded paths in the code
+            if let Ok(warmup_queries) = std::env::var("WARMUP_QUERIES") {
+                for query in warmup_queries.split(';').filter(|q| !q.trim().is_empty()) {
+                    let query = query.trim();
+                    tracing::info!("Warmup: executing '{}'", &query[..query.len().min(80)]);
+                    match conn.execute(query, params![]) {
+                        Ok(_) => tracing::info!("Warmup: query succeeded"),
+                        Err(e) => tracing::warn!("Warmup: query failed (non-fatal): {}", e),
+                    }
                 }
             }
         } else {
