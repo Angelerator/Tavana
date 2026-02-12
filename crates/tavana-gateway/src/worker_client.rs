@@ -89,9 +89,27 @@ impl WorkerClient {
         info!("Connecting to worker at {}", self.worker_addr);
         const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
 
+        // HTTP/2 window sizes for high-throughput Arrow IPC streaming.
+        // Default tonic window is 64KB — far too small for analytical data streaming,
+        // causing constant WINDOW_UPDATE frame overhead.
+        let stream_window = std::env::var("TAVANA_GRPC_STREAM_WINDOW_MB")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(2) // 2 MB default
+            * 1024 * 1024;
+        let conn_window = std::env::var("TAVANA_GRPC_CONN_WINDOW_MB")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(4) // 4 MB default
+            * 1024 * 1024;
+
         let channel = Channel::from_shared(self.worker_addr.clone())?
             .timeout(std::time::Duration::from_secs(1800)) // 30 minutes
             .connect_timeout(std::time::Duration::from_secs(30))
+            // HTTP/2 flow control: large windows to avoid WINDOW_UPDATE stalls
+            // during high-throughput Arrow IPC streaming from workers
+            .initial_stream_window_size(stream_window)
+            .initial_connection_window_size(conn_window)
             // TCP keepalive - OS-level connection health check
             .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
             // HTTP/2 keepalive - application-level PING frames for faster detection
@@ -247,14 +265,18 @@ impl WorkerClient {
         let response = client.execute_query(request).await?;
         let mut stream = response.into_inner();
 
-        // Create a SMALL bounded channel for streaming results
-        // This is critical for backpressure: when the client can't consume data fast enough,
-        // the channel fills up, which causes tx.send() to block, which back-pressures the
-        // gRPC stream reader, which back-pressures the worker via gRPC flow control.
+        // Bounded channel for streaming results with backpressure.
+        // When the client can't consume data fast enough, the channel fills up,
+        // which causes tx.send() to block, which back-pressures the gRPC stream
+        // reader, which back-pressures the worker via HTTP/2 flow control.
         //
-        // Channel size of 4 means at most 4 batches buffered between gRPC and client socket.
-        // Each batch is typically 100-1000 rows, so this limits buffering to 400-4000 rows.
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        // With LZ4-compressed Arrow IPC, batches are smaller so a larger buffer
+        // is acceptable. Default: 32 batches (up from 16).
+        let channel_buffer = std::env::var("TAVANA_GRPC_CHANNEL_BUFFER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32usize);
+        let (tx, rx) = tokio::sync::mpsc::channel(channel_buffer);
 
         // Spawn a task to read from gRPC stream and forward to channel
         // TRUE STREAMING with Arrow IPC: 10-100x faster data transfer

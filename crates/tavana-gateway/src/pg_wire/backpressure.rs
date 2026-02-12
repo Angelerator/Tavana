@@ -81,11 +81,12 @@ impl Default for BackpressureConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(500),
 
-            // 64KB write buffer - balances throughput with backpressure responsiveness
+            // 256KB write buffer - larger buffer amortizes syscall overhead for
+            // wide analytical rows (80+ columns) while maintaining backpressure
             write_buffer_size: std::env::var("TAVANA_WRITE_BUFFER_SIZE")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(64 * 1024),
+                .unwrap_or(256 * 1024),
         }
     }
 }

@@ -605,20 +605,49 @@ fn serialize_batch_to_flight_format(batch: &duckdb::arrow::array::RecordBatch) -
     }
 }
 
-/// Serialize a RecordBatch to Arrow IPC streaming format
+/// Get the configured IPC compression type from environment.
+///
+/// Supports: "lz4" (default), "zstd", "none"
+/// LZ4 decompresses at ~1 GB/s per core with negligible CPU overhead.
+/// ZSTD gives 15-20% better compression than LZ4 at slightly higher CPU cost.
+fn ipc_compression() -> Option<arrow_ipc::CompressionType> {
+    match std::env::var("TAVANA_IPC_COMPRESSION")
+        .unwrap_or_else(|_| "lz4".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "none" | "off" | "false" => None,
+        "zstd" => Some(arrow_ipc::CompressionType::ZSTD),
+        _ => Some(arrow_ipc::CompressionType::LZ4_FRAME), // default: lz4
+    }
+}
+
+/// Build IPC write options with the configured compression.
+fn ipc_write_options() -> arrow_ipc::writer::IpcWriteOptions {
+    let compression = ipc_compression();
+    arrow_ipc::writer::IpcWriteOptions::try_new(8, false, arrow_ipc::MetadataVersion::V5)
+        .and_then(|opts| opts.try_with_compression(compression))
+        .unwrap_or_default()
+}
+
+/// Serialize a RecordBatch to Arrow IPC streaming format with LZ4 compression.
 /// 
 /// Arrow IPC is ~10-50x faster than JSON serialization because:
 /// - No per-cell string conversion (preserves native typed data)
 /// - Near zero-copy serialization of columnar buffers
 /// - Gateway can deserialize with matching arrow-rs v56
+///
+/// LZ4 compression reduces wire bytes by 2-5x with <1ms/MB overhead.
 fn serialize_batch_to_arrow_ipc(batch: &duckdb::arrow::array::RecordBatch) -> Vec<u8> {
-    use duckdb::arrow::ipc::writer::StreamWriter;
+    use arrow_ipc::writer::StreamWriter;
+
+    let options = ipc_write_options();
     
     // Pre-allocate: ~8 bytes per cell + schema overhead is a reasonable estimate
     let estimated_size = batch.num_rows() * batch.num_columns() * 8 + 1024;
     let mut buf = Vec::with_capacity(estimated_size);
     let schema = batch.schema();
-    match StreamWriter::try_new(&mut buf, &schema) {
+    match StreamWriter::try_new_with_options(&mut buf, &schema, options) {
         Ok(mut writer) => {
             if let Err(e) = writer.write(batch) {
                 tracing::warn!("Arrow IPC write failed, falling back to JSON: {}", e);

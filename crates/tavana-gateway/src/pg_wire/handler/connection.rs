@@ -20,7 +20,12 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
-/// Configure TCP keepalive on a socket for faster dead connection detection
+/// Configure TCP socket options for analytical workloads.
+///
+/// Sets:
+/// - TCP_NODELAY: Disable Nagle's algorithm for lower latency
+/// - SO_SNDBUF: Larger send buffer for high-throughput streaming (default: 1 MB)
+/// - TCP keepalive: Detect dead connections
 pub(crate) fn configure_tcp_keepalive(stream: &tokio::net::TcpStream, keepalive_secs: u64) {
     use socket2::SockRef;
 
@@ -29,6 +34,16 @@ pub(crate) fn configure_tcp_keepalive(stream: &tokio::net::TcpStream, keepalive_
     }
 
     let socket = SockRef::from(stream);
+
+    // Increase TCP send buffer for high-throughput analytical streaming.
+    // Default OS buffer (~128KB) is too small for wide-row analytical results.
+    let send_buf_size: usize = std::env::var("TAVANA_TCP_SEND_BUFFER_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024 * 1024); // 1 MB default
+    if let Err(e) = socket.set_send_buffer_size(send_buf_size) {
+        warn!("Failed to set SO_SNDBUF to {}: {}", send_buf_size, e);
+    }
 
     if let Err(e) = socket.set_keepalive(true) {
         warn!("Failed to enable TCP keepalive: {}", e);
@@ -45,7 +60,7 @@ pub(crate) fn configure_tcp_keepalive(stream: &tokio::net::TcpStream, keepalive_
     if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
         warn!("Failed to configure TCP keepalive timing: {}", e);
     } else {
-        debug!("TCP keepalive configured: {}s", keepalive_secs);
+        debug!("TCP configured: keepalive={}s, sndbuf={}KB", keepalive_secs, send_buf_size / 1024);
     }
 }
 

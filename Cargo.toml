@@ -31,7 +31,7 @@ arrow = "56"
 arrow-flight = { version = "56", features = ["flight-sql-experimental"] }
 arrow-schema = "56"
 arrow-array = "56"
-arrow-ipc = { version = "56", features = ["lz4"] }
+arrow-ipc = { version = "56", features = ["lz4", "zstd"] }
 
 # PostgreSQL wire protocol
 pgwire = "0.28"
