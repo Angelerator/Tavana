@@ -601,6 +601,7 @@ where
                                         }
                                     }
                                     Some(Ok(StreamingBatch::Metadata { .. })) => continue,
+                                    Some(Ok(StreamingBatch::FlightData { .. })) => { /* Flight SQL only, skip in PG wire */ }
                                     Some(Ok(StreamingBatch::Error(msg))) => { stream_error = Some(msg); break; }
                                     Some(Err(e)) => { stream_error = Some(e.to_string()); break; }
                                     None => { stream_exhausted = true; break; }
@@ -804,6 +805,7 @@ where
                                                 }
                                             }
                                         }
+                                        Some(Ok(StreamingBatch::FlightData { .. })) => { /* Flight SQL only, skip in PG wire */ }
                                         Some(Ok(StreamingBatch::Error(msg))) => { stream_error = Some(msg); break; }
                                         Some(Err(e)) => { stream_error = Some(e.to_string()); break; }
                                         None => { stream_exhausted = true; break; }

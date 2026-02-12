@@ -205,13 +205,16 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                 // TRUE STREAMING: batches are sent as they're produced, never buffered
                 total_rows += batch.num_rows() as u64;
                 
-                // Use Arrow IPC serialization for high-performance data transfer
+                // Dual format: IPC stream (for PG wire) + split header/body (for Flight SQL passthrough)
                 let ipc_data = serialize_batch_to_arrow_ipc(&batch);
+                let (ipc_header, ipc_body) = serialize_batch_to_flight_format(&batch);
                 
                 let arrow_batch = proto::ArrowRecordBatch {
-                    schema: vec![], // Schema sent in metadata
+                    schema: vec![],
                     data: ipc_data,
                     row_count: batch.num_rows() as u64,
+                    ipc_header,
+                    ipc_body,
                 };
 
                 // blocking_send: efficient for spawn_blocking (no nested async overhead)
@@ -503,6 +506,8 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                             schema: vec![],
                             data: ipc_data,
                             row_count: batch.num_rows() as u64,
+                            ipc_header: vec![],
+                            ipc_body: vec![],
                         };
 
                         let _ = tx
@@ -571,6 +576,31 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                 success: false,
                 message: format!("Cursor '{}' not found", req.cursor_id),
             }))
+        }
+    }
+}
+
+/// Serialize a RecordBatch to FlightData-compatible split format (header + body).
+/// 
+/// Produces the exact bytes that FlightData.data_header and FlightData.data_body need,
+/// enabling zero-copy passthrough in the gateway for Flight SQL clients.
+/// The gateway can forward these directly without deserializing to RecordBatch.
+fn serialize_batch_to_flight_format(batch: &duckdb::arrow::array::RecordBatch) -> (Vec<u8>, Vec<u8>) {
+    use duckdb::arrow::ipc::writer::{IpcDataGenerator, IpcWriteOptions, DictionaryTracker};
+    
+    let gen = IpcDataGenerator::default();
+    let mut tracker = DictionaryTracker::new(false);
+    let write_options = IpcWriteOptions::default();
+    
+    match gen.encoded_batch(batch, &mut tracker, &write_options) {
+        Ok((_encoded_dicts, encoded_batch)) => {
+            // encoded_batch.ipc_message = Flatbuffer Message header
+            // encoded_batch.arrow_data = Raw buffer data
+            (encoded_batch.ipc_message, encoded_batch.arrow_data)
+        }
+        Err(e) => {
+            tracing::warn!("Flight format serialization failed: {}", e);
+            (vec![], vec![])
         }
     }
 }

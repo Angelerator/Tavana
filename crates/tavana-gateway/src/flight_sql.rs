@@ -277,6 +277,7 @@ impl TavanaFlightSqlService {
                         }
                     }
                 }
+                StreamingBatch::FlightData { .. } => { /* Handled in Flight SQL streaming path */ }
                 StreamingBatch::Error(msg) => {
                     return Err(Status::internal(msg));
                 }
@@ -467,13 +468,14 @@ impl FlightSqlService for TavanaFlightSqlService {
                     break; // Got first data, start streaming
                 }
                 StreamingBatch::Rows(_) => {} // Skip legacy
+                StreamingBatch::FlightData { .. } => { /* Handled in Flight SQL streaming path */ }
                 StreamingBatch::Error(msg) => return Err(Status::internal(msg)),
             }
         }
 
         let schema = schema.unwrap_or_else(|| Arc::new(Schema::empty()));
 
-        // Direct stream adapter (same zero-channel pattern as do_get_prepared_statement)
+        // Stream via FlightDataEncoderBuilder (same pattern as do_get_prepared_statement)
         let first_batches: std::collections::VecDeque<RecordBatch> = first_batches.into();
         let batch_stream = futures::stream::try_unfold(
             (worker_stream, first_batches),
@@ -490,6 +492,7 @@ impl FlightSqlService for TavanaFlightSqlService {
                                 return Ok(Some((first, (ws, iter))));
                             }
                         }
+                        Some(Ok(StreamingBatch::FlightData { .. })) => continue,
                         Some(Ok(StreamingBatch::Metadata { .. })) | Some(Ok(StreamingBatch::Rows(_))) => continue,
                         Some(Ok(StreamingBatch::Error(msg))) => return Err(FlightError::ExternalError(msg.into())),
                         Some(Err(e)) => return Err(FlightError::ExternalError(e.into())),
@@ -902,6 +905,7 @@ impl FlightSqlService for TavanaFlightSqlService {
                     break;
                 }
                 StreamingBatch::Rows(_) => {}
+                StreamingBatch::FlightData { .. } => { /* Handled in Flight SQL streaming path */ }
                 StreamingBatch::Error(msg) => return Err(Status::internal(msg)),
             }
         }
@@ -912,17 +916,14 @@ impl FlightSqlService for TavanaFlightSqlService {
             detected_schema.unwrap_or_else(|| Arc::new(Schema::empty()))
         };
 
-        // Direct stream adapter: no second channel, no spawned task.
-        // try_unfold pulls from worker_stream on-demand as FlightDataEncoder consumes.
-        // State = (worker_stream, pending_batches_from_current_message)
+        // Stream RecordBatches via FlightDataEncoderBuilder (handles schema automatically)
+        // Uses ArrowBatches (deserialized in gateway) — schema-compatible with arrow-rs
         let batch_stream = futures::stream::try_unfold(
             (worker_stream, first_batches),
             |(mut ws, mut pending)| async move {
-                // Drain pending batches first (from multi-batch messages)
                 if let Some(batch) = pending.pop_front() {
                     return Ok(Some((batch, (ws, pending))));
                 }
-                // Pull from worker stream
                 use crate::worker_client::StreamingBatch;
                 loop {
                     match ws.next().await {
@@ -932,20 +933,16 @@ impl FlightSqlService for TavanaFlightSqlService {
                                 return Ok(Some((first, (ws, iter))));
                             }
                         }
+                        Some(Ok(StreamingBatch::FlightData { .. })) => continue, // Skip passthrough, use ArrowBatches
                         Some(Ok(StreamingBatch::Metadata { .. })) | Some(Ok(StreamingBatch::Rows(_))) => continue,
-                        Some(Ok(StreamingBatch::Error(msg))) => {
-                            return Err(FlightError::ExternalError(msg.into()));
-                        }
-                        Some(Err(e)) => {
-                            return Err(FlightError::ExternalError(e.into()));
-                        }
-                        None => return Ok(None), // Worker stream ended
+                        Some(Ok(StreamingBatch::Error(msg))) => return Err(FlightError::ExternalError(msg.into())),
+                        Some(Err(e)) => return Err(FlightError::ExternalError(e.into())),
+                        None => return Ok(None),
                     }
                 }
             },
         );
 
-        // No compression — Arrow buffers pass through with minimal overhead
         let flight_data_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(batch_stream)

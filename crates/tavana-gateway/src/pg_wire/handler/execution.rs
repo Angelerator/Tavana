@@ -140,6 +140,7 @@ where
                             }
                         }
                     }
+                    StreamingBatch::FlightData { .. } => { /* Flight SQL only, skip in PG wire */ }
                     StreamingBatch::Error(msg) => {
                         return Err(anyhow::anyhow!("{}", msg));
                     }
@@ -646,6 +647,7 @@ where
                             }
                         }
                     }
+                    StreamingBatch::FlightData { .. } => { /* Flight SQL only, skip in PG wire */ }
                     StreamingBatch::Error(msg) => {
                         return Err(anyhow::anyhow!("{}", msg));
                     }
