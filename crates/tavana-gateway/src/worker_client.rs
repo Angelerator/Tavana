@@ -37,6 +37,12 @@ pub enum StreamingBatch {
     },
     /// Arrow RecordBatches for zero-copy PG wire encoding
     ArrowBatches(Vec<arrow_array::RecordBatch>),
+    /// Pre-encoded FlightData (header+body) for zero-copy Flight SQL passthrough.
+    /// Eliminates the double IPC serialization: worker encodes once, gateway forwards directly.
+    FlightData {
+        ipc_header: bytes::Bytes,
+        ipc_body: bytes::Bytes,
+    },
     /// Rows as string values (legacy fallback for COPY, cursors, etc.)
     Rows(Vec<Vec<String>>),
     Error(String),
@@ -263,12 +269,28 @@ impl WorkerClient {
                         })
                     }
                     Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
-                        if !batch.data.is_empty() {
-                            // Try Arrow IPC first (primary format)
+                        // Check for FlightData passthrough format first (zero-copy for Flight SQL)
+                        if !batch.ipc_header.is_empty() && !batch.ipc_body.is_empty() {
+                            // Send FlightData passthrough for Flight SQL
+                            let flight_result = Ok(StreamingBatch::FlightData {
+                                ipc_header: batch.ipc_header.into(),
+                                ipc_body: batch.ipc_body.into(),
+                            });
+                            if tx.send(flight_result).await.is_err() { break; }
+                            // Also send ArrowBatches for PG wire (deserialized from legacy data)
+                            if !batch.data.is_empty() {
+                                match deserialize_arrow_ipc(&batch.data) {
+                                    Ok(record_batches) => Ok(StreamingBatch::ArrowBatches(record_batches)),
+                                    Err(_) => continue,
+                                }
+                            } else {
+                                continue;
+                            }
+                        } else if !batch.data.is_empty() {
+                            // Legacy path: Arrow IPC stream bytes
                             match deserialize_arrow_ipc(&batch.data) {
                                 Ok(record_batches) => Ok(StreamingBatch::ArrowBatches(record_batches)),
                                 Err(_) => {
-                                    // Fallback to JSON for backward compatibility (cursor path)
                                     match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
                                         Ok(rows) => Ok(StreamingBatch::Rows(rows)),
                                         Err(e) => Err(anyhow::anyhow!("Failed to decode batch: {}", e)),
