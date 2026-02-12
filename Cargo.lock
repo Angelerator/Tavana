@@ -319,6 +319,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "flatbuffers",
+ "lz4_flex",
 ]
 
 [[package]]

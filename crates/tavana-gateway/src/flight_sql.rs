@@ -473,41 +473,32 @@ impl FlightSqlService for TavanaFlightSqlService {
 
         let schema = schema.unwrap_or_else(|| Arc::new(Schema::empty()));
 
-        // Create a channel-based stream that forwards remaining batches
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, FlightError>>(16);
-
-        // Send first batches through channel
-        let tx_clone = tx.clone();
-        for batch in first_batches {
-            let _ = tx_clone.send(Ok(batch)).await;
-        }
-
-        // Spawn task to forward remaining worker batches to channel
-        tokio::spawn(async move {
-            use crate::worker_client::StreamingBatch;
-            while let Some(result) = worker_stream.next().await {
-                match result {
-                    Ok(StreamingBatch::ArrowBatches(batches)) => {
-                        for batch in batches {
-                            if tx.send(Ok(batch)).await.is_err() { return; }
+        // Direct stream adapter (same zero-channel pattern as do_get_prepared_statement)
+        let first_batches: std::collections::VecDeque<RecordBatch> = first_batches.into();
+        let batch_stream = futures::stream::try_unfold(
+            (worker_stream, first_batches),
+            |(mut ws, mut pending)| async move {
+                if let Some(batch) = pending.pop_front() {
+                    return Ok(Some((batch, (ws, pending))));
+                }
+                use crate::worker_client::StreamingBatch;
+                loop {
+                    match ws.next().await {
+                        Some(Ok(StreamingBatch::ArrowBatches(batches))) => {
+                            let mut iter = batches.into_iter().collect::<std::collections::VecDeque<_>>();
+                            if let Some(first) = iter.pop_front() {
+                                return Ok(Some((first, (ws, iter))));
+                            }
                         }
-                    }
-                    Ok(StreamingBatch::Rows(_)) | Ok(StreamingBatch::Metadata { .. }) => {}
-                    Ok(StreamingBatch::Error(msg)) => {
-                        let _ = tx.send(Err(FlightError::ExternalError(msg.into()))).await;
-                        return;
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(FlightError::ExternalError(e.into()))).await;
-                        return;
+                        Some(Ok(StreamingBatch::Metadata { .. })) | Some(Ok(StreamingBatch::Rows(_))) => continue,
+                        Some(Ok(StreamingBatch::Error(msg))) => return Err(FlightError::ExternalError(msg.into())),
+                        Some(Err(e)) => return Err(FlightError::ExternalError(e.into())),
+                        None => return Ok(None),
                     }
                 }
-            }
-            // tx dropped here, closing the channel
-        });
+            },
+        );
 
-        // Convert channel receiver to a Stream for FlightDataEncoder
-        let batch_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let flight_data_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(batch_stream)
@@ -857,10 +848,13 @@ impl FlightSqlService for TavanaFlightSqlService {
         Ok(Response::new(flight_info))
     }
 
-    /// Execute prepared statement and stream results
+    /// Execute prepared statement and stream results directly from worker.
     /// 
-    /// Uses the schema stored during prepared statement creation for consistency
-    /// with get_flight_info_prepared_statement, as required by Flight SQL spec.
+    /// Uses a zero-channel design: adapts the worker stream directly into the
+    /// FlightData output stream via try_unfold. No intermediate channel, no
+    /// spawned task — the FlightDataEncoder pulls batches on-demand from the
+    /// single worker_client channel. This eliminates the cascading backpressure
+    /// deadlock that occurred with a second channel.
     async fn do_get_prepared_statement(
         &self,
         cmd: CommandPreparedStatementQuery,
@@ -874,21 +868,90 @@ impl FlightSqlService for TavanaFlightSqlService {
             .map(|ps| (ps.sql.clone(), ps.schema.clone()))
             .ok_or_else(|| Status::not_found(format!("Prepared statement {} not found", handle)))?;
 
-        info!("Flight SQL do_get_prepared_statement: executing {}", handle);
+        info!("Flight SQL do_get_prepared_statement: streaming {}", handle);
 
-        let (batches, _columns_meta) = self.execute_query_arrow(&sql, &user).await?;
-        
-        // Use stored schema if available, otherwise use schema from results
-        // This ensures consistency with get_flight_info_prepared_statement
+        // Start worker stream (single channel between worker gRPC and us)
+        let mut worker_stream = self.worker_client
+            .execute_query_streaming(&sql, &user)
+            .await
+            .map_err(|e| Status::internal(format!("Query failed: {}", e)))?;
+
+        // Read until first batch to determine schema
+        let mut first_batches: std::collections::VecDeque<RecordBatch> = std::collections::VecDeque::new();
+        let mut detected_schema: Option<SchemaRef> = None;
+
+        while let Some(result) = worker_stream.next().await {
+            use crate::worker_client::StreamingBatch;
+            match result.map_err(|e| Status::internal(e.to_string()))? {
+                StreamingBatch::Metadata { columns, column_types } => {
+                    if detected_schema.is_none() && !columns.is_empty() {
+                        let fields: Vec<Field> = columns.iter()
+                            .zip(column_types.iter())
+                            .map(|(name, type_name)| {
+                                Field::new(name, map_duckdb_type_to_arrow(type_name), true)
+                            })
+                            .collect();
+                        detected_schema = Some(Arc::new(Schema::new(fields)));
+                    }
+                }
+                StreamingBatch::ArrowBatches(batches) => {
+                    if detected_schema.is_none() && !batches.is_empty() {
+                        detected_schema = Some(batches[0].schema());
+                    }
+                    first_batches.extend(batches);
+                    break;
+                }
+                StreamingBatch::Rows(_) => {}
+                StreamingBatch::Error(msg) => return Err(Status::internal(msg)),
+            }
+        }
+
         let schema = if !stored_schema.fields().is_empty() {
             stored_schema
-        } else if batches.is_empty() {
-            Arc::new(Schema::empty())
         } else {
-            batches[0].schema()
+            detected_schema.unwrap_or_else(|| Arc::new(Schema::empty()))
         };
 
-        Ok(Response::new(Self::batches_to_stream(schema, batches)))
+        // Direct stream adapter: no second channel, no spawned task.
+        // try_unfold pulls from worker_stream on-demand as FlightDataEncoder consumes.
+        // State = (worker_stream, pending_batches_from_current_message)
+        let batch_stream = futures::stream::try_unfold(
+            (worker_stream, first_batches),
+            |(mut ws, mut pending)| async move {
+                // Drain pending batches first (from multi-batch messages)
+                if let Some(batch) = pending.pop_front() {
+                    return Ok(Some((batch, (ws, pending))));
+                }
+                // Pull from worker stream
+                use crate::worker_client::StreamingBatch;
+                loop {
+                    match ws.next().await {
+                        Some(Ok(StreamingBatch::ArrowBatches(batches))) => {
+                            let mut iter = batches.into_iter().collect::<std::collections::VecDeque<_>>();
+                            if let Some(first) = iter.pop_front() {
+                                return Ok(Some((first, (ws, iter))));
+                            }
+                        }
+                        Some(Ok(StreamingBatch::Metadata { .. })) | Some(Ok(StreamingBatch::Rows(_))) => continue,
+                        Some(Ok(StreamingBatch::Error(msg))) => {
+                            return Err(FlightError::ExternalError(msg.into()));
+                        }
+                        Some(Err(e)) => {
+                            return Err(FlightError::ExternalError(e.into()));
+                        }
+                        None => return Ok(None), // Worker stream ended
+                    }
+                }
+            },
+        );
+
+        // No compression — Arrow buffers pass through with minimal overhead
+        let flight_data_stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(batch_stream)
+            .map(|r| r.map_err(|e| Status::internal(format!("Encoding error: {}", e))));
+
+        Ok(Response::new(Box::pin(flight_data_stream)))
     }
 
     /// Execute update statement
