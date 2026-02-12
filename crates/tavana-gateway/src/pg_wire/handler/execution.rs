@@ -31,6 +31,55 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tonic::transport::Channel;
 use tracing::{debug, error, info, warn};
 
+/// Module-level gRPC channel cache for `execute_to_worker`.
+///
+/// Avoids creating a new TCP + HTTP/2 connection for every routed query.
+/// Channels are keyed by worker address and reused across queries.
+/// Tonic channels handle reconnection automatically if the connection drops.
+fn channel_cache() -> &'static dashmap::DashMap<String, Channel> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<dashmap::DashMap<String, Channel>> = OnceLock::new();
+    CACHE.get_or_init(dashmap::DashMap::new)
+}
+
+/// Get or create a gRPC channel to a worker address with HTTP/2 tuning.
+async fn get_worker_channel(worker_addr: &str) -> anyhow::Result<Channel> {
+    let cache = channel_cache();
+
+    if let Some(ch) = cache.get(worker_addr) {
+        return Ok(ch.clone());
+    }
+
+    // HTTP/2 window sizes matching the tuned WorkerClient settings
+    let stream_window = std::env::var("TAVANA_GRPC_STREAM_WINDOW_MB")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(2)
+        * 1024 * 1024;
+    let conn_window = std::env::var("TAVANA_GRPC_CONN_WINDOW_MB")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(4)
+        * 1024 * 1024;
+
+    let channel = Channel::from_shared(worker_addr.to_string())?
+        .timeout(std::time::Duration::from_secs(1800))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .initial_stream_window_size(stream_window)
+        .initial_connection_window_size(conn_window)
+        .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
+        .http2_keep_alive_interval(std::time::Duration::from_secs(10))
+        .keep_alive_timeout(std::time::Duration::from_secs(20))
+        .keep_alive_while_idle(true)
+        .connect()
+        .await?;
+
+    cache.insert(worker_addr.to_string(), channel.clone());
+    info!("Cached gRPC channel to worker {} (pool size: {})", worker_addr, cache.len());
+
+    Ok(channel)
+}
+
 /// Execute a simple query (handles PG commands, COPY, routing)
 ///
 /// This is the main entry point for simple query execution from the query loop.
@@ -361,15 +410,8 @@ where
 
     const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024;
 
-    let channel = Channel::from_shared(worker_addr.to_string())?
-        .timeout(std::time::Duration::from_secs(1800))
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
-        .http2_keep_alive_interval(std::time::Duration::from_secs(10))
-        .keep_alive_timeout(std::time::Duration::from_secs(20))
-        .keep_alive_while_idle(true)
-        .connect()
-        .await?;
+    // Reuse cached gRPC channel (avoids TCP+HTTP/2 handshake per query)
+    let channel = get_worker_channel(worker_addr).await?;
 
     let mut client = proto::query_service_client::QueryServiceClient::new(channel)
         .max_decoding_message_size(MAX_MESSAGE_SIZE)
@@ -427,57 +469,63 @@ where
                     };
 
                     if let Some(record_batches) = arrow_batches {
-                        // Arrow IPC path: direct RecordBatch → PG DataRow
+                        // Batch-level encoding: ArrowBatchEncoder pre-downcasts arrays once,
+                        // encodes all rows into a single buffer, then writes the whole buffer.
+                        // Eliminates per-row function calls, allocations, and flush checks.
                         for rb in &record_batches {
-                            for row_idx in 0..rb.num_rows() {
-                                let data_row = build_data_row_from_arrow(rb, row_idx, &streaming_column_types, format_codes);
+                            if rb.num_rows() == 0 { continue; }
 
-                                match writer.write_bytes(&data_row).await {
-                                    Ok(_) => {}
+                            let (encoded_buf, num_rows) = {
+                                let encoder = ArrowBatchEncoder::new(rb, format_codes);
+                                let mut buf = Vec::with_capacity(rb.num_rows() * rb.num_columns() * 24);
+                                for ri in 0..rb.num_rows() {
+                                    encoder.encode_row(ri, rb, &mut buf);
+                                }
+                                (buf, rb.num_rows())
+                            }; // encoder dropped here (before any await)
+
+                            // Single write for entire batch
+                            match writer.write_bytes(&encoded_buf).await {
+                                Ok(_) => {}
+                                Err(e) if is_disconnect_error(&e) => {
+                                    let stats = writer.stats();
+                                    warn!("Client disconnected during streaming after {} rows, {} bytes", stats.rows_sent, stats.bytes_sent);
+                                    return Err(anyhow::anyhow!("Client disconnected"));
+                                }
+                                Err(e) => return Err(e.into()),
+                            }
+                            for _ in 0..num_rows { writer.row_sent(); }
+
+                            if writer.should_flush() {
+                                match writer.flush_with_backpressure().await {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        let stats = writer.stats();
+                                        debug!("Slow client detected after {} rows", stats.rows_sent);
+                                    }
                                     Err(e) if is_disconnect_error(&e) => {
                                         let stats = writer.stats();
-                                        warn!("Client disconnected during streaming after {} rows, {} bytes", stats.rows_sent, stats.bytes_sent);
+                                        warn!("Client disconnected during flush after {} rows", stats.rows_sent);
                                         return Err(anyhow::anyhow!("Client disconnected"));
                                     }
-                                    Err(e) => return Err(e.into()),
-                                }
-                                writer.row_sent();
-
-                                if writer.should_flush() {
-                                    match writer.flush_with_backpressure().await {
-                                        Ok(true) => {}
-                                        Ok(false) => {
-                                            let stats = writer.stats();
-                                            debug!("Slow client detected after {} rows", stats.rows_sent);
-                                        }
-                                        Err(e) if is_disconnect_error(&e) => {
-                                            let stats = writer.stats();
-                                            warn!("Client disconnected during flush after {} rows", stats.rows_sent);
-                                            return Err(anyhow::anyhow!("Client disconnected"));
-                                        }
-                                        Err(e) => {
-                                            warn!("Flush failed: {} - client may be overwhelmed", e);
-                                            return Err(anyhow::anyhow!("Client too slow: {}", e));
-                                        }
+                                    Err(e) => {
+                                        warn!("Flush failed: {} - client may be overwhelmed", e);
+                                        return Err(anyhow::anyhow!("Client too slow: {}", e));
                                     }
                                 }
+                            }
 
-                                if let Some(current_gb) = writer.stats_mut().should_warn_large_transfer() {
-                                    let notice_msg = format!(
-                                        "Large data transfer: {}GB sent. Consider using LIMIT or CURSOR for very large results.",
-                                        current_gb
-                                    );
-                                    warn!("Large transfer warning: {}GB sent to client", current_gb);
-                                    let notice_bytes = build_notice_message(&notice_msg);
-                                    if let Err(e) = writer.write_bytes(&notice_bytes).await {
-                                        debug!("Failed to send large transfer notice: {}", e);
-                                    }
-                                }
+                            if let Some(current_gb) = writer.stats_mut().should_warn_large_transfer() {
+                                warn!("Large transfer warning: {}GB sent to client", current_gb);
+                                let notice_bytes = build_notice_message(&format!(
+                                    "Large data transfer: {}GB sent. Consider using LIMIT or CURSOR for very large results.", current_gb
+                                ));
+                                let _ = writer.write_bytes(&notice_bytes).await;
+                            }
 
-                                let stats = writer.stats();
-                                if stats.rows_sent % 1_000_000 == 0 && stats.rows_sent > 0 {
-                                    info!("Streaming progress: {} rows, {} MB sent", stats.rows_sent, stats.bytes_sent / (1024 * 1024));
-                                }
+                            let stats = writer.stats();
+                            if stats.rows_sent % 1_000_000 == 0 && stats.rows_sent > 0 {
+                                info!("Streaming progress: {} rows, {} MB sent", stats.rows_sent, stats.bytes_sent / (1024 * 1024));
                             }
                         }
                     } else if let Ok(rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
