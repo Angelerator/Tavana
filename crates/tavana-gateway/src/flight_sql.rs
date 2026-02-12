@@ -409,7 +409,10 @@ impl FlightSqlService for TavanaFlightSqlService {
         Ok(Response::new(flight_info))
     }
 
-    /// Execute statement and stream results
+    /// Execute statement and stream results directly from worker (true streaming).
+    /// 
+    /// Data flows: Worker → gRPC → Arrow IPC → RecordBatch → FlightData → Client
+    /// No intermediate buffering — batches are forwarded as they arrive.
     #[instrument(skip(self, request))]
     async fn do_get_statement(
         &self,
@@ -425,22 +428,92 @@ impl FlightSqlService for TavanaFlightSqlService {
             .map(|s| s.sql.clone())
             .ok_or_else(|| Status::not_found(format!("Statement {} not found", handle)))?;
 
-        info!("Flight SQL do_get_statement: executing query for handle {}", handle);
+        info!("Flight SQL do_get_statement: streaming query for handle {}", handle);
 
-        // Execute query with native Arrow batches (zero conversion)
-        let (batches, _columns_meta) = self.execute_query_arrow(&sql, &user).await?;
-        let schema = if batches.is_empty() {
-            Arc::new(Schema::empty())
-        } else {
-            batches[0].schema()
-        };
-
-        info!("Flight SQL do_get_statement: returning {} batches with native types", batches.len());
-
-        // Remove the statement after execution
+        // Remove statement early (we have the SQL)
         self.statements.remove(&handle);
 
-        Ok(Response::new(Self::batches_to_stream(schema, batches)))
+        // Start worker stream
+        let mut worker_stream = self.worker_client
+            .execute_query_streaming(&sql, &user)
+            .await
+            .map_err(|e| Status::internal(format!("Query failed: {}", e)))?;
+
+        // Read first batch to get schema, then stream the rest
+        let mut first_batches: Vec<RecordBatch> = Vec::new();
+        let mut schema: Option<SchemaRef> = None;
+
+        // Drain until we get schema (from metadata or first batch)
+        while let Some(result) = worker_stream.next().await {
+            use crate::worker_client::StreamingBatch;
+            match result.map_err(|e| Status::internal(e.to_string()))? {
+                StreamingBatch::Metadata { columns, column_types } => {
+                    if schema.is_none() && !columns.is_empty() {
+                        // Build schema with native types from DuckDB metadata
+                        let fields: Vec<Field> = columns.iter()
+                            .zip(column_types.iter())
+                            .map(|(name, type_name)| {
+                                Field::new(name, map_duckdb_type_to_arrow(type_name), true)
+                            })
+                            .collect();
+                        schema = Some(Arc::new(Schema::new(fields)));
+                    }
+                }
+                StreamingBatch::ArrowBatches(batches) => {
+                    if schema.is_none() && !batches.is_empty() {
+                        schema = Some(batches[0].schema());
+                    }
+                    first_batches.extend(batches);
+                    break; // Got first data, start streaming
+                }
+                StreamingBatch::Rows(_) => {} // Skip legacy
+                StreamingBatch::Error(msg) => return Err(Status::internal(msg)),
+            }
+        }
+
+        let schema = schema.unwrap_or_else(|| Arc::new(Schema::empty()));
+
+        // Create a channel-based stream that forwards remaining batches
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, FlightError>>(16);
+
+        // Send first batches through channel
+        let tx_clone = tx.clone();
+        for batch in first_batches {
+            let _ = tx_clone.send(Ok(batch)).await;
+        }
+
+        // Spawn task to forward remaining worker batches to channel
+        tokio::spawn(async move {
+            use crate::worker_client::StreamingBatch;
+            while let Some(result) = worker_stream.next().await {
+                match result {
+                    Ok(StreamingBatch::ArrowBatches(batches)) => {
+                        for batch in batches {
+                            if tx.send(Ok(batch)).await.is_err() { return; }
+                        }
+                    }
+                    Ok(StreamingBatch::Rows(_)) | Ok(StreamingBatch::Metadata { .. }) => {}
+                    Ok(StreamingBatch::Error(msg)) => {
+                        let _ = tx.send(Err(FlightError::ExternalError(msg.into()))).await;
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(FlightError::ExternalError(e.into()))).await;
+                        return;
+                    }
+                }
+            }
+            // tx dropped here, closing the channel
+        });
+
+        // Convert channel receiver to a Stream for FlightDataEncoder
+        let batch_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let flight_data_stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(batch_stream)
+            .map(|r| r.map_err(|e| Status::internal(format!("Encoding error: {}", e))));
+
+        Ok(Response::new(Box::pin(flight_data_stream)))
     }
 
     /// Handle fallback for unrecognized ticket types
@@ -851,6 +924,33 @@ impl FlightSqlService for TavanaFlightSqlService {
     /// Register SQL info (called during initialization)
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {
         // SQL info is statically defined in TAVANA_SQL_INFO
+    }
+}
+
+/// Map DuckDB type name strings (from Arrow schema debug format) to Arrow DataType.
+/// This preserves native types instead of flattening everything to Utf8.
+fn map_duckdb_type_to_arrow(type_name: &str) -> DataType {
+    match type_name {
+        "Boolean" => DataType::Boolean,
+        "Int8" => DataType::Int8,
+        "Int16" => DataType::Int16,
+        "Int32" => DataType::Int32,
+        "Int64" => DataType::Int64,
+        "UInt8" => DataType::UInt8,
+        "UInt16" => DataType::UInt16,
+        "UInt32" => DataType::UInt32,
+        "UInt64" => DataType::UInt64,
+        "Float32" => DataType::Float32,
+        "Float64" => DataType::Float64,
+        "Date32" => DataType::Date32,
+        "Date64" => DataType::Date64,
+        s if s.starts_with("Timestamp") => {
+            // Parse "Timestamp(Microsecond, None)" or "Timestamp(Microsecond, Some(\"UTC\"))"
+            DataType::Utf8 // Fallback to Utf8 for complex timestamp formats
+        }
+        "Utf8" | "LargeUtf8" => DataType::Utf8,
+        "Binary" | "LargeBinary" => DataType::Binary,
+        _ => DataType::Utf8, // Default fallback
     }
 }
 

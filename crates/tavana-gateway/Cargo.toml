@@ -81,6 +81,7 @@ aws-sdk-s3 = "1.75"
 aws-config = "1.6"
 parquet = { workspace = true }
 tokio-util = { version = "0.7", features = ["compat"] }
+tokio-stream = "0.1"
 
 # Kubernetes (for creating DuckDBQuery CRs)
 kube = { workspace = true, features = ["rustls-tls", "derive"] }
