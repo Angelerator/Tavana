@@ -55,18 +55,17 @@ pub struct BackpressureConfig {
 impl Default for BackpressureConfig {
     fn default() -> Self {
         Self {
-            // 64KB - matches typical TCP window size
-            // This ensures we're working with the TCP flow control
+            // 256KB - optimal for wide rows (80+ columns at ~2KB each ≈ 128 rows/flush)
             flush_threshold_bytes: std::env::var("TAVANA_FLUSH_THRESHOLD_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(64 * 1024),
+                .unwrap_or(256 * 1024),
 
-            // 100 rows max between flushes (safety net)
+            // 500 rows max between flushes (higher for wide-row workloads)
             flush_threshold_rows: std::env::var("TAVANA_FLUSH_THRESHOLD_ROWS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(100),
+                .unwrap_or(500),
 
             // 300 seconds (5 minutes) - StarRocks-style patient waiting for slow clients
             // Key insight: Don't disconnect slow clients, wait for TCP backpressure to work
@@ -82,11 +81,12 @@ impl Default for BackpressureConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(500),
 
-            // 32KB write buffer - small enough to create backpressure
+            // 256KB write buffer - larger buffer amortizes syscall overhead for
+            // wide analytical rows (80+ columns) while maintaining backpressure
             write_buffer_size: std::env::var("TAVANA_WRITE_BUFFER_SIZE")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(32 * 1024),
+                .unwrap_or(256 * 1024),
         }
     }
 }
@@ -432,6 +432,641 @@ pub fn build_data_row_with_formats(
     data_row.extend_from_slice(&row_data);
 
     data_row
+}
+
+/// Build a PostgreSQL DataRow message directly from an Arrow RecordBatch row.
+/// 
+/// This bypasses the string intermediate entirely:
+/// - For binary format: reads typed values from Arrow arrays → PG binary encoding
+/// - For text format: uses Arrow's ArrayFormatter → PG text encoding
+/// 
+/// This eliminates the Arrow → String → parse → binary round-trip that the
+/// string-based `build_data_row_with_formats` requires.
+pub fn build_data_row_from_arrow(
+    batch: &arrow_array::RecordBatch,
+    row_idx: usize,
+    column_types: &[String],
+    format_codes: &[i16],
+) -> Vec<u8> {
+    let num_cols = batch.num_columns();
+    let mut data_row = Vec::with_capacity(5 + num_cols * 20);
+    data_row.push(b'D'); // DataRow type
+
+    let mut row_data = Vec::with_capacity(2 + num_cols * 20);
+    row_data.extend_from_slice(&(num_cols as i16).to_be_bytes());
+
+    for col_idx in 0..num_cols {
+        let col = batch.column(col_idx);
+        let format = get_format_for_column(col_idx, format_codes);
+
+        if col.is_null(row_idx) {
+            row_data.extend_from_slice(&(-1i32).to_be_bytes());
+            continue;
+        }
+
+        if format == 1 {
+            // Binary format: encode directly from typed Arrow array
+            encode_arrow_binary(&mut row_data, col.as_ref(), row_idx);
+        } else {
+            // Text format: use Arrow formatter directly into buffer
+            encode_arrow_text(&mut row_data, col.as_ref(), row_idx);
+        }
+    }
+
+    // Fill in length
+    let len = (4 + row_data.len()) as u32;
+    data_row.extend_from_slice(&len.to_be_bytes());
+    data_row.extend_from_slice(&row_data);
+
+    data_row
+}
+
+// Pre-swapped network byte order constants (QuestDB pattern: avoid per-call .to_be_bytes())
+const NULL_BYTES: [u8; 4] = (-1i32).to_be_bytes();
+const LEN1_BYTES: [u8; 4] = 1i32.to_be_bytes();
+const LEN2_BYTES: [u8; 4] = 2i32.to_be_bytes();
+const LEN4_BYTES: [u8; 4] = 4i32.to_be_bytes();
+const LEN8_BYTES: [u8; 4] = 8i32.to_be_bytes();
+
+
+/// Column encoder: pre-downcast Arrow array to avoid per-row type dispatch.
+/// Inspired by ClickHouse (block-based encoding) and datafusion-postgres (per-column dispatch).
+enum ColumnEncoder<'a> {
+    // Binary format encoders (direct typed access)
+    BinBool(&'a arrow_array::BooleanArray),
+    BinI16(&'a arrow_array::Int16Array),
+    BinI32(&'a arrow_array::Int32Array),
+    BinI64(&'a arrow_array::Int64Array),
+    BinF32(&'a arrow_array::Float32Array),
+    BinF64(&'a arrow_array::Float64Array),
+    BinUtf8(&'a arrow_array::StringArray),
+    BinLargeUtf8(&'a arrow_array::LargeStringArray),
+    BinBinary(&'a arrow_array::BinaryArray),
+    BinDate32(&'a arrow_array::Date32Array),
+    BinTimestampUs(&'a arrow_array::TimestampMicrosecondArray),
+    // Text format encoders
+    TextI64(&'a arrow_array::Int64Array),
+    TextI32(&'a arrow_array::Int32Array),
+    TextI8(&'a arrow_array::Int8Array),
+    TextU64(&'a arrow_array::UInt64Array),
+    TextU32(&'a arrow_array::UInt32Array),
+    TextF64(&'a arrow_array::Float64Array),
+    TextF32(&'a arrow_array::Float32Array),
+    TextBool(&'a arrow_array::BooleanArray),
+    TextUtf8(&'a arrow_array::StringArray),
+    TextLargeUtf8(&'a arrow_array::LargeStringArray),
+    // Fallback: use ArrayFormatter (cached per column)
+    TextFormatted(arrow::util::display::ArrayFormatter<'a>),
+    // Timestamp with owned i64 values (handles TZ)
+    TextTimestamp { values: Vec<i64>, unit_scale: i64 },
+    // Binary fallback to text
+    BinFallback(&'a dyn arrow_array::Array),
+}
+
+/// High-performance batch encoder for Arrow RecordBatch → PG DataRow messages.
+///
+/// Techniques from ClickHouse, StarRocks, QuestDB, pgwire, datafusion-postgres:
+/// 1. Pre-downcast arrays per column (no per-cell type dispatch) — datafusion-postgres
+/// 2. Single-buffer in-place length backfill (no two-buffer copy) — pgwire
+/// 3. Pre-swapped network byte order constants — QuestDB
+/// 4. itoa/ryu for fast number→text (no format!() or to_string()) — general best practice
+/// 5. Cached formatters per column — StarRocks buffer reuse
+/// 6. Writes directly to output buffer (no intermediate row_buf) — ClickHouse direct write
+pub struct ArrowBatchEncoder<'a> {
+    encoders: Vec<ColumnEncoder<'a>>,
+    null_flags: Vec<bool>, // true if column is nullable (has any nulls)
+    num_cols: usize,
+    num_cols_be: [u8; 2],
+}
+
+impl<'a> ArrowBatchEncoder<'a> {
+    pub fn new(batch: &'a arrow_array::RecordBatch, format_codes: &[i16]) -> Self {
+        use arrow_array::*;
+        use arrow_schema::{DataType, TimeUnit};
+
+        let num_cols = batch.num_columns();
+        let num_cols_be = (num_cols as i16).to_be_bytes();
+
+        let mut encoders = Vec::with_capacity(num_cols);
+        let mut null_flags = Vec::with_capacity(num_cols);
+
+        for col_idx in 0..num_cols {
+            let col = batch.column(col_idx);
+            let is_binary = get_format_for_column(col_idx, format_codes) == 1;
+            null_flags.push(col.null_count() > 0);
+
+            let encoder = if is_binary {
+                // Binary format: pre-downcast for direct typed access
+                match col.data_type() {
+                    DataType::Boolean => col.as_any().downcast_ref::<BooleanArray>().map(ColumnEncoder::BinBool),
+                    DataType::Int16 => col.as_any().downcast_ref::<Int16Array>().map(ColumnEncoder::BinI16),
+                    DataType::Int8 => col.as_any().downcast_ref::<Int8Array>().map(|a| ColumnEncoder::BinFallback(col.as_ref())),
+                    DataType::Int32 => col.as_any().downcast_ref::<Int32Array>().map(ColumnEncoder::BinI32),
+                    DataType::Int64 => col.as_any().downcast_ref::<Int64Array>().map(ColumnEncoder::BinI64),
+                    DataType::Float32 => col.as_any().downcast_ref::<Float32Array>().map(ColumnEncoder::BinF32),
+                    DataType::Float64 => col.as_any().downcast_ref::<Float64Array>().map(ColumnEncoder::BinF64),
+                    DataType::Utf8 => col.as_any().downcast_ref::<StringArray>().map(ColumnEncoder::BinUtf8),
+                    DataType::LargeUtf8 => col.as_any().downcast_ref::<LargeStringArray>().map(ColumnEncoder::BinLargeUtf8),
+                    DataType::Binary => col.as_any().downcast_ref::<BinaryArray>().map(ColumnEncoder::BinBinary),
+                    DataType::Date32 => col.as_any().downcast_ref::<Date32Array>().map(ColumnEncoder::BinDate32),
+                    DataType::Timestamp(TimeUnit::Microsecond, _) => col.as_any().downcast_ref::<TimestampMicrosecondArray>().map(ColumnEncoder::BinTimestampUs),
+                    _ => None,
+                }.unwrap_or(ColumnEncoder::BinFallback(col.as_ref()))
+            } else {
+                // Text format: use fast encoders for common types, formatter for rest
+                match col.data_type() {
+                    DataType::Int64 => col.as_any().downcast_ref::<Int64Array>().map(ColumnEncoder::TextI64),
+                    DataType::Int32 | DataType::Int16 => col.as_any().downcast_ref::<Int32Array>().map(ColumnEncoder::TextI32),
+                    DataType::Int8 => col.as_any().downcast_ref::<Int8Array>().map(ColumnEncoder::TextI8),
+                    DataType::UInt64 => col.as_any().downcast_ref::<UInt64Array>().map(ColumnEncoder::TextU64),
+                    DataType::UInt32 | DataType::UInt16 | DataType::UInt8 => col.as_any().downcast_ref::<UInt32Array>().map(ColumnEncoder::TextU32),
+                    DataType::Float64 => col.as_any().downcast_ref::<Float64Array>().map(ColumnEncoder::TextF64),
+                    DataType::Float32 => col.as_any().downcast_ref::<Float32Array>().map(ColumnEncoder::TextF32),
+                    DataType::Boolean => col.as_any().downcast_ref::<BooleanArray>().map(ColumnEncoder::TextBool),
+                    DataType::Utf8 => col.as_any().downcast_ref::<StringArray>().map(ColumnEncoder::TextUtf8),
+                    DataType::LargeUtf8 => col.as_any().downcast_ref::<LargeStringArray>().map(ColumnEncoder::TextLargeUtf8),
+                    DataType::Timestamp(unit, _) => {
+                        // Extract all i64 timestamp values upfront (handles TZ)
+                        let data = col.to_data();
+                        if !data.buffers().is_empty() {
+                            let scale = match unit {
+                                TimeUnit::Second => 1_000_000i64,
+                                TimeUnit::Millisecond => 1_000,
+                                TimeUnit::Microsecond => 1,
+                                TimeUnit::Nanosecond => -1000, // negative = divide
+                            };
+                            let raw_buf = data.buffers()[0].as_slice();
+                            let offset = data.offset();
+                            let num_rows = col.len();
+                            let mut values = Vec::with_capacity(num_rows);
+                            for i in 0..num_rows {
+                                let byte_offset = (offset + i) * 8;
+                                let v = i64::from_ne_bytes(raw_buf[byte_offset..byte_offset + 8].try_into().unwrap());
+                                values.push(v);
+                            }
+                            Some(ColumnEncoder::TextTimestamp { values, unit_scale: scale })
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }.unwrap_or_else(|| {
+                    // Fallback: cached ArrayFormatter
+                    arrow::util::display::ArrayFormatter::try_new(col.as_ref(), &Default::default())
+                        .map(ColumnEncoder::TextFormatted)
+                        .unwrap_or(ColumnEncoder::BinFallback(col.as_ref()))
+                })
+            };
+            encoders.push(encoder);
+        }
+
+        Self { encoders, null_flags, num_cols, num_cols_be }
+    }
+
+    /// Encode a single row directly into the output buffer (in-place length backfill).
+    /// No intermediate buffer — writes DataRow header, placeholder length, fields, then patches length.
+    #[inline]
+    pub fn encode_row(&self, row_idx: usize, batch: &arrow_array::RecordBatch, out: &mut Vec<u8>) {
+        out.push(b'D'); // DataRow message type
+        let len_pos = out.len();
+        out.extend_from_slice(&[0, 0, 0, 0]); // Length placeholder (backfilled)
+        out.extend_from_slice(&self.num_cols_be);
+
+        for col_idx in 0..self.num_cols {
+            // Fast null check
+            if self.null_flags[col_idx] && batch.column(col_idx).is_null(row_idx) {
+                out.extend_from_slice(&NULL_BYTES);
+                continue;
+            }
+
+            match &self.encoders[col_idx] {
+                // === BINARY FORMAT (direct typed access, no string) ===
+                ColumnEncoder::BinBool(arr) => {
+                    out.extend_from_slice(&LEN1_BYTES);
+                    out.push(if arr.value(row_idx) { 1 } else { 0 });
+                }
+                ColumnEncoder::BinI16(arr) => {
+                    out.extend_from_slice(&LEN2_BYTES);
+                    out.extend_from_slice(&arr.value(row_idx).to_be_bytes());
+                }
+                ColumnEncoder::BinI32(arr) => {
+                    out.extend_from_slice(&LEN4_BYTES);
+                    out.extend_from_slice(&arr.value(row_idx).to_be_bytes());
+                }
+                ColumnEncoder::BinI64(arr) => {
+                    out.extend_from_slice(&LEN8_BYTES);
+                    out.extend_from_slice(&arr.value(row_idx).to_be_bytes());
+                }
+                ColumnEncoder::BinF32(arr) => {
+                    out.extend_from_slice(&LEN4_BYTES);
+                    out.extend_from_slice(&arr.value(row_idx).to_be_bytes());
+                }
+                ColumnEncoder::BinF64(arr) => {
+                    out.extend_from_slice(&LEN8_BYTES);
+                    out.extend_from_slice(&arr.value(row_idx).to_be_bytes());
+                }
+                ColumnEncoder::BinUtf8(arr) => {
+                    // DataRow values are length-prefixed (not null-terminated), NULL bytes are safe
+                    let v = arr.value(row_idx).as_bytes();
+                    out.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                    out.extend_from_slice(v);
+                }
+                ColumnEncoder::BinLargeUtf8(arr) => {
+                    let v = arr.value(row_idx).as_bytes();
+                    out.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                    out.extend_from_slice(v);
+                }
+                ColumnEncoder::BinBinary(arr) => {
+                    let v = arr.value(row_idx);
+                    out.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                    out.extend_from_slice(v);
+                }
+                ColumnEncoder::BinDate32(arr) => {
+                    out.extend_from_slice(&LEN4_BYTES);
+                    out.extend_from_slice(&(arr.value(row_idx) - 10957).to_be_bytes());
+                }
+                ColumnEncoder::BinTimestampUs(arr) => {
+                    out.extend_from_slice(&LEN8_BYTES);
+                    out.extend_from_slice(&(arr.value(row_idx) - 946_684_800_000_000i64).to_be_bytes());
+                }
+                ColumnEncoder::BinFallback(arr) => {
+                    encode_arrow_binary(out, *arr, row_idx);
+                }
+
+                // === TEXT FORMAT (itoa/ryu for numbers, direct bytes for strings) ===
+                ColumnEncoder::TextI64(arr) => {
+                    let mut ibuf = itoa::Buffer::new();
+                    let s = ibuf.format(arr.value(row_idx));
+                    out.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                    out.extend_from_slice(s.as_bytes());
+                }
+                ColumnEncoder::TextI32(arr) => {
+                    let mut ibuf = itoa::Buffer::new();
+                    let s = ibuf.format(arr.value(row_idx));
+                    out.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                    out.extend_from_slice(s.as_bytes());
+                }
+                ColumnEncoder::TextI8(arr) => {
+                    let mut ibuf = itoa::Buffer::new();
+                    let s = ibuf.format(arr.value(row_idx));
+                    out.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                    out.extend_from_slice(s.as_bytes());
+                }
+                ColumnEncoder::TextU64(arr) => {
+                    let mut ibuf = itoa::Buffer::new();
+                    let s = ibuf.format(arr.value(row_idx));
+                    out.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                    out.extend_from_slice(s.as_bytes());
+                }
+                ColumnEncoder::TextU32(arr) => {
+                    let mut ibuf = itoa::Buffer::new();
+                    let s = ibuf.format(arr.value(row_idx));
+                    out.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                    out.extend_from_slice(s.as_bytes());
+                }
+                ColumnEncoder::TextF64(arr) => {
+                    let mut fbuf = ryu::Buffer::new();
+                    let s = fbuf.format(arr.value(row_idx));
+                    out.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                    out.extend_from_slice(s.as_bytes());
+                }
+                ColumnEncoder::TextF32(arr) => {
+                    let mut fbuf = ryu::Buffer::new();
+                    let s = fbuf.format(arr.value(row_idx));
+                    out.extend_from_slice(&(s.len() as i32).to_be_bytes());
+                    out.extend_from_slice(s.as_bytes());
+                }
+                ColumnEncoder::TextBool(arr) => {
+                    if arr.value(row_idx) {
+                        out.extend_from_slice(&LEN4_BYTES);
+                        out.extend_from_slice(b"true");
+                    } else {
+                        out.extend_from_slice(&(5i32).to_be_bytes());
+                        out.extend_from_slice(b"false");
+                    }
+                }
+                ColumnEncoder::TextUtf8(arr) => {
+                    // DataRow values are length-prefixed (not null-terminated), NULL bytes are safe
+                    let v = arr.value(row_idx).as_bytes();
+                    out.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                    out.extend_from_slice(v);
+                }
+                ColumnEncoder::TextLargeUtf8(arr) => {
+                    let v = arr.value(row_idx).as_bytes();
+                    out.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                    out.extend_from_slice(v);
+                }
+                ColumnEncoder::TextTimestamp { values, unit_scale } => {
+                    let raw_val = values[row_idx];
+                    let us = if *unit_scale > 0 { raw_val * *unit_scale } else { raw_val / unit_scale.unsigned_abs() as i64 };
+                    // Convert to ISO 8601 using integer math (no format!() allocation)
+                    let secs = us / 1_000_000;
+                    let rem_us = (us % 1_000_000).unsigned_abs();
+                    let days = (secs / 86400) as i32;
+                    let day_secs = (secs % 86400 + 86400) % 86400;
+                    let h = day_secs / 3600; let m = (day_secs % 3600) / 60; let s = day_secs % 60;
+                    let z = days + 719468;
+                    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+                    let doe = (z - era * 146097) as u32;
+                    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+                    let y = yoe as i32 + era * 400;
+                    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                    let mp = (5 * doy + 2) / 153;
+                    let d = doy - (153 * mp + 2) / 5 + 1;
+                    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+                    let yr = if mo <= 2 { y + 1 } else { y };
+                    // Write digits directly to stack buffer (no format!() allocation)
+                    let mut ts_buf = [0u8; 32];
+                    let mut pos = 0;
+                    // Year (4 digits)
+                    ts_buf[pos] = b'0' + ((yr / 1000) % 10) as u8; pos += 1;
+                    ts_buf[pos] = b'0' + ((yr / 100) % 10) as u8; pos += 1;
+                    ts_buf[pos] = b'0' + ((yr / 10) % 10) as u8; pos += 1;
+                    ts_buf[pos] = b'0' + (yr % 10) as u8; pos += 1;
+                    ts_buf[pos] = b'-'; pos += 1;
+                    ts_buf[pos] = b'0' + (mo / 10) as u8; pos += 1;
+                    ts_buf[pos] = b'0' + (mo % 10) as u8; pos += 1;
+                    ts_buf[pos] = b'-'; pos += 1;
+                    ts_buf[pos] = b'0' + (d / 10) as u8; pos += 1;
+                    ts_buf[pos] = b'0' + (d % 10) as u8; pos += 1;
+                    ts_buf[pos] = b' '; pos += 1;
+                    ts_buf[pos] = b'0' + (h / 10) as u8; pos += 1;
+                    ts_buf[pos] = b'0' + (h % 10) as u8; pos += 1;
+                    ts_buf[pos] = b':'; pos += 1;
+                    ts_buf[pos] = b'0' + (m / 10) as u8; pos += 1;
+                    ts_buf[pos] = b'0' + (m % 10) as u8; pos += 1;
+                    ts_buf[pos] = b':'; pos += 1;
+                    ts_buf[pos] = b'0' + (s / 10) as u8; pos += 1;
+                    ts_buf[pos] = b'0' + (s % 10) as u8; pos += 1;
+                    if rem_us > 0 {
+                        ts_buf[pos] = b'.'; pos += 1;
+                        ts_buf[pos] = b'0' + ((rem_us / 100000) % 10) as u8; pos += 1;
+                        ts_buf[pos] = b'0' + ((rem_us / 10000) % 10) as u8; pos += 1;
+                        ts_buf[pos] = b'0' + ((rem_us / 1000) % 10) as u8; pos += 1;
+                        ts_buf[pos] = b'0' + ((rem_us / 100) % 10) as u8; pos += 1;
+                        ts_buf[pos] = b'0' + ((rem_us / 10) % 10) as u8; pos += 1;
+                        ts_buf[pos] = b'0' + (rem_us % 10) as u8; pos += 1;
+                    }
+                    out.extend_from_slice(&(pos as i32).to_be_bytes());
+                    out.extend_from_slice(&ts_buf[..pos]);
+                }
+                ColumnEncoder::TextFormatted(formatter) => {
+                    let text = formatter.value(row_idx).to_string();
+                    out.extend_from_slice(&(text.len() as i32).to_be_bytes());
+                    out.extend_from_slice(text.as_bytes());
+                }
+            }
+        }
+
+        // In-place length backfill (pgwire pattern: write once, no second buffer)
+        // PG protocol: length includes the 4 length bytes but not the 'D' type byte
+        let msg_len = (out.len() - len_pos) as u32;
+        out[len_pos..len_pos + 4].copy_from_slice(&msg_len.to_be_bytes());
+    }
+}
+
+/// Encode an Arrow value directly to PostgreSQL binary wire format.
+/// Reads typed values from Arrow arrays — no string intermediary.
+fn encode_arrow_binary(buf: &mut Vec<u8>, array: &dyn arrow_array::Array, idx: usize) {
+    use arrow_array::*;
+    use arrow_array::types::*;
+    use arrow_schema::{DataType, TimeUnit};
+
+    match array.data_type() {
+        DataType::Boolean => {
+            let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            buf.extend_from_slice(&1i32.to_be_bytes());
+            buf.push(if arr.value(idx) { 1 } else { 0 });
+        }
+        DataType::Int8 => {
+            let arr = array.as_any().downcast_ref::<Int8Array>().unwrap();
+            // Promote to Int16 for PostgreSQL (no int1 type)
+            buf.extend_from_slice(&2i32.to_be_bytes());
+            buf.extend_from_slice(&(arr.value(idx) as i16).to_be_bytes());
+        }
+        DataType::Int16 => {
+            let arr = array.as_any().downcast_ref::<Int16Array>().unwrap();
+            buf.extend_from_slice(&2i32.to_be_bytes());
+            buf.extend_from_slice(&arr.value(idx).to_be_bytes());
+        }
+        DataType::Int32 => {
+            let arr = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            buf.extend_from_slice(&4i32.to_be_bytes());
+            buf.extend_from_slice(&arr.value(idx).to_be_bytes());
+        }
+        DataType::Int64 => {
+            let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            buf.extend_from_slice(&8i32.to_be_bytes());
+            buf.extend_from_slice(&arr.value(idx).to_be_bytes());
+        }
+        DataType::UInt8 => {
+            let arr = array.as_any().downcast_ref::<UInt8Array>().unwrap();
+            buf.extend_from_slice(&2i32.to_be_bytes());
+            buf.extend_from_slice(&(arr.value(idx) as i16).to_be_bytes());
+        }
+        DataType::UInt16 => {
+            let arr = array.as_any().downcast_ref::<UInt16Array>().unwrap();
+            buf.extend_from_slice(&4i32.to_be_bytes());
+            buf.extend_from_slice(&(arr.value(idx) as i32).to_be_bytes());
+        }
+        DataType::UInt32 => {
+            let arr = array.as_any().downcast_ref::<UInt32Array>().unwrap();
+            buf.extend_from_slice(&8i32.to_be_bytes());
+            buf.extend_from_slice(&(arr.value(idx) as i64).to_be_bytes());
+        }
+        DataType::UInt64 => {
+            // UInt64 may overflow i64, send as text
+            let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+            let s = arr.value(idx).to_string();
+            buf.extend_from_slice(&(s.len() as i32).to_be_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        DataType::Float32 => {
+            let arr = array.as_any().downcast_ref::<Float32Array>().unwrap();
+            buf.extend_from_slice(&4i32.to_be_bytes());
+            buf.extend_from_slice(&arr.value(idx).to_be_bytes());
+        }
+        DataType::Float64 => {
+            let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            buf.extend_from_slice(&8i32.to_be_bytes());
+            buf.extend_from_slice(&arr.value(idx).to_be_bytes());
+        }
+        DataType::Utf8 => {
+            let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
+            let val = arr.value(idx);
+            let bytes: Vec<u8> = val.bytes().filter(|&b| b != 0).collect();
+            buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+            buf.extend_from_slice(&bytes);
+        }
+        DataType::LargeUtf8 => {
+            let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            let val = arr.value(idx);
+            let bytes: Vec<u8> = val.bytes().filter(|&b| b != 0).collect();
+            buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+            buf.extend_from_slice(&bytes);
+        }
+        DataType::Binary => {
+            let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            let val = arr.value(idx);
+            buf.extend_from_slice(&(val.len() as i32).to_be_bytes());
+            buf.extend_from_slice(val);
+        }
+        DataType::LargeBinary => {
+            let arr = array.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            let val = arr.value(idx);
+            buf.extend_from_slice(&(val.len() as i32).to_be_bytes());
+            buf.extend_from_slice(val);
+        }
+        DataType::Date32 => {
+            // Arrow Date32: days since 1970-01-01
+            // PG Date: days since 2000-01-01
+            let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
+            let pg_days = arr.value(idx) - 10957; // 2000-01-01 - 1970-01-01
+            buf.extend_from_slice(&4i32.to_be_bytes());
+            buf.extend_from_slice(&pg_days.to_be_bytes());
+        }
+        DataType::Date64 => {
+            // Arrow Date64: milliseconds since 1970-01-01
+            // PG Date: days since 2000-01-01
+            let arr = array.as_any().downcast_ref::<Date64Array>().unwrap();
+            let days = (arr.value(idx) / 86_400_000) as i32;
+            let pg_days = days - 10957;
+            buf.extend_from_slice(&4i32.to_be_bytes());
+            buf.extend_from_slice(&pg_days.to_be_bytes());
+        }
+        DataType::Timestamp(unit, _tz) => {
+            // PG Timestamp: microseconds since 2000-01-01
+            const EPOCH_DIFF_MICROS: i64 = 946_684_800_000_000; // 1970->2000 in microseconds
+            let micros = match unit {
+                TimeUnit::Second => {
+                    let arr = array.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
+                    arr.value(idx) * 1_000_000 - EPOCH_DIFF_MICROS
+                }
+                TimeUnit::Millisecond => {
+                    let arr = array.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap();
+                    arr.value(idx) * 1_000 - EPOCH_DIFF_MICROS
+                }
+                TimeUnit::Microsecond => {
+                    let arr = array.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
+                    arr.value(idx) - EPOCH_DIFF_MICROS
+                }
+                TimeUnit::Nanosecond => {
+                    let arr = array.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap();
+                    arr.value(idx) / 1_000 - EPOCH_DIFF_MICROS
+                }
+            };
+            buf.extend_from_slice(&8i32.to_be_bytes());
+            buf.extend_from_slice(&micros.to_be_bytes());
+        }
+        DataType::Time64(unit) => {
+            // PG Time: microseconds since midnight
+            let micros = match unit {
+                TimeUnit::Microsecond => {
+                    let arr = array.as_any().downcast_ref::<Time64MicrosecondArray>().unwrap();
+                    arr.value(idx)
+                }
+                TimeUnit::Nanosecond => {
+                    let arr = array.as_any().downcast_ref::<Time64NanosecondArray>().unwrap();
+                    arr.value(idx) / 1_000
+                }
+                _ => {
+                    encode_arrow_text(buf, array, idx);
+                    return;
+                }
+            };
+            buf.extend_from_slice(&8i32.to_be_bytes());
+            buf.extend_from_slice(&micros.to_be_bytes());
+        }
+        // For all other types (Decimal, List, Struct, Map, etc.), fall back to text
+        _ => {
+            encode_arrow_text(buf, array, idx);
+        }
+    }
+}
+
+/// Encode an Arrow value as PostgreSQL text format directly into buffer.
+/// Uses Arrow's built-in ArrayFormatter with manual fallbacks for edge cases.
+fn encode_arrow_text(buf: &mut Vec<u8>, array: &dyn arrow_array::Array, idx: usize) {
+    use arrow::util::display::ArrayFormatter;
+    use arrow_array::*;
+    use arrow_schema::{DataType, TimeUnit};
+
+    // Handle Timestamp types manually (Arrow's formatter may produce "<unsupported:...>" for TZ)
+    if matches!(array.data_type(), DataType::Timestamp(..)) {
+        // Skip ArrayFormatter for ALL timestamps — handle manually below
+    } else {
+        // Try Arrow's built-in formatter for non-timestamp types
+        if let Ok(formatter) = ArrayFormatter::try_new(array, &Default::default()) {
+            let text = formatter.value(idx).to_string();
+            if !text.starts_with("<unsupported") {
+                let sanitized: Vec<u8> = text.bytes().filter(|&b| b != 0).collect();
+                buf.extend_from_slice(&(sanitized.len() as i32).to_be_bytes());
+                buf.extend_from_slice(&sanitized);
+                return;
+            }
+        }
+    }
+
+    // Manual handler for timestamps and fallback for other types
+    let text = match array.data_type() {
+        DataType::Timestamp(unit, _tz) => {
+            // All timestamp types are physically i64 — read raw value from buffer
+            let raw_val: Option<i64> = {
+                let data = array.to_data();
+                if !data.buffers().is_empty() {
+                    let buf = &data.buffers()[0];
+                    let vals: &[i64] = unsafe {
+                        std::slice::from_raw_parts(
+                            buf.as_ptr() as *const i64,
+                            buf.len() / std::mem::size_of::<i64>(),
+                        )
+                    };
+                    vals.get(idx + data.offset()).copied()
+                } else {
+                    None
+                }
+            };
+            let micros = raw_val.map(|v| match unit {
+                TimeUnit::Second => v * 1_000_000,
+                TimeUnit::Millisecond => v * 1_000,
+                TimeUnit::Microsecond => v,
+                TimeUnit::Nanosecond => v / 1_000,
+            });
+            if let Some(us) = micros {
+                // Convert microseconds since Unix epoch to ISO 8601 format
+                let secs = us / 1_000_000;
+                let rem_us = (us % 1_000_000).unsigned_abs();
+                // Simple epoch → date/time conversion
+                let days = (secs / 86400) as i32;
+                let day_secs = (secs % 86400 + 86400) % 86400;
+                let h = day_secs / 3600;
+                let m = (day_secs % 3600) / 60;
+                let s = day_secs % 60;
+                // Days since 1970-01-01 to Y-M-D (civil calendar)
+                let z = days + 719468;
+                let era = if z >= 0 { z } else { z - 146096 } / 146097;
+                let doe = (z - era * 146097) as u32;
+                let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+                let y = yoe as i32 + era * 400;
+                let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                let mp = (5 * doy + 2) / 153;
+                let d = doy - (153 * mp + 2) / 5 + 1;
+                let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+                let yr = if mo <= 2 { y + 1 } else { y };
+                if rem_us > 0 {
+                    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}", yr, mo, d, h, m, s, rem_us)
+                } else {
+                    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", yr, mo, d, h, m, s)
+                }
+            } else {
+                format!("{:?}", array.data_type())
+            }
+        }
+        _ => format!("{:?}", array.data_type()),
+    };
+    let sanitized: Vec<u8> = text.bytes().filter(|&b| b != 0).collect();
+    buf.extend_from_slice(&(sanitized.len() as i32).to_be_bytes());
+    buf.extend_from_slice(&sanitized);
 }
 
 /// Get the format code for a specific column index

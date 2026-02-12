@@ -81,6 +81,7 @@ aws-sdk-s3 = "1.75"
 aws-config = "1.6"
 parquet = { workspace = true }
 tokio-util = { version = "0.7", features = ["compat"] }
+tokio-stream = "0.1"
 
 # Kubernetes (for creating DuckDBQuery CRs)
 kube = { workspace = true, features = ["rustls-tls", "derive"] }
@@ -98,6 +99,13 @@ socket2 = { version = "0.5", features = ["all"] }
 # MD5 authentication for PostgreSQL wire protocol
 md5 = "0.7"
 rand = { workspace = true }
+
+# Fast number formatting (used in PG wire text encoding hot path)
+itoa = "1"
+ryu = "1"
+
+# Parallel encoding for PG wire (multi-core RecordBatch → DataRow)
+rayon = "1"
 
 # Base64 encoding for Flight SQL auth
 base64 = { workspace = true }

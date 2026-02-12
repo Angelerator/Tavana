@@ -583,8 +583,10 @@ impl DuckDbExecutor {
         Self::load_duckdbrc(&connection);
 
         // Dynamic streaming buffer (can be overridden by env var)
+        // 512MB default: larger buffer reduces I/O overhead for large remote Delta scans
+        // DuckDB docs recommend large buffers for cloud storage workloads
         let streaming_buffer = std::env::var("DUCKDB_STREAMING_BUFFER_SIZE")
-            .unwrap_or_else(|_| "100MB".to_string());
+            .unwrap_or_else(|_| "512MB".to_string());
         if let Err(e) = connection.execute(
             &format!("SET streaming_buffer_size = '{}';", streaming_buffer),
             params![]
@@ -746,8 +748,12 @@ impl DuckDbExecutor {
                 tracing::warn!("Could not set azure_account_name: {}", e);
             }
             
-            // Try to get an access token for workload identity (needed for delta_scan)
-            let access_token = Self::get_azure_access_token();
+            // Try to get an access token:
+            // 1. AZURE_ACCESS_TOKEN env var (local dev with `az account get-access-token`)
+            // 2. Workload identity token exchange (K8s pods)
+            let access_token = std::env::var("AZURE_ACCESS_TOKEN").ok()
+                .map(|t| (t, 3600u64))
+                .or_else(|| Self::get_azure_access_token());
             
             if let Some((token, _expires_in)) = access_token {
                 // Use access_token provider for delta extension compatibility

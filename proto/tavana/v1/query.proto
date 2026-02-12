@@ -57,9 +57,12 @@ message QueryResultBatch {
 }
 
 message ArrowRecordBatch {
-    bytes schema = 1;  // Arrow IPC schema
-    bytes data = 2;    // Arrow IPC record batch
+    bytes schema = 1;  // Arrow IPC schema (legacy)
+    bytes data = 2;    // Arrow IPC stream bytes (legacy, used for PG wire path)
     uint64 row_count = 3;
+    // FlightData-compatible split format: enables zero-copy passthrough for Flight SQL
+    bytes ipc_header = 4;  // IPC message flatbuffer (FlightData.data_header)
+    bytes ipc_body = 5;    // Arrow buffer data (FlightData.data_body)
 }
 
 message QueryMetadata {

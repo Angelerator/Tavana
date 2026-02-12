@@ -10,7 +10,7 @@
 //! cursor operations (FETCH, CLOSE) to the correct worker based on the cursor's
 //! `worker_addr`.
 
-use arrow_ipc::reader::FileReader;
+use arrow_ipc::reader::StreamReader;
 use dashmap::DashMap;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -35,7 +35,15 @@ pub enum StreamingBatch {
         columns: Vec<String>,
         column_types: Vec<String>,
     },
-    /// Rows as string values for PG wire protocol
+    /// Arrow RecordBatches for zero-copy PG wire encoding
+    ArrowBatches(Vec<arrow_array::RecordBatch>),
+    /// Pre-encoded FlightData (header+body) for zero-copy Flight SQL passthrough.
+    /// Eliminates the double IPC serialization: worker encodes once, gateway forwards directly.
+    FlightData {
+        ipc_header: bytes::Bytes,
+        ipc_body: bytes::Bytes,
+    },
+    /// Rows as string values (legacy fallback for COPY, cursors, etc.)
     Rows(Vec<Vec<String>>),
     Error(String),
 }
@@ -81,9 +89,27 @@ impl WorkerClient {
         info!("Connecting to worker at {}", self.worker_addr);
         const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
 
+        // HTTP/2 window sizes for high-throughput Arrow IPC streaming.
+        // Default tonic window is 64KB — far too small for analytical data streaming,
+        // causing constant WINDOW_UPDATE frame overhead.
+        let stream_window = std::env::var("TAVANA_GRPC_STREAM_WINDOW_MB")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(2) // 2 MB default
+            * 1024 * 1024;
+        let conn_window = std::env::var("TAVANA_GRPC_CONN_WINDOW_MB")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(4) // 4 MB default
+            * 1024 * 1024;
+
         let channel = Channel::from_shared(self.worker_addr.clone())?
             .timeout(std::time::Duration::from_secs(1800)) // 30 minutes
             .connect_timeout(std::time::Duration::from_secs(30))
+            // HTTP/2 flow control: large windows to avoid WINDOW_UPDATE stalls
+            // during high-throughput Arrow IPC streaming from workers
+            .initial_stream_window_size(stream_window)
+            .initial_connection_window_size(conn_window)
             // TCP keepalive - OS-level connection health check
             .tcp_keepalive(Some(std::time::Duration::from_secs(10)))
             // HTTP/2 keepalive - application-level PING frames for faster detection
@@ -160,8 +186,8 @@ impl WorkerClient {
                 }
                 Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
                     debug!("Received batch with {} rows", batch.row_count);
-                    // Decode Arrow IPC data (10-100x faster than JSON!)
                     if !batch.data.is_empty() {
+                        // Try Arrow IPC first (primary format)
                         match deserialize_arrow_ipc(&batch.data) {
                             Ok(record_batches) => {
                                 for rb in record_batches {
@@ -169,30 +195,12 @@ impl WorkerClient {
                                     rows.extend(batch_rows);
                                 }
                             }
-                            Err(e) => {
-                                debug!("Arrow IPC decode failed: {}, trying JSON fallback", e);
-                                // Fallback to JSON for backwards compatibility
+                            Err(_) => {
+                                // Fallback to JSON for backward compatibility
                                 match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
-                                    Ok(batch_rows) => {
-                                        // Log column counts for diagnostics
-                                        if !batch_rows.is_empty() {
-                                            let first_row_cols = batch_rows[0].len();
-                                            let all_same = batch_rows.iter().all(|r| r.len() == first_row_cols);
-                                            if !all_same {
-                                                warn!("JSON fallback: rows have INCONSISTENT column counts! First row has {} cols", first_row_cols);
-                                                for (i, r) in batch_rows.iter().enumerate().take(5) {
-                                                    warn!("  Row {}: {} cols", i, r.len());
-                                                }
-                                            } else {
-                                                debug!("JSON fallback successful: {} rows decoded, {} cols each", batch_rows.len(), first_row_cols);
-                                            }
-                                        }
-                                        rows.extend(batch_rows);
-                                    }
-                                    Err(json_err) => {
-                                        error!("JSON fallback ALSO failed: {}. Data preview (first 200 bytes): {:?}", 
-                                            json_err, 
-                                            String::from_utf8_lossy(&batch.data[..batch.data.len().min(200)]));
+                                    Ok(batch_rows) => rows.extend(batch_rows),
+                                    Err(e) => {
+                                        error!("Failed to decode batch data: {}", e);
                                     }
                                 }
                             }
@@ -257,14 +265,18 @@ impl WorkerClient {
         let response = client.execute_query(request).await?;
         let mut stream = response.into_inner();
 
-        // Create a SMALL bounded channel for streaming results
-        // This is critical for backpressure: when the client can't consume data fast enough,
-        // the channel fills up, which causes tx.send() to block, which back-pressures the
-        // gRPC stream reader, which back-pressures the worker via gRPC flow control.
+        // Bounded channel for streaming results with backpressure.
+        // When the client can't consume data fast enough, the channel fills up,
+        // which causes tx.send() to block, which back-pressures the gRPC stream
+        // reader, which back-pressures the worker via HTTP/2 flow control.
         //
-        // Channel size of 4 means at most 4 batches buffered between gRPC and client socket.
-        // Each batch is typically 100-1000 rows, so this limits buffering to 400-4000 rows.
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        // With LZ4-compressed Arrow IPC, batches are smaller so a larger buffer
+        // is acceptable. Default: 32 batches (up from 16).
+        let channel_buffer = std::env::var("TAVANA_GRPC_CHANNEL_BUFFER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32usize);
+        let (tx, rx) = tokio::sync::mpsc::channel(channel_buffer);
 
         // Spawn a task to read from gRPC stream and forward to channel
         // TRUE STREAMING with Arrow IPC: 10-100x faster data transfer
@@ -279,22 +291,30 @@ impl WorkerClient {
                         })
                     }
                     Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
-                        if !batch.data.is_empty() {
-                            // Try JSON first (worker now sends JSON for reliability)
-                            // Arrow IPC has issues with DuckDB's bundled Arrow vs standalone crate
-                            match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
-                                Ok(rows) => Ok(StreamingBatch::Rows(rows)),
+                        // Check for FlightData passthrough format first (zero-copy for Flight SQL)
+                        if !batch.ipc_header.is_empty() && !batch.ipc_body.is_empty() {
+                            // Send FlightData passthrough for Flight SQL
+                            let flight_result = Ok(StreamingBatch::FlightData {
+                                ipc_header: batch.ipc_header.into(),
+                                ipc_body: batch.ipc_body.into(),
+                            });
+                            if tx.send(flight_result).await.is_err() { break; }
+                            // Also send ArrowBatches for PG wire (deserialized from legacy data)
+                            if !batch.data.is_empty() {
+                                match deserialize_arrow_ipc(&batch.data) {
+                                    Ok(record_batches) => Ok(StreamingBatch::ArrowBatches(record_batches)),
+                                    Err(_) => continue,
+                                }
+                            } else {
+                                continue;
+                            }
+                        } else if !batch.data.is_empty() {
+                            // Legacy path: Arrow IPC stream bytes
+                            match deserialize_arrow_ipc(&batch.data) {
+                                Ok(record_batches) => Ok(StreamingBatch::ArrowBatches(record_batches)),
                                 Err(_) => {
-                                    // Fallback to Arrow IPC for backwards compatibility
-                                    match deserialize_arrow_ipc(&batch.data) {
-                                        Ok(record_batches) => {
-                                            let mut all_rows = Vec::new();
-                                            for rb in record_batches {
-                                                let rows = arrow_batch_to_string_rows(&rb);
-                                                all_rows.extend(rows);
-                                            }
-                                            Ok(StreamingBatch::Rows(all_rows))
-                                        }
+                                    match serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                                        Ok(rows) => Ok(StreamingBatch::Rows(rows)),
                                         Err(e) => Err(anyhow::anyhow!("Failed to decode batch: {}", e)),
                                     }
                                 }
@@ -414,8 +434,19 @@ impl WorkerClient {
                 }
                 Some(proto::query_result_batch::Result::RecordBatch(batch)) => {
                     if !batch.data.is_empty() {
-                        if let Ok(batch_rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
-                            rows.extend(batch_rows);
+                        // Try Arrow IPC first, fallback to JSON
+                        match deserialize_arrow_ipc(&batch.data) {
+                            Ok(record_batches) => {
+                                for rb in record_batches {
+                                    let batch_rows = arrow_batch_to_string_rows(&rb);
+                                    rows.extend(batch_rows);
+                                }
+                            }
+                            Err(_) => {
+                                if let Ok(batch_rows) = serde_json::from_slice::<Vec<Vec<String>>>(&batch.data) {
+                                    rows.extend(batch_rows);
+                                }
+                            }
                         }
                     }
                 }
@@ -632,17 +663,14 @@ impl WorkerClientPool {
 
 // ============= Arrow IPC Deserialization Utilities =============
 
-/// Deserialize Arrow IPC data to RecordBatches
-/// This is the inverse of the worker's serialize_batch_to_arrow_ipc
+/// Deserialize Arrow IPC streaming data to RecordBatches
 fn deserialize_arrow_ipc(data: &[u8]) -> Result<Vec<arrow_array::RecordBatch>, anyhow::Error> {
     let cursor = Cursor::new(data);
-    let reader = FileReader::try_new(cursor, None)?;
-    
+    let reader = StreamReader::try_new(cursor, None)?;
     let mut batches = Vec::new();
     for batch_result in reader {
         batches.push(batch_result?);
     }
-    
     Ok(batches)
 }
 
