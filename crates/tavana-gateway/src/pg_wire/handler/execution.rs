@@ -90,6 +90,7 @@ pub(crate) async fn execute_simple_query<S>(
     sql: &str,
     user_id: &str,
     smart_scaler: Option<&SmartScaler>,
+    session_params: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<usize>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -113,12 +114,12 @@ where
     let actual_sql = pg_compat::rewrite_pg_to_duckdb(&actual_sql);
 
     if is_copy_command {
-        // COPY uses direct streaming (no routing needed)
-        return execute_copy_query(socket, worker_client, &actual_sql, user_id).await;
+        // COPY uses direct streaming (no routing needed) — pass session_params for credentials
+        return execute_copy_query(socket, worker_client, &actual_sql, user_id, session_params).await;
     }
 
     // Regular query: route via QueryRouter with optional SmartScaler
-    execute_routed_query(socket, worker_client, query_router, &actual_sql, user_id, smart_scaler, false, &[], &[]).await
+    execute_routed_query(socket, worker_client, query_router, &actual_sql, user_id, smart_scaler, false, &[], &[], session_params).await
 }
 
 /// Execute a COPY query via direct streaming
@@ -127,6 +128,7 @@ async fn execute_copy_query<S>(
     worker_client: &WorkerClient,
     sql: &str,
     user_id: &str,
+    session_params: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<usize>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -134,7 +136,7 @@ where
     metrics::query_started();
     let start_time = std::time::Instant::now();
 
-    match worker_client.execute_query_streaming(sql, user_id).await {
+    match worker_client.execute_query_streaming_with_params(sql, user_id, session_params).await {
         Ok(mut stream) => {
             let mut columns_sent = false;
             let mut total_rows: usize = 0;
@@ -228,6 +230,7 @@ pub(crate) async fn execute_routed_query<S>(
     skip_row_description: bool,
     format_codes: &[i16],
     column_types_hint: &[String],
+    session_params: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<usize>
 where
     S: AsyncWrite + Unpin,
@@ -270,13 +273,14 @@ where
         data_mb = estimate.data_size_mb,
         target = ?estimate.target,
         skip_row_desc = skip_row_description,
+        session_creds = session_params.len(),
         "Query routed for streaming execution"
     );
 
     if let Some(scaler) = smart_scaler {
         return execute_with_smart_scaler(
             socket, worker_client, query_router, scaler, sql, user_id, &estimate,
-            skip_row_description, format_codes, column_types_hint,
+            skip_row_description, format_codes, column_types_hint, session_params,
         ).await;
     }
 
@@ -284,17 +288,17 @@ where
         QueryTarget::PreSizedWorker { address, worker_name } => {
             info!("Using pre-sized worker {} at {}", worker_name, address);
             metrics::update_worker_active_queries(&worker_name, 1);
-            let result = execute_to_worker(socket, &address, sql, user_id, skip_row_description, format_codes, column_types_hint).await;
+            let result = execute_to_worker(socket, &address, sql, user_id, skip_row_description, format_codes, column_types_hint, session_params).await;
             metrics::update_worker_active_queries(&worker_name, 0);
             (result, Some(worker_name))
         }
         QueryTarget::TenantPool { service_addr, tenant_id } => {
             info!("Using tenant pool {} at {}", tenant_id, service_addr);
-            let result = execute_to_worker(socket, &service_addr, sql, user_id, skip_row_description, format_codes, column_types_hint).await;
+            let result = execute_to_worker(socket, &service_addr, sql, user_id, skip_row_description, format_codes, column_types_hint, session_params).await;
             (result, None)
         }
         QueryTarget::WorkerPool => {
-            let result = execute_default(socket, worker_client, sql, user_id, skip_row_description, format_codes, column_types_hint).await;
+            let result = execute_default(socket, worker_client, sql, user_id, skip_row_description, format_codes, column_types_hint, session_params).await;
             (result, None)
         }
     };
@@ -321,6 +325,7 @@ async fn execute_with_smart_scaler<S>(
     skip_row_description: bool,
     format_codes: &[i16],
     column_types_hint: &[String],
+    session_params: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<usize>
 where
     S: AsyncWrite + Unpin,
@@ -348,7 +353,7 @@ where
 
             warn!("No SmartScaler worker available after waiting, falling back to pool");
             metrics::query_ended();
-            return execute_default(socket, worker_client, sql, user_id, skip_row_description, format_codes, column_types_hint).await;
+            return execute_default(socket, worker_client, sql, user_id, skip_row_description, format_codes, column_types_hint, session_params).await;
         }
     };
 
@@ -369,7 +374,7 @@ where
 
     let elastic_handle = scaler.start_elastic_monitoring(selection.worker_name.clone());
 
-    let result = execute_to_worker(socket, &selection.worker_address, sql, user_id, skip_row_description, format_codes, column_types_hint).await;
+    let result = execute_to_worker(socket, &selection.worker_address, sql, user_id, skip_row_description, format_codes, column_types_hint, session_params).await;
 
     elastic_handle.abort();
 
@@ -393,6 +398,7 @@ async fn execute_to_worker<S>(
     skip_row_description: bool,
     format_codes: &[i16],
     column_types_hint: &[String],
+    session_params: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<usize>
 where
     S: AsyncWrite + Unpin,
@@ -433,7 +439,7 @@ where
             max_rows: 0,
             max_bytes: 0,
             enable_profiling: false,
-            session_params: Default::default(),
+            session_params: session_params.clone(),
         }),
         allocated_resources: None,
     };
@@ -584,6 +590,7 @@ async fn execute_default<S>(
     skip_row_description: bool,
     format_codes: &[i16],
     column_types_hint: &[String],
+    session_params: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<usize>
 where
     S: AsyncWrite + Unpin,
@@ -597,7 +604,7 @@ where
         write_buffer_size: config.write_buffer_size,
     };
 
-    match worker_client.execute_query_streaming(sql, user_id).await {
+    match worker_client.execute_query_streaming_with_params(sql, user_id, session_params).await {
         Ok(mut stream) => {
             let mut writer = BackpressureWriter::new(&mut *socket, bp_config);
             let mut columns_sent = false;

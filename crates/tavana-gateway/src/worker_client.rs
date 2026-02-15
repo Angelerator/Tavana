@@ -235,12 +235,24 @@ impl WorkerClient {
         sql: &str,
         user_id: &str,
     ) -> Result<StreamingResult, anyhow::Error> {
+        self.execute_query_streaming_with_params(sql, user_id, &Default::default()).await
+    }
+
+    /// Execute a query with TRUE STREAMING and per-session credential parameters.
+    /// Session params carry user-provided credential SQL (SET/CREATE SECRET) that
+    /// the worker applies on the same connection before executing the query.
+    pub async fn execute_query_streaming_with_params(
+        &self,
+        sql: &str,
+        user_id: &str,
+        session_params: &std::collections::HashMap<String, String>,
+    ) -> Result<StreamingResult, anyhow::Error> {
         let mut client = self.get_client().await?;
 
         let query_id = Uuid::new_v4().to_string();
         debug!(
-            "Executing streaming query {} for user {}",
-            query_id, user_id
+            "Executing streaming query {} for user {} (session_creds={})",
+            query_id, user_id, session_params.len()
         );
 
         let request = proto::ExecuteQueryRequest {
@@ -257,7 +269,7 @@ impl WorkerClient {
                 max_rows: 0,          // 0 = unlimited rows (streaming)
                 max_bytes: 0,
                 enable_profiling: false,
-                session_params: Default::default(),
+                session_params: session_params.clone(),
             }),
             allocated_resources: None,
         };

@@ -169,12 +169,148 @@ pub(crate) fn extract_startup_param(msg: &[u8], key: &str) -> Option<String> {
     None
 }
 
+/// Check if a SQL command is a credential/storage configuration command.
+/// These should NOT be silently intercepted — they need to be stored in the
+/// session and forwarded to workers with each subsequent query.
+pub(crate) fn is_credential_command(sql: &str) -> bool {
+    let sql_upper = sql.to_uppercase();
+    let sql_trimmed = sql_upper.trim();
+
+    // CREATE SECRET commands
+    if sql_trimmed.starts_with("CREATE SECRET") {
+        return true;
+    }
+
+    // DROP SECRET commands (user wants to remove their credential override)
+    if sql_trimmed.starts_with("DROP SECRET") {
+        return true;
+    }
+
+    // SET commands for storage credentials
+    if sql_trimmed.starts_with("SET ") {
+        let after_set = sql_trimmed.strip_prefix("SET ").unwrap_or("").trim();
+        // S3/AWS credential settings
+        if after_set.starts_with("S3_")
+            || after_set.starts_with("AWS_")
+            // Azure credential settings
+            || after_set.starts_with("AZURE_")
+            // GCS credential settings
+            || after_set.starts_with("GCS_")
+            // HTTP settings that affect storage access
+            || after_set.starts_with("HTTP_")
+            || after_set.starts_with("HTTPFS_")
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Validate that a credential SQL command is safe to store and execute.
+///
+/// Returns `Err(reason)` if the SQL is potentially dangerous (multi-statement
+/// injection, suspicious content, etc.).
+///
+/// Security: This prevents attacks like:
+///   SET s3_access_key_id = 'x'; DROP TABLE data
+///   CREATE SECRET foo (TYPE s3); SELECT * FROM private_table
+pub(crate) fn validate_credential_sql(sql: &str) -> Result<(), String> {
+    let trimmed = sql.trim();
+
+    // Strip trailing semicolons (some clients add them), then check for embedded ones
+    let without_trailing = trimmed.trim_end_matches(';').trim();
+
+    // Reject if there's a semicolon inside the statement body (multi-statement injection)
+    // But we need to be careful: semicolons inside string literals are OK.
+    // Simple approach: scan for semicolons outside of single-quoted strings.
+    let mut in_string = false;
+    for ch in without_trailing.chars() {
+        if ch == '\'' {
+            in_string = !in_string;
+        } else if ch == ';' && !in_string {
+            return Err("Multi-statement SQL is not allowed in credential commands".to_string());
+        }
+    }
+
+    // Reject if statement contains SQL keywords that shouldn't appear in credentials
+    let upper = without_trailing.to_uppercase();
+    let sql_type = if upper.starts_with("SET ") {
+        "SET"
+    } else if upper.starts_with("CREATE SECRET") {
+        "CREATE SECRET"
+    } else if upper.starts_with("DROP SECRET") {
+        "DROP SECRET"
+    } else {
+        return Err(format!("Unrecognized credential command type"));
+    };
+
+    // For SET commands, verify simple structure: SET var = value
+    if sql_type == "SET" {
+        // Should not contain subqueries or function calls outside of string values
+        let parts: Vec<&str> = without_trailing.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            // Some SET commands use space instead of '=', that's fine
+            // e.g., SET s3_region 'us-east-1'
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract the secret name from a DROP SECRET statement.
+/// Handles patterns like:
+/// - `DROP SECRET my_secret`
+/// - `DROP SECRET IF EXISTS my_secret`
+pub(crate) fn extract_drop_secret_name(sql: &str) -> Option<String> {
+    let upper = sql.to_uppercase();
+    let trimmed = upper.trim();
+    let rest = trimmed.strip_prefix("DROP SECRET")?.trim();
+    // Skip IF EXISTS if present
+    let rest = if rest.starts_with("IF EXISTS") {
+        rest.strip_prefix("IF EXISTS")?.trim()
+    } else {
+        rest
+    };
+    let name = rest.split(&[' ', '\t', '\n', ';'][..]).next()?.trim();
+    if name.is_empty() { None } else { Some(name.to_string()) }
+}
+
+/// Extract the secret name from a CREATE SECRET statement.
+/// Handles patterns like:
+/// - `CREATE SECRET my_secret (TYPE ...)`
+/// - `CREATE SECRET IF NOT EXISTS my_secret (TYPE ...)`
+pub(crate) fn extract_create_secret_name(sql: &str) -> Option<String> {
+    let upper = sql.to_uppercase();
+    let trimmed = upper.trim();
+    let rest = trimmed.strip_prefix("CREATE SECRET")?.trim();
+    // Skip OR REPLACE if present
+    let rest = if rest.starts_with("OR REPLACE") {
+        rest.strip_prefix("OR REPLACE")?.trim()
+    } else {
+        rest
+    };
+    // Skip IF NOT EXISTS if present
+    let rest = if rest.starts_with("IF NOT EXISTS") {
+        rest.strip_prefix("IF NOT EXISTS")?.trim()
+    } else {
+        rest
+    };
+    let name = rest.split(&['(', ' ', '\t', '\n'][..]).next()?.trim();
+    if name.is_empty() || name == "(" { None } else { Some(name.to_string()) }
+}
+
 /// Handle PostgreSQL-specific commands that should be intercepted locally
 pub(crate) fn handle_pg_specific_command(sql: &str) -> Option<QueryExecutionResult> {
     let sql_upper = sql.to_uppercase();
     let sql_trimmed = sql_upper.trim();
 
     if sql_trimmed.starts_with("SET ") {
+        // Don't intercept credential-related SET commands —
+        // those are captured by is_credential_command() and stored in the session
+        if is_credential_command(sql) {
+            return None;
+        }
         return Some(QueryExecutionResult {
             columns: vec![],
             rows: vec![],

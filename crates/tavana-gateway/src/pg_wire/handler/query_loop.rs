@@ -21,8 +21,9 @@ use super::messages::{
 };
 use super::portal::{PortalState, StreamingPortal};
 use super::utils::{
-    extract_copy_inner_query, get_transaction_state_change, handle_pg_specific_command,
-    substitute_parameters, TRANSACTION_STATUS_ERROR,
+    extract_copy_inner_query, extract_create_secret_name, extract_drop_secret_name,
+    get_transaction_state_change, handle_pg_specific_command,
+    is_credential_command, validate_credential_sql, substitute_parameters, TRANSACTION_STATUS_ERROR,
     TRANSACTION_STATUS_IDLE, TRANSACTION_STATUS_IN_TRANSACTION,
 };
 use std::sync::Arc;
@@ -58,6 +59,11 @@ where
     let mut schema_cache: std::collections::HashMap<String, Vec<(String, String)>> = std::collections::HashMap::new();
     let mut _cached_describe_columns: Option<Vec<(String, String)>> = None;
     let mut ignore_till_sync = false;
+
+    // Per-session credential storage: user-provided SET/CREATE SECRET commands
+    // are stored here and forwarded as session_params with every query to workers.
+    // This allows users to override infra-level credentials at query time.
+    let mut session_credentials: Vec<String> = Vec::new();
 
     macro_rules! update_transaction_status {
         ($new_status:expr) => {{
@@ -123,6 +129,84 @@ where
                         "Transaction command detected - updating status"
                     );
                     update_transaction_status!(new_tx_status);
+                }
+
+                // Credential commands: store in session and return success to client
+                if is_credential_command(&query) {
+                    // Security: validate credential SQL before storing
+                    if let Err(reason) = validate_credential_sql(&query) {
+                        warn!("Rejected credential command: {}", reason);
+                        send_error(socket, &format!("Invalid credential command: {}", reason)).await?;
+                        socket.write_all(&ready).await?;
+                        socket.flush().await?;
+                        continue;
+                    }
+
+                    // For DROP SECRET, remove only the matching CREATE SECRET from session
+                    if query_trimmed.starts_with("DROP SECRET") {
+                        let drop_name = extract_drop_secret_name(&query);
+                        let before_len = session_credentials.len();
+                        if let Some(ref target_name) = drop_name {
+                            session_credentials.retain(|s| {
+                                if let Some(existing_name) = extract_create_secret_name(s) {
+                                    existing_name != *target_name
+                                } else {
+                                    true
+                                }
+                            });
+                        }
+                        info!(
+                            "Session credential DROP SECRET '{}': removed {} stored secrets, {} credentials remain",
+                            drop_name.as_deref().unwrap_or("?"),
+                            before_len - session_credentials.len(),
+                            session_credentials.len()
+                        );
+                    } else {
+                        // For SET commands, replace any existing SET for the same variable
+                        if query_trimmed.starts_with("SET ") {
+                            let var_name = query_trimmed
+                                .strip_prefix("SET ")
+                                .and_then(|s| s.split(&['=', ' '][..]).next())
+                                .unwrap_or("")
+                                .trim()
+                                .to_uppercase();
+                            if !var_name.is_empty() {
+                                session_credentials.retain(|s| {
+                                    let s_upper = s.to_uppercase();
+                                    let s_trimmed = s_upper.trim();
+                                    if let Some(rest) = s_trimmed.strip_prefix("SET ") {
+                                        let existing_var = rest.split(&['=', ' '][..]).next().unwrap_or("").trim();
+                                        existing_var != var_name
+                                    } else {
+                                        true
+                                    }
+                                });
+                            }
+                        }
+                        session_credentials.push(query.clone());
+                        info!(
+                            "Session credential stored ({} total, type: {})",
+                            session_credentials.len(),
+                            if query_trimmed.starts_with("SET ") {
+                                query_trimmed.split(&['=', ' '][..]).nth(1).unwrap_or("unknown").trim()
+                            } else {
+                                "CREATE SECRET"
+                            }
+                        );
+                    }
+
+                    // Return success to client
+                    let command_tag = if query_trimmed.starts_with("SET ") {
+                        "SET"
+                    } else if query_trimmed.starts_with("CREATE SECRET") {
+                        "CREATE SECRET"
+                    } else {
+                        "OK"
+                    };
+                    send_simple_result(socket, &[], &[], Some(command_tag)).await?;
+                    socket.write_all(&ready).await?;
+                    socket.flush().await?;
+                    continue;
                 }
 
                 // Cursor commands
@@ -198,9 +282,16 @@ where
                         let start = std::time::Instant::now();
                         let timeout_duration = Duration::from_secs(config.query_timeout_secs);
 
+                        // Build session_params from stored credentials
+                        let session_params: std::collections::HashMap<String, String> = session_credentials
+                            .iter()
+                            .enumerate()
+                            .map(|(i, sql)| (format!("_cred_{}", i), sql.clone()))
+                            .collect();
+
                         let result = tokio::time::timeout(
                             timeout_duration,
-                            execute_simple_query(socket, worker_client, query_router, &query, user_id, smart_scaler)
+                            execute_simple_query(socket, worker_client, query_router, &query, user_id, smart_scaler, &session_params)
                         ).await;
 
                         let duration_ms = start.elapsed().as_millis() as u64;
@@ -698,6 +789,69 @@ where
 
                     let final_sql = pg_compat::rewrite_pg_to_duckdb(&final_sql);
 
+                    // Credential commands via Extended Protocol: capture and return success
+                    if is_credential_command(&final_sql) {
+                        // Security: validate credential SQL before storing
+                        if let Err(reason) = validate_credential_sql(&final_sql) {
+                            warn!("Extended Protocol - Rejected credential command: {}", reason);
+                            send_error(socket, &format!("Invalid credential command: {}", reason)).await?;
+                            ignore_till_sync = true;
+                            update_transaction_status!(TRANSACTION_STATUS_ERROR);
+                            continue;
+                        }
+
+                        let final_upper = final_sql.to_uppercase();
+                        let final_trimmed = final_upper.trim();
+                        if final_trimmed.starts_with("DROP SECRET") {
+                            let drop_name = extract_drop_secret_name(&final_sql);
+                            if let Some(ref target_name) = drop_name {
+                                session_credentials.retain(|s| {
+                                    if let Some(existing_name) = extract_create_secret_name(s) {
+                                        existing_name != *target_name
+                                    } else {
+                                        true
+                                    }
+                                });
+                            }
+                        } else {
+                            if final_trimmed.starts_with("SET ") {
+                                let var_name = final_trimmed
+                                    .strip_prefix("SET ")
+                                    .and_then(|s| s.split(&['=', ' '][..]).next())
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_uppercase();
+                                if !var_name.is_empty() {
+                                    session_credentials.retain(|s| {
+                                        let s_upper = s.to_uppercase();
+                                        let s_tr = s_upper.trim();
+                                        if let Some(rest) = s_tr.strip_prefix("SET ") {
+                                            let existing_var = rest.split(&['=', ' '][..]).next().unwrap_or("").trim();
+                                            existing_var != var_name
+                                        } else {
+                                            true
+                                        }
+                                    });
+                                }
+                            }
+                            session_credentials.push(final_sql.clone());
+                        }
+                        info!(
+                            "Extended Protocol - Session credential stored ({} total)",
+                            session_credentials.len()
+                        );
+                        send_command_complete(socket, "SET").await?;
+                        socket.flush().await?;
+                        prepared_query = None;
+                        describe_sent_row_description = false;
+                        describe_column_count = 0;
+                        bound_parameters.clear();
+                        result_format_codes.clear();
+                        _cached_describe_columns = None;
+                        cached_column_types.clear();
+                        continue;
+                    }
+
                     if !describe_sent_row_description {
                         // Describe sent NoData — just send CommandComplete
                         let cmd_tag = if let Some(result) = handle_pg_specific_command(&final_sql) {
@@ -731,7 +885,14 @@ where
                         // TRUE STREAMING mode
                         info!("Extended Protocol - Execute: streaming mode, max_rows={}", max_rows);
 
-                        let stream_result = worker_client.execute_query_streaming(&final_sql, user_id).await;
+                        // Build session_params from stored credentials for Extended Protocol
+                        let session_params: std::collections::HashMap<String, String> = session_credentials
+                            .iter()
+                            .enumerate()
+                            .map(|(i, sql)| (format!("_cred_{}", i), sql.clone()))
+                            .collect();
+
+                        let stream_result = worker_client.execute_query_streaming_with_params(&final_sql, user_id, &session_params).await;
 
                         match stream_result {
                             Ok(mut stream) => {

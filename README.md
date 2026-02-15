@@ -10,6 +10,7 @@ Cloud-agnostic, auto-scaling SQL query engine for data lakes. Query petabytes of
 - **Cloud Storage**: S3, Azure ADLS Gen2, Google Cloud Storage
 - **Data Formats**: Delta Lake, Parquet, Iceberg, CSV, JSON
 - **Streaming Results**: Server-side cursors for memory-efficient large result sets
+- **Flexible Credentials**: Infrastructure-level (env vars, Workload Identity) with per-session user overrides via `SET` / `CREATE SECRET`
 
 ## Architecture
 
@@ -228,6 +229,37 @@ SELECT category, SUM(amount)
 FROM delta_scan('az://data/sales/') 
 GROUP BY category;
 ```
+
+## Credential Management
+
+Tavana supports two layers of credential configuration. User-provided credentials take priority over infrastructure-level defaults.
+
+**Infrastructure-level** (environment variables, Workload Identity):
+```bash
+# Set via Helm values, Docker env, or Kubernetes secrets
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AZURE_STORAGE_ACCOUNT_NAME=...
+```
+
+**User-level overrides** (per-session, via any SQL client):
+```sql
+-- Override S3 credentials for this session
+SET s3_access_key_id = 'AKIA...';
+SET s3_secret_access_key = '...';
+SET s3_region = 'eu-west-1';
+
+-- Or use DuckDB secrets for more complex setups
+CREATE SECRET my_azure (TYPE azure, PROVIDER access_token, ACCESS_TOKEN '...', ACCOUNT_NAME '...');
+
+-- Then query as usual — credentials apply automatically
+SELECT * FROM read_parquet('s3://my-private-bucket/data.parquet');
+
+-- Remove a secret override (reverts to infra defaults)
+DROP SECRET my_azure;
+```
+
+User credentials are session-scoped, forwarded securely to workers per-query, and cleaned up automatically so they never leak between users on shared connection pools.
 
 ## Configuration
 

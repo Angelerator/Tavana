@@ -1287,7 +1287,28 @@ impl DuckDbExecutor {
     /// The callback receives each RecordBatch as it's produced by DuckDB.
     /// Returns (schema, total_rows) on success.
     #[instrument(skip(self, batch_callback))]
-    pub fn execute_query_streaming<F>(&self, sql: &str, mut batch_callback: F) -> Result<(Arc<Schema>, u64)>
+    pub fn execute_query_streaming<F>(&self, sql: &str, batch_callback: F) -> Result<(Arc<Schema>, u64)>
+    where
+        F: FnMut(RecordBatch) -> Result<()>,
+    {
+        self.execute_query_streaming_with_session(sql, &std::collections::HashMap::new(), batch_callback)
+    }
+
+    /// Execute a query with TRUE STREAMING and per-session credential overrides.
+    ///
+    /// Session params carry user-provided credential SQL (SET/CREATE SECRET) that
+    /// are applied on the SAME connection before executing the query. After the query
+    /// completes (success or failure), infra-level credentials are restored so the
+    /// connection is clean for the next user.
+    ///
+    /// User credentials have PRIORITY over infra-level credentials.
+    #[instrument(skip(self, batch_callback))]
+    pub fn execute_query_streaming_with_session<F>(
+        &self,
+        sql: &str,
+        session_params: &std::collections::HashMap<String, String>,
+        mut batch_callback: F,
+    ) -> Result<(Arc<Schema>, u64)>
     where
         F: FnMut(RecordBatch) -> Result<()>,
     {
@@ -1298,12 +1319,19 @@ impl DuckDbExecutor {
         self.check_azure_token_emergency_refresh();
         
         let pooled_conn = self.get_connection();
-        debug!("Using connection {} for streaming query", pooled_conn.id);
+        let has_session_creds = !session_params.is_empty();
+        debug!("Using connection {} for streaming query (session_creds={})", pooled_conn.id, session_params.len());
 
         let conn = pooled_conn
             .connection
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        // Apply per-query session credentials BEFORE executing the query.
+        // This overrides infra-level credentials on this connection.
+        if has_session_creds {
+            Self::apply_session_credentials(&conn, session_params)?;
+        }
 
         // Execute the query and stream results
         let result: Result<(Arc<Schema>, u64)> = (|| {
@@ -1328,6 +1356,15 @@ impl DuckDbExecutor {
             Ok((schema, total_rows))
         })();
 
+        // ALWAYS restore infra credentials after the query, regardless of success/failure.
+        // This ensures the shared connection is clean for the next user's query.
+        // Pass session_params so we know exactly what to undo.
+        if has_session_creds {
+            if let Err(e) = Self::restore_after_session_credentials(&conn, session_params) {
+                warn!("Failed to restore credentials on connection {}: {}", pooled_conn.id, e);
+            }
+        }
+
         // If query failed, rollback to clear any aborted transaction state
         if result.is_err() {
             debug!("Streaming query failed, rolling back to clear transaction state");
@@ -1337,6 +1374,230 @@ impl DuckDbExecutor {
         }
 
         result
+    }
+
+    /// Apply user-provided session credentials on a DuckDB connection.
+    ///
+    /// Session params are keyed as `_cred_0`, `_cred_1`, etc., with values being
+    /// the raw SQL (e.g., `SET s3_access_key_id = 'xxx'` or `CREATE SECRET ...`).
+    /// They are sorted by key to preserve the order in which the user set them.
+    fn apply_session_credentials(
+        conn: &duckdb::Connection,
+        session_params: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        if session_params.is_empty() {
+            return Ok(());
+        }
+
+        // Sort by key to preserve insertion order (_cred_0, _cred_1, ...)
+        let mut cred_entries: Vec<_> = session_params
+            .iter()
+            .filter(|(k, _)| k.starts_with("_cred_"))
+            .collect();
+        cred_entries.sort_by_key(|(k, _)| k.clone());
+
+        info!("Applying {} session credential(s) before query", cred_entries.len());
+
+        for (key, cred_sql) in &cred_entries {
+            let sql_upper = cred_sql.to_uppercase();
+            let sql_trimmed = sql_upper.trim();
+
+            // For CREATE SECRET: drop existing secret with the same name first
+            // to allow user override of infra-level secrets
+            if sql_trimmed.starts_with("CREATE SECRET") {
+                // Extract secret name if present: CREATE SECRET [IF NOT EXISTS] name (...)
+                // We use CREATE OR REPLACE semantics by dropping first
+                let secret_name = Self::extract_secret_name(cred_sql);
+                if let Some(name) = &secret_name {
+                    let drop_sql = format!("DROP SECRET IF EXISTS {}", name);
+                    debug!("Dropping existing secret '{}' before user override", name);
+                    if let Err(e) = conn.execute(&drop_sql, params![]) {
+                        debug!("DROP SECRET {} (non-critical): {}", name, e);
+                    }
+                }
+            }
+
+            // Log credential type only, NEVER log credential values (access keys, tokens, secrets)
+            let cred_type = if sql_trimmed.starts_with("CREATE SECRET") {
+                "CREATE SECRET"
+            } else if sql_trimmed.starts_with("SET ") {
+                sql_trimmed.split(&['=', ' '][..]).nth(1).unwrap_or("unknown")
+            } else {
+                "unknown"
+            };
+            debug!("Applying session credential {}: type={}", key, cred_type);
+            if let Err(e) = conn.execute(cred_sql, params![]) {
+                warn!("Failed to apply session credential {}: {}", key, e);
+                return Err(anyhow::anyhow!("Failed to apply credential: {}", e));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Restore connection state after user session credentials were applied.
+    ///
+    /// This is a **targeted** undo: for each credential the user set, we either
+    /// restore the infra-level value from environment variables or RESET to DuckDB
+    /// default. For CREATE SECRET, we DROP the user's secret and recreate the infra
+    /// version if applicable.
+    ///
+    /// This approach prevents credential leakage between users sharing a connection pool.
+    fn restore_after_session_credentials(
+        conn: &duckdb::Connection,
+        session_params: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        debug!("Restoring connection after {} session credentials", session_params.len());
+
+        for (_key, cred_sql) in session_params.iter().filter(|(k, _)| k.starts_with("_cred_")) {
+            let upper = cred_sql.to_uppercase();
+            let trimmed = upper.trim();
+
+            if trimmed.starts_with("CREATE SECRET") {
+                // DROP the user-created secret
+                if let Some(name) = Self::extract_secret_name(cred_sql) {
+                    let drop_sql = format!("DROP SECRET IF EXISTS {}", name);
+                    debug!("Cleanup: dropping user secret '{}'", name);
+                    let _ = conn.execute(&drop_sql, params![]);
+
+                    // If this was an infra-level secret name, recreate it
+                    Self::recreate_infra_secret_if_needed(conn, &name);
+                }
+            } else if trimmed.starts_with("SET ") {
+                // Extract variable name and restore from env or RESET
+                if let Some(var_name) = Self::extract_set_variable_name(trimmed) {
+                    if let Some(restore_sql) = Self::get_infra_restore_sql(&var_name) {
+                        debug!("Cleanup: restoring {} from infra env", var_name);
+                        let _ = conn.execute(&restore_sql, params![]);
+                    } else {
+                        debug!("Cleanup: resetting {} to DuckDB default", var_name);
+                        let _ = conn.execute(&format!("RESET {}", var_name.to_lowercase()), params![]);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extract the variable name from a SET command (already uppercased/trimmed).
+    /// e.g., "SET S3_ACCESS_KEY_ID = 'xxx'" -> Some("S3_ACCESS_KEY_ID")
+    fn extract_set_variable_name(set_sql_upper: &str) -> Option<String> {
+        let rest = set_sql_upper.strip_prefix("SET ")?.trim();
+        let var = rest.split(&['=', ' ', '\t'][..]).next()?.trim();
+        if var.is_empty() { None } else { Some(var.to_string()) }
+    }
+
+    /// Map a DuckDB SET variable name to the infra-level restore SQL from env vars.
+    /// Returns None if no env var exists for this setting (will RESET to default).
+    fn get_infra_restore_sql(var_name: &str) -> Option<String> {
+        match var_name {
+            // S3 / AWS settings
+            "S3_REGION" => std::env::var("AWS_REGION").ok()
+                .map(|v| format!("SET s3_region = '{}'", v)),
+            "S3_ACCESS_KEY_ID" => std::env::var("AWS_ACCESS_KEY_ID").ok()
+                .map(|v| format!("SET s3_access_key_id = '{}'", v)),
+            "S3_SECRET_ACCESS_KEY" => std::env::var("AWS_SECRET_ACCESS_KEY").ok()
+                .map(|v| format!("SET s3_secret_access_key = '{}'", v)),
+            "S3_SESSION_TOKEN" => std::env::var("AWS_SESSION_TOKEN").ok()
+                .map(|v| format!("SET s3_session_token = '{}'", v)),
+            "S3_ENDPOINT" => std::env::var("AWS_ENDPOINT_URL").ok()
+                .map(|v| {
+                    let clean = v.replace("http://", "").replace("https://", "");
+                    format!("SET s3_endpoint = '{}'", clean)
+                }),
+            "S3_USE_SSL" => std::env::var("AWS_ENDPOINT_URL").ok()
+                .map(|v| {
+                    let use_ssl = v.starts_with("https://");
+                    format!("SET s3_use_ssl = {}", use_ssl)
+                }),
+            "S3_URL_STYLE" => std::env::var("AWS_S3_URL_STYLE").ok()
+                .map(|v| format!("SET s3_url_style = '{}'", v)),
+
+            // Azure settings
+            "AZURE_ACCOUNT_NAME" => std::env::var("AZURE_STORAGE_ACCOUNT_NAME").ok()
+                .map(|v| format!("SET azure_account_name = '{}'", v)),
+            "AZURE_STORAGE_CONNECTION_STRING" => std::env::var("AZURE_STORAGE_CONNECTION_STRING").ok()
+                .map(|v| format!("SET azure_storage_connection_string = '{}'", v)),
+
+            // GCS settings
+            "GCS_ACCESS_KEY_ID" => std::env::var("GCS_ACCESS_KEY_ID").ok()
+                .map(|v| format!("SET gcs_access_key_id = '{}'", v)),
+            "GCS_SECRET" => std::env::var("GCS_SECRET").ok()
+                .map(|v| format!("SET gcs_secret = '{}'", v)),
+
+            // No infra restore — will RESET to DuckDB default
+            _ => None,
+        }
+    }
+
+    /// If a dropped secret matches a known infra-level secret, recreate it.
+    fn recreate_infra_secret_if_needed(conn: &duckdb::Connection, secret_name: &str) {
+        match secret_name {
+            "AZURE_STORAGE" | "azure_storage" => {
+                if let Ok(account_name) = std::env::var("AZURE_STORAGE_ACCOUNT_NAME") {
+                    let access_token = std::env::var("AZURE_ACCESS_TOKEN").ok()
+                        .map(|t| (t, 3600u64))
+                        .or_else(|| Self::get_azure_access_token());
+
+                    let secret_sql = if let Some((token, _)) = access_token {
+                        format!(
+                            "CREATE SECRET IF NOT EXISTS azure_storage (\n\
+                                TYPE azure,\n\
+                                PROVIDER access_token,\n\
+                                ACCESS_TOKEN '{}',\n\
+                                ACCOUNT_NAME '{}'\n\
+                            )",
+                            token, account_name
+                        )
+                    } else {
+                        format!(
+                            "CREATE SECRET IF NOT EXISTS azure_storage (\n\
+                                TYPE azure,\n\
+                                PROVIDER credential_chain,\n\
+                                ACCOUNT_NAME '{}'\n\
+                            )",
+                            account_name
+                        )
+                    };
+                    debug!("Cleanup: recreating infra azure_storage secret");
+                    let _ = conn.execute(&secret_sql, params![]);
+                }
+            }
+            // Add other infra-level secret names here as needed
+            _ => {}
+        }
+    }
+
+    /// Extract the secret name from a CREATE SECRET SQL statement.
+    /// 
+    /// Handles patterns like:
+    /// - `CREATE SECRET my_secret (TYPE ...)`
+    /// - `CREATE SECRET IF NOT EXISTS my_secret (TYPE ...)`
+    fn extract_secret_name(sql: &str) -> Option<String> {
+        let upper = sql.to_uppercase();
+        let trimmed = upper.trim();
+        
+        // Remove CREATE SECRET prefix
+        let rest = trimmed.strip_prefix("CREATE SECRET")?;
+        let rest = rest.trim();
+        
+        // Skip IF NOT EXISTS if present
+        let rest = if rest.starts_with("IF NOT EXISTS") {
+            rest.strip_prefix("IF NOT EXISTS")?.trim()
+        } else {
+            rest
+        };
+        
+        // The next token is the secret name (before '(' or whitespace)
+        let name = rest.split(&['(', ' ', '\t', '\n'][..]).next()?;
+        let name = name.trim();
+        
+        if name.is_empty() || name == "(" {
+            None
+        } else {
+            Some(name.to_string())
+        }
     }
 
     /// Execute a query with parameters

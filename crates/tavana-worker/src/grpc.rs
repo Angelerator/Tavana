@@ -138,6 +138,12 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
         let sql = req.sql.clone();
         let query_id = req.query_id.clone();
         
+        // Extract session credentials from request options
+        let session_params = req.options
+            .as_ref()
+            .map(|o| o.session_params.clone())
+            .unwrap_or_default();
+        
         // Register query for cancellation support
         let cancellation_token = self.register_query(&query_id);
         let active_queries = self.active_queries.clone();
@@ -158,10 +164,10 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
             let mut first_batch_time: Option<std::time::Duration> = None;
             let mut last_progress_log = std::time::Instant::now();
 
-            info!(query_id = %query_id_clone, sql_preview = %&sql[..sql.len().min(100)], "Starting query execution");
+            info!(query_id = %query_id_clone, sql_preview = %&sql[..sql.len().min(100)], session_creds = session_params.len(), "Starting query execution");
 
             // Use the streaming API - batches are sent as they're produced
-            let result = executor.execute_query_streaming(&sql, |batch| {
+            let result = executor.execute_query_streaming_with_session(&sql, &session_params, |batch| {
                 // Check for cancellation before processing each batch
                 if cancel_token.is_cancelled() {
                     info!(query_id = %query_id_clone, "Query cancelled by client");
