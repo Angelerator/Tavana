@@ -6,7 +6,7 @@ Cloud-Agnostic Auto-Scaling DuckDB Query Platform
 
 ```bash
 # From Docker Hub
-helm install tavana oci://ghcr.io/tavana/charts/tavana
+helm install tavana oci://ghcr.io/angelerator/charts/tavana
 
 # Or from local
 helm install tavana ./helm/tavana
@@ -78,7 +78,7 @@ jdbc:arrow-flight-sql://tavana-gateway:9091/?useEncryption=false
 ### From OCI Registry (Recommended)
 
 ```bash
-helm install tavana oci://ghcr.io/tavana/charts/tavana \
+helm install tavana oci://ghcr.io/angelerator/charts/tavana \
   --namespace tavana \
   --create-namespace \
   --set global.imageRegistry=myacr.azurecr.io
@@ -232,7 +232,7 @@ metadata:
   namespace: argocd
 spec:
   source:
-    repoURL: oci://ghcr.io/tavana/charts
+    repoURL: oci://ghcr.io/angelerator/charts
     chart: tavana
     targetRevision: "1.0.0"
     helm:

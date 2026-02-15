@@ -24,22 +24,6 @@ Thumbs.db
 .env.local
 .env.*.local
 
-# Terraform
-terraform/.terraform/
-terraform/**/.terraform/
-terraform/*.tfstate
-terraform/**/*.tfstate
-terraform/*.tfstate.*
-terraform/**/*.tfstate.*
-terraform/*.tfplan
-terraform/**/*.tfplan
-terraform/*.tfvars
-terraform/**/*.tfvars
-!terraform/**/*.tfvars.example
-terraform/.terraform.lock.hcl
-terraform/**/.terraform.lock.hcl
-terraform/crash.log
-
 # Kubernetes
 *.kubeconfig
 kubeconfig

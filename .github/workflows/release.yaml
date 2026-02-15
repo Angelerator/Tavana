@@ -220,5 +220,5 @@ jobs:
             
             ### Quick Start
             
-            See [deployment documentation](./terraform/README.md) for full instructions.
+            See project README for deployment instructions.
 

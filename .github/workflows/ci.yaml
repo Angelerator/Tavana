@@ -11,7 +11,6 @@ on:
       - 'LICENSE'
       - 'CONTRIBUTING.md'
       - '**.sh'
-      - 'gitops-template/**'
 
 env:
   CARGO_TERM_COLOR: always

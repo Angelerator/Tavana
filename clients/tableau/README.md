@@ -35,8 +35,8 @@ Close and reopen Tableau Desktop, or restart Tableau Server.
    - **Server**: `tavana.example.com`
    - **Port**: `5432`
    - **Database**: `main` (or leave empty)
-   - **Username**: Your Separ username (e.g., `user@example.com`)
-   - **Password**: Your Separ password
+   - **Username**: Your username (e.g., `user@example.com`)
+   - **Password**: Your password
    - **Require SSL**: ✅ Checked
 
 ### 4. Use Custom SQL
