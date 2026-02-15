@@ -189,7 +189,6 @@ print(cursor.fetchall())
 - Connection Type: PostgreSQL
 - Host: `tavana.example.com`
 - Port: `5432`
-- See `clients/` folder for streaming configuration
 
 ### Arrow Flight SQL (Port 9091)
 
@@ -326,9 +325,6 @@ tavana/
 │   ├── tavana-worker/      # DuckDB execution, streaming
 │   └── tavana-common/      # Shared types, gRPC definitions
 ├── helm/tavana/            # Kubernetes Helm chart
-├── clients/                # Client configuration guides
-│   ├── dbeaver/
-│   └── tableau/
 ├── proto/                  # gRPC protocol definitions
 ├── Dockerfile.gateway
 └── Dockerfile.worker
