@@ -50,19 +50,20 @@ gateway:
     enabled: true               # Expose Tavana externally
     externalPort: 443           # External port (443 passes corporate firewalls)
     exposeHttp: false
-    exposeFlight: false
+    exposeFlight: true          # Expose Arrow Flight SQL (2.2x faster than PG wire)
     annotations:
       # Use internal Azure Load Balancer (recommended for security)
       # service.beta.kubernetes.io/azure-load-balancer-internal: "true"
   
-  # Resource sizing for D4s_v3 nodes (4 vCPU, 16 GB)
+  # Resource sizing — gateway serializes Arrow batches to PG wire / Flight SQL
+  # More CPU = faster serialization for large result sets
   resources:
     requests:
-      memory: "1Gi"
-      cpu: "500m"
+      memory: "2Gi"
+      cpu: "1"
     limits:
-      memory: "4Gi"
-      cpu: "2000m"
+      memory: "8Gi"
+      cpu: "4"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # WORKER CONFIGURATION (Query Execution)
@@ -96,16 +97,16 @@ worker:
     #     maxRestarts: 3
     rules: []
   
-  # Resource sizing optimized by VPA
-  # Smaller limits allow more workers = better parallelism
-  # VPA will adjust based on actual usage
+  # Resource sizing for high-throughput DuckDB execution
+  # DuckDB uses 1 thread per CPU core — more cores = faster scans
+  # Memory determines whether large scans stay in-memory or spill to disk
   resources:
     requests:
-      memory: "2Gi"       # VPA recommendation
-      cpu: "250m"         # VPA recommendation
+      memory: "4Gi"
+      cpu: "2"
     limits:
-      memory: "4Gi"       # Allow bursting to 4Gi
-      cpu: "2"            # 2 cores max per worker
+      memory: "16Gi"       # DuckDB can use up to 80% for query execution
+      cpu: "4"             # 4 cores = 4 DuckDB threads per worker
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # AUTOSCALING (HPA)

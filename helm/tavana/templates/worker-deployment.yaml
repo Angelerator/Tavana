@@ -112,9 +112,13 @@ spec:
               mountPath: /home/tavana
       volumes:
         - name: tmp
-          emptyDir: {}
+          emptyDir:
+            medium: Memory    # RAM-backed tmpfs for DuckDB spill files
+            sizeLimit: 2Gi
         - name: duckdb-home
-          emptyDir: {}
+          emptyDir:
+            medium: Memory    # RAM-backed tmpfs for DuckDB temp storage
+            sizeLimit: 4Gi
 ---
 apiVersion: v1
 kind: Service

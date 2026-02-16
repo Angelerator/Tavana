@@ -44,7 +44,7 @@ gateway:
     #   - "10.0.0.0/8"
     exposeHttp: false           # Expose HTTP health/metrics externally
     httpExternalPort: 8080
-    exposeFlight: false         # Expose Arrow Flight SQL externally  
+    exposeFlight: true          # Expose Arrow Flight SQL externally (2.2x faster)
     flightExternalPort: 9091
     annotations: {}
     # Azure-specific annotations:
@@ -133,7 +133,7 @@ worker:
   resources:
     requests:
       memory: "4Gi"
-      cpu: "500m"
+      cpu: "2"
     limits:
       memory: "16Gi"
       cpu: "4"
