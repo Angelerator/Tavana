@@ -25,11 +25,11 @@ import time
 # ---------------------------------------------------------------------------
 # Configuration — override via environment variables or edit directly
 # ---------------------------------------------------------------------------
-TAVANA_HOST = os.environ.get("TAVANA_HOST", "tavana.example.com")
+TAVANA_HOST = os.environ.get("TAVANA_HOST", "localhost")
 TAVANA_PG_PORT = int(os.environ.get("TAVANA_PG_PORT", "5432"))
 TAVANA_FLIGHT_PORT = int(os.environ.get("TAVANA_FLIGHT_PORT", "9091"))
 TAVANA_DB = os.environ.get("TAVANA_DB", "main")
-TAVANA_USER = os.environ.get("TAVANA_USER", "your.name@example.com")
+TAVANA_USER = os.environ.get("TAVANA_USER", "tavana")
 TAVANA_PASSWORD = os.environ.get("TAVANA_PASSWORD", "your-password")
 
 SAMPLE_QUERY = """
