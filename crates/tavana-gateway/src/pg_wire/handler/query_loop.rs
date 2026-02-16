@@ -213,7 +213,13 @@ where
                 if query_trimmed.starts_with("DECLARE ") && query_trimmed.contains(" CURSOR ") {
                     debug!(query_trimmed = %query_trimmed, "Detected DECLARE CURSOR command");
                     let default_client = worker_client_pool.default_client();
-                    if let Some(result) = cursors::handle_declare_cursor(&query, &mut cursors, &default_client, user_id).await {
+                    // Build session_params from stored credentials for cursor operations
+                    let cursor_session_params: std::collections::HashMap<String, String> = session_credentials
+                        .iter()
+                        .enumerate()
+                        .map(|(i, sql)| (format!("_cred_{}", i), sql.clone()))
+                        .collect();
+                    if let Some(result) = cursors::handle_declare_cursor(&query, &mut cursors, &default_client, user_id, &cursor_session_params).await {
                         info!(cursor_count = cursors.len(), "DECLARE CURSOR handled successfully");
                         send_simple_result(socket, &[], &[], result.command_tag.as_deref()).await?;
                         socket.write_all(&ready).await?;

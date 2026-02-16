@@ -1206,6 +1206,13 @@ impl DuckDbExecutor {
         Arc::clone(&self.connections[idx])
     }
 
+    /// Get a specific connection by its pool index.
+    /// Used to pin cursors to the same connection that created their materialized table.
+    pub fn get_connection_by_id(&self, id: usize) -> Arc<PooledConnection> {
+        let idx = id % self.connections.len();
+        Arc::clone(&self.connections[idx])
+    }
+
     /// Execute a query and return Arrow record batches
     /// Uses connection pool for parallel execution
     /// 
@@ -1333,21 +1340,32 @@ impl DuckDbExecutor {
             Self::apply_session_credentials(&conn, session_params)?;
         }
 
-        // Execute the query and stream results
+        // Execute the query and stream results using stream_arrow for on-demand allocation.
+        // stream_arrow avoids materializing the entire result in DuckDB's memory;
+        // batches are produced lazily so peak memory stays proportional to batch_size.
         let result: Result<(Arc<Schema>, u64)> = (|| {
+            // Step 1: Get schema from a lightweight LIMIT 0 probe (no data scanned)
+            let schema = {
+                let schema_sql = format!(
+                    "SELECT * FROM ({}) AS __schema LIMIT 0",
+                    sql.trim().trim_end_matches(';')
+                );
+                let mut schema_stmt = conn.prepare(&schema_sql)?;
+                let schema_iter = schema_stmt.query_arrow(params![])?;
+                schema_iter.get_schema()
+            };
+
+            // Step 2: Stream data lazily — DuckDB only computes the next batch
+            // when the previous one has been consumed by the callback.
             let mut stmt = conn.prepare(sql)?;
-            let arrow_iter = stmt.query_arrow(params![])?;
-            // get_schema() returns Arc<Schema>, so don't double-wrap
-            let schema: Arc<Schema> = arrow_iter.get_schema();
+            let stream = stmt.stream_arrow(params![], schema.clone())?;
             
             let mut total_rows: u64 = 0;
             
-            // Stream each batch through the callback - NEVER collect into Vec
-            for batch in arrow_iter {
+            for batch in stream {
                 total_rows += batch.num_rows() as u64;
                 batch_callback(batch)?;
                 
-                // Log progress for very large queries
                 if total_rows % 1_000_000 == 0 {
                     info!("Streaming progress: {} rows processed", total_rows);
                 }
@@ -1381,7 +1399,7 @@ impl DuckDbExecutor {
     /// Session params are keyed as `_cred_0`, `_cred_1`, etc., with values being
     /// the raw SQL (e.g., `SET s3_access_key_id = 'xxx'` or `CREATE SECRET ...`).
     /// They are sorted by key to preserve the order in which the user set them.
-    fn apply_session_credentials(
+    pub fn apply_session_credentials(
         conn: &duckdb::Connection,
         session_params: &std::collections::HashMap<String, String>,
     ) -> Result<()> {
@@ -1443,7 +1461,7 @@ impl DuckDbExecutor {
     /// version if applicable.
     ///
     /// This approach prevents credential leakage between users sharing a connection pool.
-    fn restore_after_session_credentials(
+    pub fn restore_after_session_credentials(
         conn: &duckdb::Connection,
         session_params: &std::collections::HashMap<String, String>,
     ) -> Result<()> {

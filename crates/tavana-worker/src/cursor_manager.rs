@@ -34,8 +34,9 @@ pub struct CursorColumnMeta {
 /// Active cursor with streaming-friendly design
 /// 
 /// Instead of loading all results into memory (which caused OOM for large tables),
-/// this cursor uses LIMIT/OFFSET pagination to fetch data on-demand.
-/// Only a configurable number of rows are kept in memory at a time.
+/// this cursor materializes the query into a DuckDB table once, then serves
+/// FETCH requests from fast local LIMIT/OFFSET on the materialized table.
+/// This eliminates O(N²) re-scanning of remote data (e.g., Azure Delta Lake).
 pub struct ActiveCursor {
     /// Unique cursor ID
     pub id: String,
@@ -59,10 +60,18 @@ pub struct ActiveCursor {
     pub created_at: Instant,
     /// Last access time for idle cleanup
     last_accessed: Mutex<Instant>,
-    /// The original SQL query (wrapped with LIMIT/OFFSET for pagination)
+    /// The original SQL query (kept for diagnostics)
     pub sql: String,
+    /// Name of the materialized DuckDB table backing this cursor.
+    /// FETCH reads from this table instead of re-executing the original query.
+    pub materialized_table: Option<String>,
+    /// The pool connection ID that created the materialized table.
+    /// Cursor operations must use this same connection (tables are per-connection in DuckDB).
+    pub connection_id: usize,
     /// Schema for creating new batches
     schema: Arc<Schema>,
+    /// Session credentials to apply on connections before executing cursor queries
+    pub session_params: std::collections::HashMap<String, String>,
 }
 
 impl ActiveCursor {
@@ -74,6 +83,9 @@ impl ActiveCursor {
         schema: Arc<Schema>,
         initial_batches: Vec<RecordBatch>,
         initial_exhausted: bool,
+        session_params: std::collections::HashMap<String, String>,
+        materialized_table: Option<String>,
+        connection_id: usize,
     ) -> Self {
         let columns = schema
             .fields()
@@ -99,7 +111,10 @@ impl ActiveCursor {
             created_at: Instant::now(),
             last_accessed: Mutex::new(Instant::now()),
             sql,
+            materialized_table,
+            connection_id,
             schema,
+            session_params,
         }
     }
 
@@ -363,6 +378,8 @@ pub struct CursorManager {
     cursors: DashMap<String, Arc<ActiveCursor>>,
     /// Configuration
     config: CursorManagerConfig,
+    /// Tables from closed cursors that need to be dropped (deferred cleanup)
+    pending_table_drops: Mutex<Vec<String>>,
 }
 
 impl CursorManager {
@@ -371,6 +388,7 @@ impl CursorManager {
         Self {
             cursors: DashMap::new(),
             config,
+            pending_table_drops: Mutex::new(Vec::new()),
         }
     }
 
@@ -379,15 +397,21 @@ impl CursorManager {
         Self::new(CursorManagerConfig::default())
     }
 
-    /// Declare a new cursor by executing the query with LIMIT for initial batch
+    /// Declare a new cursor by materializing the query into a DuckDB table.
     /// 
-    /// IMPORTANT: This now uses LIMIT to fetch only the first batch of results,
-    /// preventing OOM for large Delta table scans. Subsequent fetches use LIMIT/OFFSET.
+    /// The entire result set is materialized once into a table named `__cursor_<id>`.
+    /// Subsequent FETCH operations read from this local table with fast LIMIT/OFFSET,
+    /// completely eliminating re-scanning of remote data sources (e.g., Azure Delta Lake).
+    /// 
+    /// For small results (< batch_size), no table is created — results are served
+    /// directly from the initial Arrow batch buffer.
     pub fn declare_cursor(
         &self,
         cursor_id: String,
         sql: &str,
         connection: &Connection,
+        session_params: std::collections::HashMap<String, String>,
+        connection_id: usize,
     ) -> Result<Arc<ActiveCursor>> {
         // Check cursor limit
         if self.cursors.len() >= self.config.max_cursors {
@@ -403,68 +427,81 @@ impl CursorManager {
         }
 
         let batch_size = max_cursor_batch_size();
+        // Use a unique suffix to prevent table name collisions when cursor IDs are reused.
+        // The timestamp ensures uniqueness even if the same cursor_id (e.g. "c1") is reused.
+        let unique_suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let safe_id: String = cursor_id.chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+            .collect();
+        let table_name = format!("__cursor_{}_{}", safe_id, unique_suffix);
+
         info!(
-            cursor_id = %cursor_id, 
-            sql = %&sql[..sql.len().min(100)], 
+            cursor_id = %cursor_id,
+            table_name = %table_name,
+            sql = %&sql[..sql.len().min(100)],
             batch_size = batch_size,
-            "Declaring cursor with streaming pagination"
+            "Declaring cursor — materializing query into DuckDB table"
         );
 
-        // Wrap query with LIMIT for initial batch to prevent OOM
-        // We fetch batch_size + 1 to detect if there are more rows
-        let initial_sql = format!(
-            "SELECT * FROM ({}) AS __cursor_subquery LIMIT {}",
-            sql.trim().trim_end_matches(';'),
-            batch_size + 1
-        );
+        // Materialize the full query result into a DuckDB table.
+        // This scans the remote source once; all subsequent FETCHes are local.
+        let execute_result = (|| -> Result<(Arc<Schema>, Vec<RecordBatch>, bool, Option<String>)> {
+            let create_sql = format!(
+                "CREATE OR REPLACE TABLE \"{}\" AS {}",
+                table_name,
+                sql.trim().trim_end_matches(';')
+            );
+            connection.execute(&create_sql, params![])?;
 
-        // Execute initial query with LIMIT, rolling back on error
-        let execute_result = (|| -> Result<(Arc<Schema>, Vec<RecordBatch>, bool)> {
+            // Fetch initial batch from the materialized table (fast local read)
+            let initial_sql = format!(
+                "SELECT * FROM \"{}\" LIMIT {}",
+                table_name,
+                batch_size + 1
+            );
             let mut stmt = connection.prepare(&initial_sql)?;
             let arrow_result = stmt.query_arrow(params![])?;
-            
-            // Get schema before consuming iterator
             let schema = arrow_result.get_schema();
 
-            // Collect initial batches (limited by LIMIT clause)
             let mut batches: Vec<RecordBatch> = Vec::new();
             let mut total_rows = 0;
-            
+
             for batch in arrow_result {
                 total_rows += batch.num_rows();
                 batches.push(batch);
-                
-                // Stop if we've collected enough for initial batch
                 if total_rows >= batch_size + 1 {
                     break;
                 }
             }
-            
-            // Check if we got more than batch_size (indicates more data available)
+
             let has_more = total_rows > batch_size;
-            
-            // If we got batch_size + 1, trim to batch_size
+
             if has_more && !batches.is_empty() {
-                // Trim the last batch if needed
                 let excess = total_rows - batch_size;
                 if let Some(last_batch) = batches.last() {
                     if last_batch.num_rows() <= excess {
-                        // Remove entire last batch
                         batches.pop();
                     }
-                    // Note: We don't perfectly trim here, accepting slightly more rows
-                    // This is acceptable as it's still bounded
                 }
             }
-            
-            Ok((schema, batches, !has_more))
+
+            // If no more data, drop the table immediately to reclaim memory
+            if !has_more {
+                let _ = connection.execute(&format!("DROP TABLE IF EXISTS \"{}\"", table_name), params![]);
+                Ok((schema, batches, true, None))
+            } else {
+                Ok((schema, batches, false, Some(table_name.clone())))
+            }
         })();
 
-        // Rollback on error to clear transaction state for next query on this connection
-        let (schema, batches, initially_exhausted) = match execute_result {
+        let (schema, batches, initially_exhausted, mat_table) = match execute_result {
             Ok(result) => result,
             Err(e) => {
-                debug!("Cursor query failed, rolling back to clear transaction state");
+                debug!("Cursor materialization failed, cleaning up");
+                let _ = connection.execute(&format!("DROP TABLE IF EXISTS \"{}\"", table_name), params![]);
                 if let Err(rollback_err) = connection.execute("ROLLBACK", params![]) {
                     warn!("Rollback failed (non-critical): {}", rollback_err);
                 }
@@ -478,23 +515,29 @@ impl CursorManager {
             batches = batches.len(),
             buffered_rows = buffered_rows,
             exhausted = initially_exhausted,
-            "Cursor declared with initial batch (streaming-friendly)"
+            materialized = mat_table.is_some(),
+            "Cursor declared (materialized table eliminates remote re-scanning)"
         );
 
         let cursor = Arc::new(ActiveCursor::new(
             cursor_id.clone(),
-            sql.to_string(), // Store original SQL for pagination
+            sql.to_string(),
             schema,
             batches,
             initially_exhausted,
+            session_params,
+            mat_table,
+            connection_id,
         ));
 
         self.cursors.insert(cursor_id, cursor.clone());
         Ok(cursor)
     }
     
-    /// Fetch more data for a cursor using LIMIT/OFFSET pagination
-    /// This is called when the cursor buffer is exhausted but more data exists
+    /// Fetch more data for a cursor from its materialized DuckDB table.
+    /// 
+    /// Since the full result was materialized during DECLARE, this is a fast
+    /// local LIMIT/OFFSET on an in-memory table — no remote data re-scanning.
     pub fn fetch_more_for_cursor(
         &self,
         cursor_id: &str,
@@ -512,10 +555,16 @@ impl CursorManager {
         let batch_size = max_cursor_batch_size();
         let offset = cursor.current_offset();
         
-        // Build paginated query
+        // Read from the materialized table (fast local scan) if available,
+        // otherwise fall back to the original query (legacy path).
+        let source = match &cursor.materialized_table {
+            Some(table) => format!("\"{}\"", table),
+            None => format!("({}) AS __cursor_subquery", cursor.sql.trim().trim_end_matches(';')),
+        };
+        
         let paginated_sql = format!(
-            "SELECT * FROM ({}) AS __cursor_subquery LIMIT {} OFFSET {}",
-            cursor.sql.trim().trim_end_matches(';'),
+            "SELECT * FROM {} LIMIT {} OFFSET {}",
+            source,
             batch_size + 1,
             offset
         );
@@ -524,10 +573,11 @@ impl CursorManager {
             cursor_id = %cursor_id,
             offset = offset,
             batch_size = batch_size,
-            "Fetching more cursor data with LIMIT/OFFSET"
+            materialized = cursor.materialized_table.is_some(),
+            "Fetching more cursor data from {}",
+            if cursor.materialized_table.is_some() { "materialized table" } else { "original query" }
         );
         
-        // Execute paginated query
         let execute_result = (|| -> Result<(Vec<RecordBatch>, bool)> {
             let mut stmt = connection.prepare(&paginated_sql)?;
             let arrow_result = stmt.query_arrow(params![])?;
@@ -557,6 +607,14 @@ impl CursorManager {
                     exhausted = exhausted,
                     "Fetched more cursor data"
                 );
+                
+                // If cursor is now exhausted and we have a materialized table, drop it
+                if exhausted {
+                    if let Some(table) = &cursor.materialized_table {
+                        let _ = connection.execute(&format!("DROP TABLE IF EXISTS \"{}\"", table), params![]);
+                        debug!(cursor_id = %cursor_id, table = %table, "Dropped materialized cursor table (exhausted)");
+                    }
+                }
                 
                 cursor.replace_buffer(batches, exhausted);
                 Ok(true)
@@ -625,9 +683,16 @@ impl CursorManager {
         Ok((batches, exhausted))
     }
 
-    /// Close and remove a cursor
+    /// Close and remove a cursor, dropping its materialized table if present.
+    /// If a connection is provided, the table is dropped immediately;
+    /// otherwise it will be cleaned up by the periodic cleanup task.
     pub fn close_cursor(&self, cursor_id: &str) -> bool {
         if let Some((_, cursor)) = self.cursors.remove(cursor_id) {
+            if let Some(table) = &cursor.materialized_table {
+                // Store table name for deferred cleanup (caller should invoke drop_cursor_table)
+                self.pending_table_drops.lock().push(table.clone());
+                debug!(cursor_id = %cursor_id, table = %table, "Cursor table queued for cleanup");
+            }
             info!(
                 cursor_id = %cursor_id,
                 total_rows = cursor.rows_fetched.load(Ordering::Relaxed),
@@ -640,9 +705,30 @@ impl CursorManager {
         }
     }
 
-    /// Close all cursors
+    /// Drop any pending materialized cursor tables.
+    /// Called periodically or when a connection is available.
+    pub fn drop_pending_tables(&self, connection: &Connection) {
+        let tables: Vec<String> = {
+            let mut pending = self.pending_table_drops.lock();
+            std::mem::take(&mut *pending)
+        };
+        for table in &tables {
+            match connection.execute(&format!("DROP TABLE IF EXISTS \"{}\"", table), params![]) {
+                Ok(_) => debug!(table = %table, "Dropped materialized cursor table"),
+                Err(e) => warn!(table = %table, error = %e, "Failed to drop cursor table"),
+            }
+        }
+    }
+
+    /// Close all cursors, queueing their materialized tables for cleanup
     pub fn close_all_cursors(&self) -> usize {
         let count = self.cursors.len();
+        let mut pending = self.pending_table_drops.lock();
+        for entry in self.cursors.iter() {
+            if let Some(table) = &entry.value().materialized_table {
+                pending.push(table.clone());
+            }
+        }
         self.cursors.clear();
         info!(count = count, "All cursors closed");
         count

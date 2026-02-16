@@ -296,17 +296,19 @@ pub async fn handle_declare_cursor(
     cursors: &mut ConnectionCursors,
     worker_client: &WorkerClient,
     user_id: &str,
+    session_params: &std::collections::HashMap<String, String>,
 ) -> Option<CursorResult> {
     let (cursor_name, query) = parse_declare_cursor(sql)?;
 
     info!(
         cursor_name = %cursor_name,
         query_preview = %&query[..query.len().min(80)],
+        session_creds = session_params.len(),
         "DECLARE CURSOR - using TRUE STREAMING (worker-side cursor)"
     );
 
     // Call worker's DeclareCursor gRPC - query is executed and iterator is held on worker
-    match worker_client.declare_cursor(&cursor_name, &query, user_id).await {
+    match worker_client.declare_cursor(&cursor_name, &query, user_id, session_params).await {
         Ok(result) => {
             let columns: Vec<(String, String)> = result.columns.iter()
                 .map(|c| (c.name.clone(), c.type_name.clone()))
@@ -407,7 +409,7 @@ pub async fn handle_fetch_cursor(
     // If cursor was declared with true streaming, use worker's FetchCursor gRPC
     // CRITICAL: Route to the correct worker using cursor.worker_addr!
     if cursor.uses_true_streaming {
-        let max_rows = if fetch_count == usize::MAX { 10000 } else { fetch_count };
+        let max_rows = if fetch_count == usize::MAX { usize::MAX } else { fetch_count };
         
         // Get the correct worker client using affinity routing
         let worker_client = worker_client_pool.get_or_create(cursor.worker_addr.as_deref());

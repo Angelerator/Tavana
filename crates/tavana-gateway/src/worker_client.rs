@@ -360,10 +360,11 @@ impl WorkerClient {
         cursor_id: &str,
         sql: &str,
         user_id: &str,
+        session_params: &std::collections::HashMap<String, String>,
     ) -> Result<DeclareCursorResult, anyhow::Error> {
         let mut client = self.get_client().await?;
 
-        info!(cursor_id = %cursor_id, sql = %&sql[..sql.len().min(80)], "Declaring cursor on worker");
+        info!(cursor_id = %cursor_id, sql = %&sql[..sql.len().min(80)], session_creds = session_params.len(), "Declaring cursor on worker");
 
         let request = proto::DeclareCursorRequest {
             cursor_id: cursor_id.to_string(),
@@ -379,7 +380,7 @@ impl WorkerClient {
                 max_rows: 0,          // Unlimited for cursors
                 max_bytes: 0,
                 enable_profiling: false,
-                session_params: Default::default(),
+                session_params: session_params.clone(),
             }),
         };
 

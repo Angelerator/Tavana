@@ -373,7 +373,14 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
         request: Request<proto::DeclareCursorRequest>,
     ) -> Result<Response<proto::DeclareCursorResponse>, Status> {
         let req = request.into_inner();
-        info!(cursor_id = %req.cursor_id, sql = %&req.sql[..req.sql.len().min(100)], "Declaring cursor");
+        
+        // Extract session credentials from request options
+        let session_params = req.options
+            .as_ref()
+            .map(|o| o.session_params.clone())
+            .unwrap_or_default();
+        
+        info!(cursor_id = %req.cursor_id, sql = %&req.sql[..req.sql.len().min(100)], session_creds = session_params.len(), "Declaring cursor");
 
         let executor = self.executor.clone();
         let cursor_manager = self.cursor_manager.clone();
@@ -383,7 +390,6 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
 
         // Execute in blocking context since DuckDB is synchronous
         let result = tokio::task::spawn_blocking(move || {
-            // Get a connection from the pool
             let pooled_conn = executor.get_connection();
             let conn = pooled_conn
                 .connection
@@ -391,7 +397,26 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
 
             match conn {
                 Ok(conn_guard) => {
-                    cursor_manager.declare_cursor(cursor_id, &sql, &conn_guard)
+                    let has_session_creds = !session_params.is_empty();
+                    
+                    // Apply user session credentials (SET/CREATE SECRET) before cursor creation
+                    if has_session_creds {
+                        if let Err(e) = crate::executor::DuckDbExecutor::apply_session_credentials(&conn_guard, &session_params) {
+                            return Err(anyhow::anyhow!("Failed to apply session credentials: {}", e));
+                        }
+                    }
+                    
+                    let conn_id = pooled_conn.id;
+                    let result = cursor_manager.declare_cursor(cursor_id, &sql, &conn_guard, session_params.clone(), conn_id);
+                    
+                    // Restore infra credentials after cursor creation to prevent leakage
+                    if has_session_creds {
+                        if let Err(e) = crate::executor::DuckDbExecutor::restore_after_session_credentials(&conn_guard, &session_params) {
+                            warn!("Failed to restore credentials after cursor declare: {}", e);
+                        }
+                    }
+                    
+                    result
                 }
                 Err(e) => Err(anyhow::anyhow!("Failed to acquire connection: {}", e)),
             }
@@ -469,6 +494,10 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
         let cursor = cursor.expect("cursor existence verified above");
         let columns: Vec<String> = cursor.columns.iter().map(|c| c.name.clone()).collect();
         let column_types: Vec<String> = cursor.columns.iter().map(|c| c.type_name.clone()).collect();
+        let cursor_session_params = cursor.session_params.clone();
+        let cursor_conn_id = cursor.connection_id;
+
+        let executor = self.executor.clone();
 
         // Spawn fetch in background
         tokio::spawn(async move {
@@ -489,74 +518,146 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
                 }))
                 .await;
 
-            // Fetch Arrow RecordBatch slices from cursor (zero-copy, no string conversion)
-            match cursor_manager.fetch_cursor_arrow(&cursor_id, max_rows) {
-                Ok((batches, exhausted)) => {
-                    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-                    
-                    for batch in &batches {
-                        if batch.num_rows() == 0 { continue; }
-                        
-                        // Serialize via Arrow IPC (same as execute_query path)
-                        let ipc_data = serialize_batch_to_arrow_ipc(batch);
+            // Fetch rows from cursor buffer, refilling from DuckDB when needed.
+            // The cursor uses LIMIT/OFFSET pagination internally — when the in-memory
+            // buffer is exhausted, we load the next batch from DuckDB before retrying.
+            let mut total_rows: usize = 0;
+            let mut rows_remaining = max_rows;
 
-                        debug!(
-                            cursor_id = %cursor_id,
-                            batch_rows = batch.num_rows(),
-                            bytes = ipc_data.len(),
-                            exhausted = exhausted,
-                            "Sending cursor fetch Arrow IPC batch"
-                        );
+            loop {
+                // Try fetching from the current buffer
+                let fetch_result = cursor_manager.fetch_cursor_arrow(&cursor_id, rows_remaining);
 
-                        let arrow_batch = proto::ArrowRecordBatch {
-                            schema: vec![],
-                            data: ipc_data,
-                            row_count: batch.num_rows() as u64,
-                            ipc_header: vec![],
-                            ipc_body: vec![],
-                        };
+                match fetch_result {
+                    Ok((batches, exhausted)) => {
+                        let batch_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                        total_rows += batch_rows;
+                        rows_remaining = rows_remaining.saturating_sub(batch_rows);
 
+                        for batch in &batches {
+                            if batch.num_rows() == 0 { continue; }
+
+                            let ipc_data = serialize_batch_to_arrow_ipc(batch);
+
+                            debug!(
+                                cursor_id = %cursor_id,
+                                batch_rows = batch.num_rows(),
+                                bytes = ipc_data.len(),
+                                exhausted = exhausted,
+                                "Sending cursor fetch Arrow IPC batch"
+                            );
+
+                            let arrow_batch = proto::ArrowRecordBatch {
+                                schema: vec![],
+                                data: ipc_data,
+                                row_count: batch.num_rows() as u64,
+                                ipc_header: vec![],
+                                ipc_body: vec![],
+                            };
+
+                            let _ = tx
+                                .send(Ok(proto::QueryResultBatch {
+                                    result: Some(proto::query_result_batch::Result::RecordBatch(
+                                        arrow_batch,
+                                    )),
+                                }))
+                                .await;
+                        }
+
+                        // If cursor is fully exhausted or we have enough rows, stop
+                        if exhausted || rows_remaining == 0 {
+                            break;
+                        }
+
+                        // Buffer is empty but cursor has more data — refill from DuckDB
+                        let cm = cursor_manager.clone();
+                        let cid = cursor_id.clone();
+                        let exec = executor.clone();
+                        let refill_creds = cursor_session_params.clone();
+
+                        let refill_ok = tokio::task::spawn_blocking(move || {
+                            // Pin to the same connection that created the materialized table
+                            let pooled_conn = exec.get_connection_by_id(cursor_conn_id);
+                            let conn = pooled_conn.connection.lock();
+                            match conn {
+                                Ok(conn_guard) => {
+                                    let has_creds = !refill_creds.is_empty();
+                                    
+                                    // Apply session credentials before refill query
+                                    if has_creds {
+                                        if let Err(e) = crate::executor::DuckDbExecutor::apply_session_credentials(&conn_guard, &refill_creds) {
+                                            warn!(cursor_id = %cid, error = %e, "Failed to apply session creds for cursor refill");
+                                            return false;
+                                        }
+                                    }
+                                    
+                                    let result = match cm.fetch_more_for_cursor(&cid, &conn_guard) {
+                                        Ok(has_more) => {
+                                            debug!(cursor_id = %cid, has_more = has_more, "Refilled cursor buffer");
+                                            true
+                                        }
+                                        Err(e) => {
+                                            warn!(cursor_id = %cid, error = %e, "Failed to refill cursor buffer");
+                                            false
+                                        }
+                                    };
+                                    
+                                    // Restore infra credentials after refill
+                                    if has_creds {
+                                        if let Err(e) = crate::executor::DuckDbExecutor::restore_after_session_credentials(&conn_guard, &refill_creds) {
+                                            warn!(cursor_id = %cid, error = %e, "Failed to restore creds after cursor refill");
+                                        }
+                                    }
+                                    
+                                    result
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Failed to acquire connection for cursor refill");
+                                    false
+                                }
+                            }
+                        })
+                        .await
+                        .unwrap_or(false);
+
+                        if !refill_ok {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!(cursor_id = %cursor_id, error = %e, "Cursor fetch failed");
                         let _ = tx
                             .send(Ok(proto::QueryResultBatch {
-                                result: Some(proto::query_result_batch::Result::RecordBatch(
-                                    arrow_batch,
-                                )),
+                                result: Some(proto::query_result_batch::Result::Error(proto::Error {
+                                    code: "CURSOR_FETCH_FAILED".to_string(),
+                                    message: e.to_string(),
+                                    details: Default::default(),
+                                })),
                             }))
                             .await;
+                        break;
                     }
-
-                    // Send profile
-                    let elapsed = start.elapsed();
-                    let profile = proto::QueryProfile {
-                        execution_time_ms: elapsed.as_millis() as u64,
-                        rows_scanned: 0,
-                        bytes_scanned: 0,
-                        rows_returned: total_rows as u64,
-                        bytes_returned: 0,
-                        peak_memory_bytes: 0,
-                        cpu_seconds: elapsed.as_secs_f32(),
-                        tables_accessed: vec![],
-                    };
-
-                    let _ = tx
-                        .send(Ok(proto::QueryResultBatch {
-                            result: Some(proto::query_result_batch::Result::Profile(profile)),
-                        }))
-                        .await;
-                }
-                Err(e) => {
-                    error!(cursor_id = %cursor_id, error = %e, "Cursor fetch failed");
-                    let _ = tx
-                        .send(Ok(proto::QueryResultBatch {
-                            result: Some(proto::query_result_batch::Result::Error(proto::Error {
-                                code: "CURSOR_FETCH_FAILED".to_string(),
-                                message: e.to_string(),
-                                details: Default::default(),
-                            })),
-                        }))
-                        .await;
                 }
             }
+
+            // Send profile after all batches
+            let elapsed = start.elapsed();
+            let profile = proto::QueryProfile {
+                execution_time_ms: elapsed.as_millis() as u64,
+                rows_scanned: 0,
+                bytes_scanned: 0,
+                rows_returned: total_rows as u64,
+                bytes_returned: 0,
+                peak_memory_bytes: 0,
+                cpu_seconds: elapsed.as_secs_f32(),
+                tables_accessed: vec![],
+            };
+
+            let _ = tx
+                .send(Ok(proto::QueryResultBatch {
+                    result: Some(proto::query_result_batch::Result::Profile(profile)),
+                }))
+                .await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -571,6 +672,22 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
         info!(cursor_id = %req.cursor_id, "Closing cursor");
 
         let success = self.cursor_manager.close_cursor(&req.cursor_id);
+        
+        // Drop any materialized cursor tables synchronously to prevent race conditions
+        // (reused cursor IDs could otherwise see a stale drop for a new table).
+        if success {
+            let executor = self.executor.clone();
+            let cm = self.cursor_manager.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let pooled_conn = executor.get_connection();
+                let conn = pooled_conn.connection.lock();
+                if let Ok(conn_guard) = conn {
+                    cm.drop_pending_tables(&conn_guard);
+                    drop(conn_guard);
+                }
+            })
+            .await;
+        }
         
         if success {
             Ok(Response::new(proto::CloseCursorResponse {
