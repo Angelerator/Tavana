@@ -277,6 +277,9 @@ User credentials are session-scoped, forwarded securely to workers per-query, an
 | `WORKER_ADDR` | `http://localhost:50053` | Worker gRPC address |
 | `TLS_ENABLED` | `false` | Enable TLS/SSL |
 | `LOG_LEVEL` | `info` | Log level |
+| `TAVANA_GRPC_STREAM_WINDOW_MB` | `512` | HTTP/2 per-stream window size (MB) |
+| `TAVANA_GRPC_CONN_WINDOW_MB` | `1024` | HTTP/2 connection window size (MB) |
+| `TAVANA_GRPC_CHANNEL_BUFFER` | `256` | Internal streaming channel buffer |
 
 **Worker:**
 | Variable | Default | Description |
@@ -300,6 +303,11 @@ gateway:
     enabled: false
   flightSql:
     enabled: true
+  # gRPC performance tuning (high-throughput Arrow streaming)
+  grpc:
+    streamWindowMB: 512      # HTTP/2 per-stream window
+    connectionWindowMB: 1024 # HTTP/2 connection window
+    channelBuffer: 256       # Streaming buffer size
 
 worker:
   replicaCount: 2
