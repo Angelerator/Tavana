@@ -51,15 +51,17 @@ async fn get_worker_channel(worker_addr: &str) -> anyhow::Result<Channel> {
     }
 
     // HTTP/2 window sizes matching the tuned WorkerClient settings
+    // Performance optimization: 512MB stream / 1GB connection windows
+    // eliminate flow control backpressure on large analytical result sets.
     let stream_window = std::env::var("TAVANA_GRPC_STREAM_WINDOW_MB")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(2)
+        .unwrap_or(512) // 512 MB default (was 2 MB - 256x increase)
         * 1024 * 1024;
     let conn_window = std::env::var("TAVANA_GRPC_CONN_WINDOW_MB")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(4)
+        .unwrap_or(1024) // 1 GB default (was 4 MB - 256x increase)
         * 1024 * 1024;
 
     let channel = Channel::from_shared(worker_addr.to_string())?

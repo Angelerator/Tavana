@@ -72,6 +72,14 @@ gateway:
     limits:
       memory: "8Gi"
       cpu: "4"
+  
+  # gRPC Performance Tuning (Gateway → Worker communication)
+  # High-performance settings for Azure deployments — matches worker HTTP/2 config.
+  # These eliminate flow control backpressure on large analytical result sets.
+  grpc:
+    streamWindowMB: 512       # HTTP/2 per-stream window (2MB → 512MB)
+    connectionWindowMB: 1024  # HTTP/2 connection window (4MB → 1GB)
+    channelBuffer: 256        # Streaming channel buffer (32 → 256 batches)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # WORKER CONFIGURATION (Query Execution)

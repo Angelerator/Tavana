@@ -84,6 +84,20 @@ gateway:
       memory: "4Gi"
       cpu: "2000m"
   
+  # gRPC Performance Tuning (Gateway → Worker communication)
+  # These settings control HTTP/2 flow control for Arrow IPC streaming.
+  # Higher values reduce WINDOW_UPDATE frame overhead for large result sets.
+  # Workers use 512MB/1GB by default — gateway should match for optimal throughput.
+  grpc:
+    # HTTP/2 stream window size (per-stream flow control)
+    # Higher = fewer flow control stalls, but more memory per stream
+    streamWindowMB: 512       # Default: 2MB → 512MB (256x increase)
+    # HTTP/2 connection window size (aggregate across all streams)
+    connectionWindowMB: 1024  # Default: 4MB → 1GB (256x increase)
+    # Internal channel buffer for streaming batches
+    # Higher = more batches buffered before backpressure kicks in
+    channelBuffer: 256        # Default: 32 → 256 (8x increase)
+  
   # Environment variables
   env: []
   

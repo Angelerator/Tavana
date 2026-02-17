@@ -137,6 +137,24 @@ spec:
               value: {{ .Values.auth.rateLimit.maxFailedAttempts | default 5 | quote }}
             - name: TAVANA_AUTH_RATE_LIMIT_BAN_SECS
               value: {{ .Values.auth.rateLimit.banDurationSecs | default 300 | quote }}
+            # gRPC Performance Tuning — HTTP/2 flow control for Arrow IPC streaming
+            # Higher window sizes eliminate WINDOW_UPDATE frame overhead on large result sets
+            {{- if .Values.gateway.grpc }}
+            - name: TAVANA_GRPC_STREAM_WINDOW_MB
+              value: {{ .Values.gateway.grpc.streamWindowMB | default 512 | quote }}
+            - name: TAVANA_GRPC_CONN_WINDOW_MB
+              value: {{ .Values.gateway.grpc.connectionWindowMB | default 1024 | quote }}
+            - name: TAVANA_GRPC_CHANNEL_BUFFER
+              value: {{ .Values.gateway.grpc.channelBuffer | default 256 | quote }}
+            {{- else }}
+            # Default high-performance gRPC settings (match worker HTTP/2 config)
+            - name: TAVANA_GRPC_STREAM_WINDOW_MB
+              value: "512"
+            - name: TAVANA_GRPC_CONN_WINDOW_MB
+              value: "1024"
+            - name: TAVANA_GRPC_CHANNEL_BUFFER
+              value: "256"
+            {{- end }}
             {{- with .Values.gateway.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
