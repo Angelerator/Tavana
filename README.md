@@ -192,13 +192,16 @@ print(cursor.fetchall())
 - Host: `tavana.example.com`
 - Port: `5432`
 
-### Arrow Flight SQL (Port 50051)
+### Arrow Flight SQL (Port 443 recommended)
+
+For best network compatibility (especially on Azure/corporate networks), use port 443.
 
 **Python (ADBC) - Recommended for large datasets:**
 ```python
 import adbc_driver_flightsql.dbapi as adbc
 
-with adbc.connect("grpc://localhost:50051") as conn:
+# Use port 443 for best Azure/corporate network compatibility
+with adbc.connect("grpc://tavana.example.com:443") as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM delta_scan('s3://bucket/table')")
         table = cur.fetch_arrow_table()  # Zero-copy Arrow data
@@ -206,7 +209,7 @@ with adbc.connect("grpc://localhost:50051") as conn:
 
 **JDBC:**
 ```
-jdbc:arrow-flight-sql://localhost:50051/?useEncryption=false
+jdbc:arrow-flight-sql://tavana.example.com:443/?useEncryption=false
 ```
 
 ## Query Examples

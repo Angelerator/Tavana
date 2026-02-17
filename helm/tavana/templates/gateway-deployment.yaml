@@ -64,6 +64,9 @@ spec:
               value: {{ .Values.config.workerServiceName | default "worker" }}
             - name: WORKER_SERVICE_PORT
               value: "{{ .Values.config.workerServicePort | default 50053 }}"
+            # Worker address for Flight SQL — must use FQDN and actual worker port for headless services
+            - name: WORKER_ADDR
+              value: "http://worker.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.config.workerServicePort | default 50053 }}"
             - name: PG_PORT
               value: "{{ .Values.gateway.service.pgPort }}"
             - name: HTTP_PORT
