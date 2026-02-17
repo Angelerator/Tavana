@@ -701,6 +701,408 @@ impl proto::query_service_server::QueryService for QueryServiceImpl {
             }))
         }
     }
+
+    // ============= Statistics Endpoints for Smart Query Routing =============
+
+    #[instrument(skip(self, request))]
+    async fn get_table_statistics(
+        &self,
+        request: Request<proto::GetTableStatisticsRequest>,
+    ) -> Result<Response<proto::GetTableStatisticsResponse>, Status> {
+        let req = request.into_inner();
+        info!(uri = %req.uri, "Getting table statistics for smart routing");
+
+        let executor = self.executor.clone();
+        let uri = req.uri.clone();
+        let include_columns = req.include_columns;
+
+        let result = tokio::task::spawn_blocking(move || {
+            let pooled_conn = executor.get_connection();
+            let conn = pooled_conn.connection.lock();
+            
+            match conn {
+                Ok(conn_guard) => {
+                    // Use DuckDB's SUMMARIZE or direct metadata queries to get statistics
+                    // For Delta/Parquet, we can query the metadata directly
+                    let stats = get_table_stats_from_duckdb(&conn_guard, &uri, include_columns);
+                    drop(conn_guard);
+                    stats
+                }
+                Err(e) => Err(format!("Failed to acquire connection: {}", e)),
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Task failed: {}", e)))?;
+
+        match result {
+            Ok(stats) => Ok(Response::new(proto::GetTableStatisticsResponse {
+                success: true,
+                statistics: Some(stats),
+                error_message: String::new(),
+                from_cache: false,
+            })),
+            Err(e) => Ok(Response::new(proto::GetTableStatisticsResponse {
+                success: false,
+                statistics: None,
+                error_message: e,
+                from_cache: false,
+            })),
+        }
+    }
+
+    #[instrument(skip(self, _request))]
+    async fn get_cluster_statistics(
+        &self,
+        _request: Request<proto::GetClusterStatisticsRequest>,
+    ) -> Result<Response<proto::GetClusterStatisticsResponse>, Status> {
+        // Get current worker stats
+        let cursor_stats = self.cursor_manager.stats();
+        
+        // Get system resource info
+        let sys_info = get_system_resources();
+        
+        Ok(Response::new(proto::GetClusterStatisticsResponse {
+            worker_count: 1, // Single worker; gateway should aggregate across workers
+            active_workers: 1,
+            total_memory_bytes: sys_info.total_memory,
+            available_memory_bytes: sys_info.available_memory,
+            active_queries: self.active_queries.len() as u32,
+            queued_queries: 0, // Would come from gateway
+            avg_query_latency_ms: 100.0, // TODO: Track actual latency
+            storage_bandwidth_gbps: 10.0, // Assume 10 Gbps internal storage
+            workers: vec![proto::WorkerStats {
+                worker_id: self.worker_id.clone(),
+                memory_bytes: sys_info.total_memory,
+                available_memory_bytes: sys_info.available_memory,
+                active_queries: self.active_queries.len() as u32,
+                cpu_usage_percent: sys_info.cpu_usage,
+            }],
+        }))
+    }
+
+    #[instrument(skip(self, request))]
+    async fn analyze_query(
+        &self,
+        request: Request<proto::AnalyzeQueryRequest>,
+    ) -> Result<Response<proto::AnalyzeQueryResponse>, Status> {
+        let req = request.into_inner();
+        info!(sql = %&req.sql[..req.sql.len().min(100)], "Analyzing query for routing optimization");
+
+        let executor = self.executor.clone();
+        let sql = req.sql.clone();
+        let local_tables = req.local_tables.clone();
+        let client_memory = req.local_memory_bytes;
+        let client_bandwidth = req.client_bandwidth_mbps;
+
+        let result = tokio::task::spawn_blocking(move || {
+            let pooled_conn = executor.get_connection();
+            let conn = pooled_conn.connection.lock();
+            
+            match conn {
+                Ok(conn_guard) => {
+                    let analysis = analyze_query_for_routing(
+                        &conn_guard, 
+                        &sql, 
+                        &local_tables,
+                        client_memory,
+                        client_bandwidth,
+                    );
+                    drop(conn_guard);
+                    analysis
+                }
+                Err(e) => Err(format!("Failed to acquire connection: {}", e)),
+            }
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Task failed: {}", e)))?;
+
+        match result {
+            Ok(response) => Ok(Response::new(response)),
+            Err(e) => Err(Status::internal(e)),
+        }
+    }
+}
+
+/// Get table statistics using DuckDB's metadata capabilities
+fn get_table_stats_from_duckdb(
+    conn: &duckdb::Connection,
+    uri: &str,
+    include_columns: bool,
+) -> Result<proto::TableStatistics, String> {
+    // For Delta Lake tables
+    if uri.contains("delta") || uri.starts_with("az://") || uri.starts_with("s3://") {
+        return get_delta_table_stats(conn, uri, include_columns);
+    }
+    
+    // For Parquet files
+    if uri.ends_with(".parquet") {
+        return get_parquet_file_stats(conn, uri, include_columns);
+    }
+    
+    // Generic approach: use EXPLAIN ANALYZE or SUMMARIZE
+    get_generic_table_stats(conn, uri, include_columns)
+}
+
+fn get_delta_table_stats(
+    conn: &duckdb::Connection,
+    uri: &str,
+    _include_columns: bool,
+) -> Result<proto::TableStatistics, String> {
+    // Try to get Delta table metadata using delta_scan metadata
+    let count_sql = format!(
+        "SELECT COUNT(*) as cnt FROM delta_scan('{}')",
+        uri.replace('\'', "''")
+    );
+    
+    let row_count: u64 = conn.query_row(&count_sql, [], |row| row.get(0))
+        .unwrap_or(0);
+    
+    // Estimate size based on row count (100 bytes per row default)
+    let estimated_size = row_count * 100;
+    
+    Ok(proto::TableStatistics {
+        row_count,
+        size_bytes: estimated_size,
+        file_count: (estimated_size / (128 * 1024 * 1024)).max(1) as u32,
+        last_updated: None,
+        column_stats: std::collections::HashMap::new(),
+    })
+}
+
+fn get_parquet_file_stats(
+    conn: &duckdb::Connection,
+    uri: &str,
+    _include_columns: bool,
+) -> Result<proto::TableStatistics, String> {
+    // Use parquet_metadata to get actual file statistics
+    let metadata_sql = format!(
+        "SELECT num_rows, total_uncompressed_size FROM parquet_metadata('{}')",
+        uri.replace('\'', "''")
+    );
+    
+    match conn.query_row(&metadata_sql, [], |row| {
+        Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64))
+    }) {
+        Ok((rows, size)) => Ok(proto::TableStatistics {
+            row_count: rows,
+            size_bytes: size,
+            file_count: 1,
+            last_updated: None,
+            column_stats: std::collections::HashMap::new(),
+        }),
+        Err(e) => Err(format!("Failed to get parquet metadata: {}", e)),
+    }
+}
+
+fn get_generic_table_stats(
+    conn: &duckdb::Connection,
+    uri: &str,
+    _include_columns: bool,
+) -> Result<proto::TableStatistics, String> {
+    // Fallback: run COUNT(*) 
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM read_parquet('{}') LIMIT 1",
+        uri.replace('\'', "''")
+    );
+    
+    let row_count: u64 = conn.query_row(&count_sql, [], |row| row.get(0))
+        .unwrap_or(10000); // Default estimate
+    
+    Ok(proto::TableStatistics {
+        row_count,
+        size_bytes: row_count * 100, // Estimate
+        file_count: 1,
+        last_updated: None,
+        column_stats: std::collections::HashMap::new(),
+    })
+}
+
+/// Get system resource information
+fn get_system_resources() -> SystemResourceInfo {
+    use sysinfo::{System, RefreshKind, CpuRefreshKind, MemoryRefreshKind};
+    
+    let mut sys = System::new_with_specifics(
+        RefreshKind::new()
+            .with_cpu(CpuRefreshKind::everything())
+            .with_memory(MemoryRefreshKind::everything())
+    );
+    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    sys.refresh_all();
+    
+    SystemResourceInfo {
+        total_memory: sys.total_memory(),
+        available_memory: sys.available_memory(),
+        cpu_usage: sys.global_cpu_usage(),
+    }
+}
+
+struct SystemResourceInfo {
+    total_memory: u64,
+    available_memory: u64,
+    cpu_usage: f32,
+}
+
+/// Analyze a query and recommend optimal routing strategy
+fn analyze_query_for_routing(
+    conn: &duckdb::Connection,
+    sql: &str,
+    local_tables: &[String],
+    client_memory_bytes: u64,
+    client_bandwidth_mbps: f64,
+) -> Result<proto::AnalyzeQueryResponse, String> {
+    // Parse query to extract tables accessed
+    let sql_lower = sql.to_lowercase();
+    
+    // Check for aggregation
+    let has_aggregation = sql_lower.contains("group by") 
+        || sql_lower.contains("sum(")
+        || sql_lower.contains("count(")
+        || sql_lower.contains("avg(");
+    
+    // Count GROUP BY columns
+    let group_by_columns = if has_aggregation {
+        let re = regex::Regex::new(r"group\s+by\s+([^;]+?)(?:having|order|limit|$)").ok();
+        re.and_then(|r| r.captures(&sql_lower))
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().matches(',').count() as u32 + 1)
+            .unwrap_or(1)
+    } else {
+        0
+    };
+    
+    // Count joins
+    let join_count = sql_lower.matches(" join ").count() as u32;
+    
+    // Check for window functions
+    let has_window = sql_lower.contains(" over ");
+    
+    // Estimate table sizes by running EXPLAIN or quick scans
+    // For now, use heuristics based on table names
+    let mut tables_accessed = Vec::new();
+    let mut table_sizes = Vec::new();
+    let mut total_remote_bytes: u64 = 0;
+    let mut total_local_bytes: u64 = 0;
+    
+    // Extract table references from query
+    let table_patterns = [
+        regex::Regex::new(r"from\s+(\S+)").ok(),
+        regex::Regex::new(r"join\s+(\S+)").ok(),
+        regex::Regex::new(r"delta_scan\s*\(\s*'([^']+)'\s*\)").ok(),
+    ];
+    
+    for pattern in table_patterns.iter().flatten() {
+        for cap in pattern.captures_iter(&sql_lower) {
+            if let Some(table) = cap.get(1) {
+                let table_name = table.as_str().trim_matches(|c| c == '\'' || c == '"');
+                tables_accessed.push(table_name.to_string());
+                
+                // Estimate size (in real implementation, query actual stats)
+                let estimated_rows = 1_000_000u64; // 1M rows default
+                let estimated_bytes = estimated_rows * 100; // 100 bytes/row
+                let is_local = local_tables.iter().any(|lt| lt.contains(table_name));
+                
+                if is_local {
+                    total_local_bytes += estimated_bytes;
+                } else {
+                    total_remote_bytes += estimated_bytes;
+                }
+                
+                table_sizes.push(proto::TableSizeInfo {
+                    uri: table_name.to_string(),
+                    row_count: estimated_rows,
+                    size_bytes: estimated_bytes,
+                    is_local,
+                });
+            }
+        }
+    }
+    
+    // Calculate costs for each strategy
+    let download_time_ms = (total_remote_bytes as f64 / (client_bandwidth_mbps * 1024.0 * 1024.0 / 8.0)) * 1000.0;
+    
+    // Aggregation reduction factor
+    let agg_factor = if has_aggregation {
+        match group_by_columns {
+            1 => 0.001,
+            2 => 0.01,
+            3 => 0.05,
+            _ => 0.1,
+        }
+    } else {
+        1.0
+    };
+    
+    let aggregated_bytes = (total_remote_bytes as f64 * agg_factor) as u64;
+    
+    // Determine best strategy
+    let (strategy, estimated_time_ms, transfer_bytes, rationale) = if total_remote_bytes == 0 {
+        (
+            proto::RoutingStrategy::AllLocal,
+            100.0, // Local compute only
+            0u64,
+            "All data is local, no network transfer needed".to_string(),
+        )
+    } else if total_local_bytes == 0 {
+        (
+            proto::RoutingStrategy::AllRemote,
+            200.0 + aggregated_bytes as f64 / (client_bandwidth_mbps * 1024.0 * 1024.0 / 8.0) * 1000.0,
+            aggregated_bytes,
+            "All data is remote, execute on cluster and download result".to_string(),
+        )
+    } else if has_aggregation && total_remote_bytes > total_local_bytes * 10 {
+        // Remote is much larger, aggregate there first
+        let result_bytes = aggregated_bytes;
+        let time = 300.0 + result_bytes as f64 / (client_bandwidth_mbps * 1024.0 * 1024.0 / 8.0) * 1000.0;
+        (
+            proto::RoutingStrategy::HybridRemoteAgg,
+            time,
+            result_bytes,
+            format!(
+                "Aggregate {}MB remote data on cluster (reduces to {}KB), then join with {}MB local data",
+                total_remote_bytes / 1_000_000,
+                result_bytes / 1_000,
+                total_local_bytes / 1_000_000
+            ),
+        )
+    } else if total_remote_bytes < client_memory_bytes / 2 {
+        // Remote data fits in memory, pull it
+        (
+            proto::RoutingStrategy::AllLocal,
+            download_time_ms + 500.0,
+            total_remote_bytes,
+            format!("Pull {}MB remote data to local (fits in memory)", total_remote_bytes / 1_000_000),
+        )
+    } else {
+        // Large remote data, stream it
+        (
+            proto::RoutingStrategy::Streaming,
+            download_time_ms * 1.2 + 1000.0, // Streaming overhead
+            total_remote_bytes,
+            format!("Stream {}MB in batches (constant memory)", total_remote_bytes / 1_000_000),
+        )
+    };
+    
+    Ok(proto::AnalyzeQueryResponse {
+        recommendation: Some(proto::RoutingRecommendation {
+            strategy: strategy.into(),
+            estimated_time_ms,
+            estimated_transfer_bytes: transfer_bytes,
+            rationale,
+        }),
+        alternatives: vec![], // Could add other strategies for comparison
+        plan_analysis: Some(proto::QueryPlanAnalysis {
+            estimated_input_rows: (total_remote_bytes + total_local_bytes) / 100,
+            estimated_output_rows: ((total_remote_bytes + total_local_bytes) as f64 * agg_factor) as u64,
+            estimated_bytes_scanned: total_remote_bytes + total_local_bytes,
+            has_aggregation,
+            group_by_columns,
+            join_count,
+            has_window_functions: has_window,
+            estimated_selectivity: 1.0, // TODO: Parse WHERE clause
+            tables_accessed,
+            table_sizes,
+        }),
+    })
 }
 
 /// Serialize a RecordBatch to FlightData-compatible split format (header + body).
