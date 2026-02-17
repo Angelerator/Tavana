@@ -627,10 +627,134 @@ impl DuckDbExecutor {
             }
         }
 
+        // ============= cache_httpfs: High-Performance Remote File Caching =============
+        // The cache_httpfs community extension provides:
+        // - On-disk caching of remote HTTP/S3/Azure data blocks
+        // - Parallel I/O with tunable parallelism
+        // - Cache hit/miss profiling
+        // - 11.6x speedup on repeated queries (documented in DuckDB community benchmarks)
+        //
+        // Installation: INSTALL cache_httpfs FROM community; LOAD cache_httpfs;
+        // This replaces httpfs as the HTTP handler when loaded.
+        //
+        // Configuration (via environment variables):
+        // - TAVANA_CACHE_HTTPFS_ENABLED: Enable/disable (default: true)
+        // - TAVANA_CACHE_HTTPFS_DIR: Cache directory (default: /tmp/duckdb_cache)
+        // - TAVANA_CACHE_HTTPFS_SIZE_GB: Max disk cache size (default: 50GB)
+        // - TAVANA_CACHE_HTTPFS_BLOCK_SIZE: Block size (default: 8MB)
+        // - TAVANA_CACHE_HTTPFS_PARALLEL_IO: Number of parallel I/O requests (default: 8)
+        
+        let cache_httpfs_enabled = std::env::var("TAVANA_CACHE_HTTPFS_ENABLED")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(true); // Enabled by default for performance
+        
+        if cache_httpfs_enabled {
+            // Install and load cache_httpfs from community extensions
+            // Note: Requires allow_community_extensions = true (default)
+            if let Err(e) = connection.execute("INSTALL cache_httpfs FROM community", params![]) {
+                tracing::debug!("cache_httpfs already installed or not available: {}", e);
+            }
+            
+            match connection.execute("LOAD cache_httpfs", params![]) {
+                Ok(_) => {
+                    tracing::info!("cache_httpfs extension loaded - remote file caching enabled");
+                    
+                    // Configure cache directory (must be writable by worker)
+                    let cache_dir = std::env::var("TAVANA_CACHE_HTTPFS_DIR")
+                        .unwrap_or_else(|_| "/tmp/duckdb_cache".to_string());
+                    
+                    // Create cache directory if it doesn't exist
+                    if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+                        tracing::warn!("Could not create cache_httpfs directory {}: {}", cache_dir, e);
+                    }
+                    
+                    // Enable on-disk caching (vs in-memory only)
+                    // On-disk caching persists across queries and is essential for performance
+                    if let Err(e) = connection.execute(
+                        "SELECT cache_httpfs_set_config('cache_httpfs_type', 'ON_DISK')",
+                        params![],
+                    ) {
+                        tracing::debug!("Could not set cache_httpfs_type: {}", e);
+                    }
+                    
+                    // Set cache directory
+                    if let Err(e) = connection.execute(
+                        &format!("SELECT cache_httpfs_set_config('cache_httpfs_dir', '{}')", cache_dir),
+                        params![],
+                    ) {
+                        tracing::debug!("Could not set cache_httpfs_dir: {}", e);
+                    }
+                    
+                    // Set maximum cache size (disk space to use)
+                    let cache_size_gb = std::env::var("TAVANA_CACHE_HTTPFS_SIZE_GB")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(50); // 50GB default
+                    let cache_size_bytes = cache_size_gb * 1024 * 1024 * 1024;
+                    
+                    if let Err(e) = connection.execute(
+                        &format!("SELECT cache_httpfs_set_config('max_disk_cache_size', '{}')", cache_size_bytes),
+                        params![],
+                    ) {
+                        tracing::debug!("Could not set max_disk_cache_size: {}", e);
+                    }
+                    
+                    // Set block size for caching (larger = fewer HTTP requests, more memory)
+                    let block_size_mb = std::env::var("TAVANA_CACHE_HTTPFS_BLOCK_SIZE_MB")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(8); // 8MB default (good for Parquet row groups)
+                    let block_size_bytes = block_size_mb * 1024 * 1024;
+                    
+                    if let Err(e) = connection.execute(
+                        &format!("SELECT cache_httpfs_set_config('data_block_size', '{}')", block_size_bytes),
+                        params![],
+                    ) {
+                        tracing::debug!("Could not set data_block_size: {}", e);
+                    }
+                    
+                    // Set parallel I/O configuration for high-throughput remote access
+                    let parallel_io = std::env::var("TAVANA_CACHE_HTTPFS_PARALLEL_IO")
+                        .ok()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or(8); // 8 parallel requests default
+                    
+                    if let Err(e) = connection.execute(
+                        &format!("SELECT cache_httpfs_set_config('nconn', '{}')", parallel_io),
+                        params![],
+                    ) {
+                        tracing::debug!("Could not set nconn: {}", e);
+                    }
+                    
+                    // Enable cache profiling for monitoring (optional)
+                    if std::env::var("TAVANA_CACHE_HTTPFS_PROFILING").is_ok() {
+                        if let Err(e) = connection.execute(
+                            "SELECT cache_httpfs_set_config('profile', 'true')",
+                            params![],
+                        ) {
+                            tracing::debug!("Could not enable cache_httpfs profiling: {}", e);
+                        }
+                    }
+                    
+                    tracing::info!(
+                        "cache_httpfs configured: dir={}, size={}GB, block_size={}MB, parallel_io={}",
+                        cache_dir, cache_size_gb, block_size_mb, parallel_io
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!("cache_httpfs not available (using standard httpfs): {}", e);
+                    tracing::debug!("To enable: ensure allow_community_extensions = true");
+                }
+            }
+        } else {
+            tracing::info!("cache_httpfs disabled via TAVANA_CACHE_HTTPFS_ENABLED=false");
+        }
+
         // Enable external file cache for S3/remote files (DuckDB 1.3+)
         // This caches remote data locally to avoid repeated network transfers
+        // Note: This is a fallback if cache_httpfs is not available
         if let Err(e) = connection.execute("SET enable_external_file_cache = true", params![]) {
-            tracing::warn!("Could not enable external file cache: {}", e);
+            tracing::debug!("enable_external_file_cache not available: {}", e);
         }
 
         // Configure temp directory for out-of-core processing (spill to disk)

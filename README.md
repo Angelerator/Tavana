@@ -281,12 +281,33 @@ User credentials are session-scoped, forwarded securely to workers per-query, an
 | `TAVANA_GRPC_CONN_WINDOW_MB` | `1024` | HTTP/2 connection window size (MB) |
 | `TAVANA_GRPC_CHANNEL_BUFFER` | `256` | Internal streaming channel buffer |
 
+**Gateway (Query Caching):**
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TAVANA_CACHE_REDIS_URL` | - | Redis/Dragonfly URL (e.g., `redis://redis:6379`) |
+| `TAVANA_CACHE_TTL_SECS` | `300` | Default cache TTL (5 minutes) |
+| `TAVANA_CACHE_MAX_SIZE_MB` | `100` | Maximum cacheable result size |
+| `TAVANA_CACHE_COMPRESSION` | `true` | Enable LZ4 compression |
+| `TAVANA_CACHE_VERSION` | `1` | Cache version (increment to invalidate all) |
+| `TAVANA_CACHE_L1_ENABLED` | `true` | Enable in-memory L1 cache |
+| `TAVANA_CACHE_L1_SIZE` | `1000` | L1 cache entries |
+
 **Worker:**
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GRPC_PORT` | `50053` | gRPC server port |
 | `MAX_MEMORY_GB` | `0` (auto) | Max memory for DuckDB |
 | `THREADS` | auto | DuckDB threads |
+
+**Worker (Remote File Caching):**
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TAVANA_CACHE_HTTPFS_ENABLED` | `true` | Enable cache_httpfs extension |
+| `TAVANA_CACHE_HTTPFS_DIR` | `/tmp/duckdb_cache` | Cache directory |
+| `TAVANA_CACHE_HTTPFS_SIZE_GB` | `50` | Maximum disk cache size |
+| `TAVANA_CACHE_HTTPFS_BLOCK_SIZE_MB` | `8` | Block size for caching |
+| `TAVANA_CACHE_HTTPFS_PARALLEL_IO` | `8` | Parallel I/O requests |
+| `TAVANA_CACHE_HTTPFS_PROFILING` | - | Enable cache profiling |
 
 ### Helm Values
 
@@ -327,7 +348,97 @@ objectStorage:
   endpoint: ""
   bucket: ""
   region: "us-east-1"
+
+# Query Result Caching (Redis/Dragonfly)
+# 25x faster with Dragonfly vs Redis
+queryCache:
+  enabled: false  # Requires Redis/Dragonfly deployment
+  redisUrl: "redis://redis:6379"
+  ttlSecs: 300
+  maxResultSizeMB: 100
+
+# Remote File Caching (cache_httpfs)
+# 11.6x speedup on repeated queries
+cacheHttpfs:
+  enabled: true
+  cacheDir: "/tmp/duckdb_cache"
+  maxSizeGB: 50
+  blockSizeMB: 8
+  parallelIO: 8
+
+# Network Performance Tuning (TCP BBR)
+# 10x improvement on lossy networks
+networkTuning:
+  enabled: false  # Requires privileged DaemonSet
+  tcpCongestionControl: "bbr"
+  tcpRmemMaxMB: 64
+  tcpWmemMaxMB: 64
 ```
+
+## Performance Optimizations
+
+Tavana includes several performance optimizations that can be enabled for production workloads:
+
+### Query Result Caching (Redis/Dragonfly)
+
+Cache query results in a distributed cache to avoid re-executing identical queries. Based on Redis caching best practices:
+
+- **Two-tier caching**: L1 (in-memory, <1μs) + L2 (Redis/Dragonfly, <1ms)
+- **Smart TTL**: Aggregate queries get 2x TTL, point queries get 0.5x TTL
+- **LZ4 compression**: Reduces network and storage overhead for large results
+- **Dragonfly recommended**: 25x faster than Redis, drop-in compatible
+
+```yaml
+# values.yaml
+queryCache:
+  enabled: true
+  redisUrl: "redis://dragonfly:6379"  # Or redis://redis:6379
+  ttlSecs: 300                         # 5 minute default TTL
+```
+
+### Remote File Caching (cache_httpfs)
+
+The `cache_httpfs` DuckDB community extension caches remote HTTP/S3/Azure data blocks locally:
+
+- **11.6x speedup** on repeated queries (documented benchmarks)
+- **On-disk caching** persists across query executions
+- **Parallel I/O** with configurable parallelism
+- **Automatic** for all remote file access
+
+```yaml
+# values.yaml
+cacheHttpfs:
+  enabled: true      # Enabled by default
+  maxSizeGB: 50      # Disk cache size
+  parallelIO: 8      # Concurrent connections
+```
+
+### Network Performance Tuning (TCP BBR)
+
+A DaemonSet that applies high-performance kernel network settings to all nodes:
+
+- **TCP BBR**: 10x performance on paths with packet loss
+- **Large buffers**: 64MB TCP buffers for 10G+ networks
+- **Fast Open**: Reduces latency for new connections
+
+```yaml
+# values.yaml
+networkTuning:
+  enabled: true
+  tcpCongestionControl: "bbr"
+  tcpRmemMaxMB: 64
+  tcpWmemMaxMB: 64
+```
+
+**Note**: Requires privileged containers. The DaemonSet runs once at startup to apply sysctl settings.
+
+### gRPC/HTTP/2 Optimization
+
+Already enabled by default for optimal Arrow streaming:
+
+- **512MB stream window**: Eliminates flow control backpressure
+- **1GB connection window**: Supports multiple concurrent streams
+- **256 batch buffer**: Maximizes pipeline throughput
 
 ## Project Structure
 

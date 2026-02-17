@@ -376,3 +376,116 @@ podDisruptionBudget:
   worker:
     enabled: true
     maxUnavailable: 1
+
+# =============================================================================
+# Query Result Caching (Redis/Dragonfly)
+# =============================================================================
+# Distributed cache for query results to avoid re-executing identical queries.
+# Supports Redis and Dragonfly (25x faster, drop-in compatible).
+#
+# Best practices applied:
+#   - TTL-based expiration (configurable per query pattern)
+#   - Two-tier caching: L1 (in-memory) + L2 (Redis/Dragonfly)
+#   - LZ4 compression for large results
+#   - BLAKE3 hashing for O(1) key lookups
+#
+queryCache:
+  enabled: false  # Enable to use caching (requires Redis/Dragonfly)
+  # Redis/Dragonfly connection URL
+  # Examples:
+  #   - redis://redis.tavana.svc:6379
+  #   - redis://:password@redis-master:6379/0
+  #   - rediss://secure-redis:6380 (TLS)
+  redisUrl: "redis://redis:6379"
+  # Default TTL for cached results (seconds)
+  # Aggregate queries get 2x TTL, point queries get 0.5x TTL
+  ttlSecs: 300
+  # Maximum cacheable result size (MB)
+  maxResultSizeMB: 100
+  # Enable LZ4 compression for results > 1KB
+  compression: true
+  # Cache version (increment to invalidate all entries)
+  version: 1
+  # L1 (in-memory) cache settings
+  l1:
+    enabled: true
+    size: 1000      # Number of entries
+    ttlSecs: 30     # Local cache TTL
+  # Use existing Redis secret for authentication
+  existingSecret: ""
+  existingSecretKey: "redis-password"
+
+# =============================================================================
+# Worker Remote File Caching (cache_httpfs)
+# =============================================================================
+# DuckDB community extension for caching remote HTTP/S3/Azure data blocks.
+# Provides 11.6x speedup on repeated queries (documented benchmarks).
+#
+# How it works:
+#   - Caches data blocks from remote files to local disk
+#   - Supports parallel I/O with tunable parallelism
+#   - Provides cache hit/miss profiling
+#   - Acts as a drop-in replacement for httpfs
+#
+cacheHttpfs:
+  enabled: true  # Enabled by default for performance
+  # Cache directory (must be writable by worker)
+  # For production: use a PVC-backed volume for persistence across restarts
+  cacheDir: "/tmp/duckdb_cache"
+  # Maximum disk cache size (GB)
+  # Set based on available disk space on worker nodes
+  maxSizeGB: 50
+  # Block size for caching (MB)
+  # Larger = fewer HTTP requests, more memory per block
+  # 8MB is good for typical Parquet row groups
+  blockSizeMB: 8
+  # Number of parallel I/O requests
+  # Higher = more throughput, more concurrent connections
+  parallelIO: 8
+  # Enable profiling (logs cache hit/miss statistics)
+  profiling: false
+
+# =============================================================================
+# Network Performance Tuning (TCP BBR)
+# =============================================================================
+# DaemonSet that applies high-performance kernel network settings to all nodes.
+# Based on ESnet (DOE) and Google research for high-bandwidth data transfer.
+#
+# TCP BBR benefits:
+#   - 10x performance on paths with packet loss
+#   - Avoids bufferbloat by not filling bottleneck buffers
+#   - Better throughput for high-latency connections (cloud cross-region)
+#
+# References:
+#   - https://fasterdata.es.net/host-tuning/linux
+#   - https://cloud.google.com/blog/products/networking/tcp-bbr-congestion-control
+#
+networkTuning:
+  enabled: false  # Enable to deploy network tuner DaemonSet
+  # TCP congestion control algorithm
+  # Options: bbr (recommended), cubic (default), reno
+  # BBR requires Linux kernel 4.9+ (all modern K8s nodes have this)
+  tcpCongestionControl: "bbr"
+  # Maximum TCP buffer sizes (MB) for 10G+ networks
+  # ESnet recommends 32-64MB per socket for high-bandwidth paths
+  tcpRmemMaxMB: 64
+  tcpWmemMaxMB: 64
+  # Socket backlog settings for high-connection scenarios
+  somaxconn: 65535
+  netdevMaxBacklog: 65535
+  tcpMaxSynBacklog: 65535
+  # TCP Fast Open (0=disabled, 1=client, 2=server, 3=both)
+  tcpFastOpen: 3
+  # MTU probing (0=disabled, 1=enabled when ICMP blackhole detected, 2=always)
+  tcpMtuProbing: 1
+  # Reuse TIME_WAIT sockets (safe for most workloads)
+  tcpTwReuse: true
+  # TIME_WAIT timeout (seconds, default 60 is often too long)
+  tcpFinTimeout: 15
+  # TCP keepalive settings (faster dead connection detection)
+  tcpKeepaliveTime: 60    # Start probes after 60s idle
+  tcpKeepaliveIntvl: 10   # Probe interval 10s
+  tcpKeepaliveProbes: 6   # 6 probes before declaring dead
+  # Node selector (optional, limit to specific node pools)
+  nodeSelector: {}
+    # nodepool: tavana

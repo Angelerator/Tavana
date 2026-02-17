@@ -110,3 +110,7 @@ rayon = "1"
 # Base64 encoding for Flight SQL auth
 base64 = { workspace = true }
 
+# Query result caching
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+lz4_flex = "0.11"
+

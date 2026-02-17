@@ -18,6 +18,7 @@ mod errors;
 mod flight_sql;
 mod metrics;
 mod pg_wire;
+mod query_cache;
 mod query_queue;
 mod query_router;
 mod smart_scaler;

@@ -155,6 +155,30 @@ spec:
             - name: TAVANA_GRPC_CHANNEL_BUFFER
               value: "256"
             {{- end }}
+            # Query Result Caching (Redis/Dragonfly)
+            {{- if .Values.queryCache.enabled }}
+            - name: TAVANA_CACHE_REDIS_URL
+              {{- if .Values.queryCache.existingSecret }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.queryCache.existingSecret }}
+                  key: {{ .Values.queryCache.existingSecretKey | default "redis-url" }}
+              {{- else }}
+              value: {{ .Values.queryCache.redisUrl | quote }}
+              {{- end }}
+            - name: TAVANA_CACHE_TTL_SECS
+              value: {{ .Values.queryCache.ttlSecs | default 300 | quote }}
+            - name: TAVANA_CACHE_MAX_SIZE_MB
+              value: {{ .Values.queryCache.maxResultSizeMB | default 100 | quote }}
+            - name: TAVANA_CACHE_COMPRESSION
+              value: {{ .Values.queryCache.compression | default true | quote }}
+            - name: TAVANA_CACHE_VERSION
+              value: {{ .Values.queryCache.version | default 1 | quote }}
+            - name: TAVANA_CACHE_L1_ENABLED
+              value: {{ .Values.queryCache.l1.enabled | default true | quote }}
+            - name: TAVANA_CACHE_L1_SIZE
+              value: {{ .Values.queryCache.l1.size | default 1000 | quote }}
+            {{- end }}
             {{- with .Values.gateway.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

@@ -90,6 +90,23 @@ spec:
                   name: {{ .Values.objectStorage.existingSecret }}
                   key: {{ .Values.objectStorage.existingSecretSecretAccessKeyKey }}
             {{- end }}
+            # cache_httpfs: Remote File Caching for DuckDB
+            {{- if .Values.cacheHttpfs }}
+            - name: TAVANA_CACHE_HTTPFS_ENABLED
+              value: {{ .Values.cacheHttpfs.enabled | default true | quote }}
+            - name: TAVANA_CACHE_HTTPFS_DIR
+              value: {{ .Values.cacheHttpfs.cacheDir | default "/tmp/duckdb_cache" | quote }}
+            - name: TAVANA_CACHE_HTTPFS_SIZE_GB
+              value: {{ .Values.cacheHttpfs.maxSizeGB | default 50 | quote }}
+            - name: TAVANA_CACHE_HTTPFS_BLOCK_SIZE_MB
+              value: {{ .Values.cacheHttpfs.blockSizeMB | default 8 | quote }}
+            - name: TAVANA_CACHE_HTTPFS_PARALLEL_IO
+              value: {{ .Values.cacheHttpfs.parallelIO | default 8 | quote }}
+            {{- if .Values.cacheHttpfs.profiling }}
+            - name: TAVANA_CACHE_HTTPFS_PROFILING
+              value: "true"
+            {{- end }}
+            {{- end }}
             {{- with .Values.worker.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -110,6 +127,10 @@ spec:
               mountPath: /tmp
             - name: duckdb-home
               mountPath: /home/tavana
+            {{- if and .Values.cacheHttpfs .Values.cacheHttpfs.enabled }}
+            - name: httpfs-cache
+              mountPath: {{ .Values.cacheHttpfs.cacheDir | default "/tmp/duckdb_cache" }}
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir:
@@ -119,6 +140,13 @@ spec:
           emptyDir:
             medium: Memory    # RAM-backed tmpfs for DuckDB temp storage
             sizeLimit: 4Gi
+        {{- if and .Values.cacheHttpfs .Values.cacheHttpfs.enabled }}
+        - name: httpfs-cache
+          emptyDir:
+            # Disk-backed for persistence across query executions
+            # For true persistence across pod restarts, use a PVC
+            sizeLimit: {{ .Values.cacheHttpfs.maxSizeGB | default 50 }}Gi
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
