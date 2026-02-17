@@ -35,7 +35,7 @@ spec:
     {{- end }}
     {{- if and .Values.gateway.flightSql.enabled .Values.gateway.loadBalancer.exposeFlight }}
     - name: flight
-      port: {{ .Values.gateway.loadBalancer.flightExternalPort | default 9091 }}
+      port: {{ .Values.gateway.loadBalancer.flightExternalPort | default 50051 }}
       targetPort: flight
       protocol: TCP
     {{- end }}

@@ -75,7 +75,7 @@ docker run -d --name tavana-worker --network tavana-network \
 ```bash
 docker run -d --name tavana-gateway --network tavana-network \
   -p 5432:15432 \
-  -p 9091:443 \
+  -p 50051:443 \
   -p 8080:8080 \
   -e PG_PORT=15432 \
   -e FLIGHT_SQL_PORT=443 \
@@ -106,7 +106,7 @@ services:
     image: angelerator/tavana-gateway:latest
     ports:
       - "5432:15432"
-      - "9091:443"
+      - "50051:443"
       - "8080:8080"
     environment:
       - PG_PORT=15432
@@ -192,13 +192,13 @@ print(cursor.fetchall())
 - Host: `tavana.example.com`
 - Port: `5432`
 
-### Arrow Flight SQL (Port 9091)
+### Arrow Flight SQL (Port 50051)
 
 **Python (ADBC) - Recommended for large datasets:**
 ```python
 import adbc_driver_flightsql.dbapi as adbc
 
-with adbc.connect("grpc://localhost:9091") as conn:
+with adbc.connect("grpc://localhost:50051") as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM delta_scan('s3://bucket/table')")
         table = cur.fetch_arrow_table()  # Zero-copy Arrow data
@@ -206,7 +206,7 @@ with adbc.connect("grpc://localhost:9091") as conn:
 
 **JDBC:**
 ```
-jdbc:arrow-flight-sql://localhost:9091/?useEncryption=false
+jdbc:arrow-flight-sql://localhost:50051/?useEncryption=false
 ```
 
 ## Query Examples

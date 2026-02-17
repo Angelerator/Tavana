@@ -27,7 +27,7 @@ import time
 # ---------------------------------------------------------------------------
 TAVANA_HOST = os.environ.get("TAVANA_HOST", "localhost")
 TAVANA_PG_PORT = int(os.environ.get("TAVANA_PG_PORT", "5432"))
-TAVANA_FLIGHT_PORT = int(os.environ.get("TAVANA_FLIGHT_PORT", "9091"))
+TAVANA_FLIGHT_PORT = int(os.environ.get("TAVANA_FLIGHT_PORT", "50051"))
 TAVANA_DB = os.environ.get("TAVANA_DB", "main")
 TAVANA_USER = os.environ.get("TAVANA_USER", "tavana")
 TAVANA_PASSWORD = os.environ.get("TAVANA_PASSWORD", "your-password")

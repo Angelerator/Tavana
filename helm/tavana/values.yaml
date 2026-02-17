@@ -45,7 +45,7 @@ gateway:
     exposeHttp: false           # Expose HTTP health/metrics externally
     httpExternalPort: 8080
     exposeFlight: true          # Expose Arrow Flight SQL externally (2.2x faster)
-    flightExternalPort: 9091
+    flightExternalPort: 50051   # Standard gRPC port
     annotations: {}
     # Azure-specific annotations:
     #   service.beta.kubernetes.io/azure-load-balancer-internal: "true"
@@ -60,7 +60,7 @@ gateway:
   #   - JDBC: jdbc:arrow-flight-sql://host:port
   flightSql:
     enabled: true
-    port: 9091         # Arrow Flight gRPC port (9091 allowed by Azure Policy)
+    port: 50051        # Arrow Flight gRPC port (standard gRPC port)
   
   # TLS configuration for PostgreSQL wire protocol
   tls:

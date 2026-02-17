@@ -51,9 +51,15 @@ gateway:
     externalPort: 443           # External port (443 passes corporate firewalls)
     exposeHttp: false
     exposeFlight: true          # Expose Arrow Flight SQL (2.2x faster than PG wire)
+    flightExternalPort: 50051   # Standard gRPC port for Flight SQL
     annotations:
       # Use internal Azure Load Balancer (recommended for security)
       # service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+  
+  # Arrow Flight SQL configuration (ADBC-compatible, 2.2x faster than PG wire)
+  flightSql:
+    enabled: true
+    port: 50051              # Internal gRPC port for Arrow Flight SQL
   
   # Resource sizing — gateway serializes Arrow batches to PG wire / Flight SQL
   # More CPU = faster serialization for large result sets

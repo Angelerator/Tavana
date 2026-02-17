@@ -30,14 +30,14 @@ Standard PostgreSQL-compatible clients:
 psql -h tavana-gateway -p 5432 -U user -c "SELECT * FROM delta_scan('s3://bucket/table')"
 ```
 
-### Arrow Flight SQL / ADBC (Port 9091)
+### Arrow Flight SQL / ADBC (Port 50051)
 High-performance Arrow-native connectivity for analytics applications:
 
 **Python (ADBC)**:
 ```python
 import adbc_driver_flightsql.dbapi
 
-with adbc_driver_flightsql.dbapi.connect("grpc://tavana-gateway:9091") as conn:
+with adbc_driver_flightsql.dbapi.connect("grpc://tavana-gateway:50051") as conn:
     with conn.cursor() as cur:
         cur.execute("SELECT * FROM delta_scan('s3://bucket/table')")
         table = cur.fetch_arrow_table()  # Zero-copy Arrow data
@@ -47,7 +47,7 @@ with adbc_driver_flightsql.dbapi.connect("grpc://tavana-gateway:9091") as conn:
 ```python
 import pyarrow.flight as flight
 
-client = flight.connect("grpc://tavana-gateway:9091")
+client = flight.connect("grpc://tavana-gateway:50051")
 info = client.get_flight_info(flight.FlightDescriptor.for_command(b"SELECT 1"))
 reader = client.do_get(info.endpoints[0].ticket)
 table = reader.read_all()
@@ -58,12 +58,12 @@ table = reader.read_all()
 import "github.com/apache/arrow-adbc/go/adbc/driver/flightsql"
 
 driver := flightsql.NewDriver()
-db, _ := driver.Open("grpc://tavana-gateway:9091")
+db, _ := driver.Open("grpc://tavana-gateway:50051")
 ```
 
 **JDBC**:
 ```
-jdbc:arrow-flight-sql://tavana-gateway:9091/?useEncryption=false
+jdbc:arrow-flight-sql://tavana-gateway:50051/?useEncryption=false
 ```
 
 ## Prerequisites
@@ -118,11 +118,11 @@ helm uninstall tavana -n tavana
 | `gateway.resources.limits.memory` | Memory limit | `4Gi` |
 | `gateway.service.pgPort` | PostgreSQL port (internal) | `5432` |
 | `gateway.flightSql.enabled` | Enable Arrow Flight SQL (ADBC) | `true` |
-| `gateway.flightSql.port` | Flight SQL gRPC port | `9091` |
+| `gateway.flightSql.port` | Flight SQL gRPC port | `50051` |
 | `gateway.loadBalancer.enabled` | Enable external LoadBalancer | `false` |
 | `gateway.loadBalancer.externalPort` | External PostgreSQL port | `5432` |
 | `gateway.loadBalancer.exposeFlight` | Expose Flight SQL externally | `false` |
-| `gateway.loadBalancer.flightExternalPort` | External Flight SQL port | `9091` |
+| `gateway.loadBalancer.flightExternalPort` | External Flight SQL port | `50051` |
 | `gateway.loadBalancer.annotations` | LoadBalancer annotations | `{}` |
 
 ### Worker
