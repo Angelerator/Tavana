@@ -29,17 +29,6 @@ service QueryService {
     
     // Close a cursor and release resources
     rpc CloseCursor(CloseCursorRequest) returns (CloseCursorResponse);
-    
-    // ============= Statistics for Smart Query Routing =============
-    
-    // Get statistics for a table/data source (enables smart routing decisions)
-    rpc GetTableStatistics(GetTableStatisticsRequest) returns (GetTableStatisticsResponse);
-    
-    // Get cluster resource statistics (for routing optimization)
-    rpc GetClusterStatistics(GetClusterStatisticsRequest) returns (GetClusterStatisticsResponse);
-    
-    // Analyze query plan and suggest optimal routing
-    rpc AnalyzeQuery(AnalyzeQueryRequest) returns (AnalyzeQueryResponse);
 }
 
 message ExecuteQueryRequest {
@@ -163,101 +152,6 @@ message CloseCursorRequest {
 message CloseCursorResponse {
     bool success = 1;
     string message = 2;
-}
-
-// ============= Statistics Messages for Smart Query Routing =============
-
-message GetTableStatisticsRequest {
-    string uri = 1;              // Table/data source URI (e.g., az://container/path, delta_scan path)
-    bool include_columns = 2;    // Include per-column statistics
-    bool force_refresh = 3;      // Force refresh from storage (bypass cache)
-}
-
-message GetTableStatisticsResponse {
-    bool success = 1;
-    TableStatistics statistics = 2;
-    string error_message = 3;
-    bool from_cache = 4;         // Whether stats came from cache
-}
-
-message GetClusterStatisticsRequest {
-    bool include_workers = 1;    // Include per-worker details
-}
-
-message GetClusterStatisticsResponse {
-    uint32 worker_count = 1;
-    uint32 active_workers = 2;
-    uint64 total_memory_bytes = 3;
-    uint64 available_memory_bytes = 4;
-    uint32 active_queries = 5;
-    uint32 queued_queries = 6;
-    double avg_query_latency_ms = 7;
-    double storage_bandwidth_gbps = 8;  // Internal bandwidth to object storage
-    repeated WorkerStats workers = 9;
-}
-
-message WorkerStats {
-    string worker_id = 1;
-    uint64 memory_bytes = 2;
-    uint64 available_memory_bytes = 3;
-    uint32 active_queries = 4;
-    float cpu_usage_percent = 5;
-}
-
-message AnalyzeQueryRequest {
-    string sql = 1;
-    repeated string local_tables = 2;     // URIs of tables that are local to the client
-    uint64 local_memory_bytes = 3;        // Client's available memory
-    double client_bandwidth_mbps = 4;     // Client's network bandwidth
-}
-
-message AnalyzeQueryResponse {
-    RoutingRecommendation recommendation = 1;
-    repeated RoutingAlternative alternatives = 2;
-    QueryPlanAnalysis plan_analysis = 3;
-}
-
-message RoutingRecommendation {
-    RoutingStrategy strategy = 1;
-    double estimated_time_ms = 2;
-    uint64 estimated_transfer_bytes = 3;
-    string rationale = 4;
-}
-
-message RoutingAlternative {
-    RoutingStrategy strategy = 1;
-    double estimated_time_ms = 2;
-    uint64 estimated_transfer_bytes = 3;
-    string why_not_recommended = 4;
-}
-
-enum RoutingStrategy {
-    ROUTING_STRATEGY_UNSPECIFIED = 0;
-    ROUTING_STRATEGY_ALL_LOCAL = 1;       // Pull all data to client
-    ROUTING_STRATEGY_ALL_REMOTE = 2;      // Execute entirely on Tavana
-    ROUTING_STRATEGY_HYBRID_REMOTE_AGG = 3;  // Aggregate on Tavana, join locally
-    ROUTING_STRATEGY_HYBRID_LOCAL_AGG = 4;   // Aggregate locally, join on Tavana
-    ROUTING_STRATEGY_STREAMING = 5;       // Stream results in batches
-}
-
-message QueryPlanAnalysis {
-    uint64 estimated_input_rows = 1;
-    uint64 estimated_output_rows = 2;
-    uint64 estimated_bytes_scanned = 3;
-    bool has_aggregation = 4;
-    uint32 group_by_columns = 5;
-    uint32 join_count = 6;
-    bool has_window_functions = 7;
-    double estimated_selectivity = 8;     // Filter selectivity (0.0-1.0)
-    repeated string tables_accessed = 9;
-    repeated TableSizeInfo table_sizes = 10;
-}
-
-message TableSizeInfo {
-    string uri = 1;
-    uint64 row_count = 2;
-    uint64 size_bytes = 3;
-    bool is_local = 4;
 }
 
 // Query history logging

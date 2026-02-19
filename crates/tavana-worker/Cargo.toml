@@ -60,7 +60,6 @@ dotenvy = { workspace = true }
 
 # System
 num_cpus = "1.16"
-sysinfo = "0.32"
 
 # HTTP client for Azure token exchange
 reqwest = { version = "0.12", features = ["blocking", "json"] }
