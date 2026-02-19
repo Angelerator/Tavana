@@ -1,5 +1,9 @@
 # Tavana
 
+<p align="center">
+  <img src="assets/tavana-linkedin-post.png" alt="Tavana - Every Duck Needs a Powerful Father" width="800">
+</p>
+
 **The open-source alternative to MotherDuck** — because every duck needs a powerful father.
 
 Cloud-agnostic, auto-scaling SQL query engine for data lakes. Query petabytes of Delta Lake, Parquet, and Iceberg data using standard SQL through PostgreSQL-compatible clients or high-performance Arrow Flight SQL. Deploy on your own infrastructure, keep full control of your data.
