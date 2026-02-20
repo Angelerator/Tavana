@@ -579,8 +579,14 @@ pub fn encode_metrics() -> String {
     let encoder = TextEncoder::new();
     let metric_families = prometheus::gather();
     let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
-    String::from_utf8(buffer).unwrap()
+    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+        tracing::error!("Failed to encode prometheus metrics: {}", e);
+        return "# Error encoding metrics".to_string();
+    }
+    String::from_utf8(buffer).unwrap_or_else(|e| {
+        tracing::error!("Failed to convert metrics to UTF-8: {}", e);
+        "# Error converting metrics to string".to_string()
+    })
 }
 
 /// Record query routing decision

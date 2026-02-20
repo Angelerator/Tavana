@@ -34,14 +34,14 @@ pub struct PgWireConfig {
 
     // === Backpressure Settings ===
     
-    /// Bytes to buffer before forcing a flush (default: 64KB)
-    /// This is the primary backpressure threshold, matching TCP window sizes
+    /// Bytes to buffer before forcing a flush (default: 256KB)
+    /// This is the primary backpressure threshold, optimal for wide rows
     pub flush_threshold_bytes: usize,
-    /// Maximum rows before forcing a flush regardless of bytes (default: 100)
+    /// Maximum rows before forcing a flush regardless of bytes (default: 500)
     /// Acts as a safety net for rows with very small data
     pub flush_threshold_rows: usize,
-    /// Timeout for flush operations in seconds (default: 5s)
-    /// If flush takes longer, client is likely overwhelmed
+    /// Timeout for flush operations in seconds (default: 300s / 5 min)
+    /// StarRocks-style patient waiting for slow clients
     pub flush_timeout_secs: u64,
     /// Maximum rows to buffer in portal state (default: 50000)
     /// Prevents gateway OOM for large result sets with JDBC scrolling
@@ -85,15 +85,15 @@ impl Default for PgWireConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(500), // Check more frequently for better disconnect detection
 
-            // Backpressure settings
+            // Backpressure settings (must match BackpressureConfig::default())
             flush_threshold_bytes: std::env::var("TAVANA_FLUSH_THRESHOLD_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(64 * 1024), // 64KB - matches typical TCP window
+                .unwrap_or(256 * 1024), // 256KB - optimal for wide rows
             flush_threshold_rows: std::env::var("TAVANA_FLUSH_THRESHOLD_ROWS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(100), // Safety net for small rows
+                .unwrap_or(500), // Higher for wide-row workloads
             flush_timeout_secs: std::env::var("TAVANA_FLUSH_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())

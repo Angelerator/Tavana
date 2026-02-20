@@ -17,8 +17,17 @@ use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement, TableFactor};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+static FALLBACK_TABLE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"read_parquet\s*\(\s*'([^']+)'").expect("constant pattern")
+});
+
+static SIZE_FROM_FILENAME_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(\d+)\s*(mb|gb|tb)").expect("constant pattern")
+});
 
 /// Cache entry with TTL and full Parquet metadata
 #[derive(Clone)]
@@ -298,10 +307,7 @@ impl DataSizer {
         let sql_upper = sql.to_uppercase();
         let mut structure = QueryStructure::default();
 
-        // Extract tables using regex
-        let table_regex = Regex::new(r"read_parquet\s*\(\s*'([^']+)'")
-            .expect("read_parquet regex is a valid constant pattern");
-        for cap in table_regex.captures_iter(sql) {
+        for cap in FALLBACK_TABLE_REGEX.captures_iter(sql) {
             if let Some(path) = cap.get(1) {
                 structure.tables.push(path.as_str().to_string());
             }
@@ -842,9 +848,7 @@ impl DataSizer {
     }
 
     fn extract_size_from_filename(&self, path: &str) -> Option<u64> {
-        let size_regex = Regex::new(r"(\d+)\s*(mb|gb|tb)").ok()?;
-
-        if let Some(caps) = size_regex.captures(path) {
+        if let Some(caps) = SIZE_FROM_FILENAME_REGEX.captures(path) {
             let num: u64 = caps.get(1)?.as_str().parse().ok()?;
             let unit = caps.get(2)?.as_str();
 

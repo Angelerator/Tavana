@@ -329,8 +329,7 @@ impl TavanaFlightSqlService {
     ///
     /// IMPORTANT: The schema for the FlightData header must come from the actual
     /// ArrowBatch (not from Metadata type mapping) to ensure the schema matches
-    /// the batch data types exactly. `map_duckdb_type_to_arrow` is lossy (e.g.,
-    /// Timestamp → Utf8) which would cause decode errors on the client.
+    /// the batch data types exactly.
     ///
     /// **Fallback**: If no passthrough data is available, uses FlightDataEncoderBuilder
     /// to re-serialize RecordBatches (current behavior, still works for cursors etc.).
@@ -1051,33 +1050,6 @@ impl FlightSqlService for TavanaFlightSqlService {
     /// Register SQL info (called during initialization)
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {
         // SQL info is statically defined in TAVANA_SQL_INFO
-    }
-}
-
-/// Map DuckDB type name strings (from Arrow schema debug format) to Arrow DataType.
-/// This preserves native types instead of flattening everything to Utf8.
-fn map_duckdb_type_to_arrow(type_name: &str) -> DataType {
-    match type_name {
-        "Boolean" => DataType::Boolean,
-        "Int8" => DataType::Int8,
-        "Int16" => DataType::Int16,
-        "Int32" => DataType::Int32,
-        "Int64" => DataType::Int64,
-        "UInt8" => DataType::UInt8,
-        "UInt16" => DataType::UInt16,
-        "UInt32" => DataType::UInt32,
-        "UInt64" => DataType::UInt64,
-        "Float32" => DataType::Float32,
-        "Float64" => DataType::Float64,
-        "Date32" => DataType::Date32,
-        "Date64" => DataType::Date64,
-        s if s.starts_with("Timestamp") => {
-            // Parse "Timestamp(Microsecond, None)" or "Timestamp(Microsecond, Some(\"UTC\"))"
-            DataType::Utf8 // Fallback to Utf8 for complex timestamp formats
-        }
-        "Utf8" | "LargeUtf8" => DataType::Utf8,
-        "Binary" | "LargeBinary" => DataType::Binary,
-        _ => DataType::Utf8, // Default fallback
     }
 }
 

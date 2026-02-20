@@ -131,8 +131,8 @@ hpa:
   enabled: true
   minReplicas: 2
   maxReplicas: 8           # Max 8 workers (fits 4 nodes)
-  targetCPUUtilizationPercentage: 70
-  targetMemoryUtilizationPercentage: 75
+  cpuTargetUtilization: 70
+  memoryTargetUtilization: 75
   # HPA behavior settings
   behavior:
     scaleUp:

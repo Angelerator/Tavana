@@ -27,15 +27,20 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    # Allow from ingress controller
-    - from: []
+    - from:
+        {{- if .Values.networkPolicies.ingressNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicies.ingressNamespace }}
+        {{- else }}
+        - namespaceSelector: {}
+        {{- end }}
       ports:
         - protocol: TCP
           port: {{ .Values.gateway.service.pgPort }}
         - protocol: TCP
           port: {{ .Values.gateway.service.httpPort }}
         {{- if .Values.gateway.flightSql.enabled }}
-        # Arrow Flight SQL / ADBC port
         - protocol: TCP
           port: {{ .Values.gateway.flightSql.port }}
         {{- end }}

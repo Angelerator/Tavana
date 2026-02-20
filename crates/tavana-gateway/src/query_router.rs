@@ -16,8 +16,23 @@ use regex::Regex;
 use sqlparser::ast::{SetExpr, Statement, TableFactor};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tracing::{debug, info, warn};
+
+static TABLE_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        r"read_csv_auto\s*\(\s*'([^']+)'",
+        r"read_csv\s*\(\s*'([^']+)'",
+        r"read_parquet\s*\(\s*'([^']+)'",
+        r"read_json\s*\(\s*'([^']+)'",
+        r"read_json_auto\s*\(\s*'([^']+)'",
+        r"delta_scan\s*\(\s*'([^']+)'",
+        r"iceberg_scan\s*\(\s*'([^']+)'",
+    ]
+    .iter()
+    .map(|p| Regex::new(p).expect("table regex is a valid constant pattern"))
+    .collect()
+});
 
 use crate::data_sizer::{DataSizer, EstimationMethod};
 use crate::metrics;
@@ -71,7 +86,6 @@ pub struct QueryRouter {
     data_sizer: Arc<DataSizer>,
     /// Worker pool manager for pre-sizing (shared pool)
     pool_manager: Option<Arc<WorkerPoolManager>>,
-    // tenant_manager: Option<Arc<TenantPoolManager>>,  // Removed - not implemented
 }
 
 impl QueryRouter {
@@ -196,7 +210,7 @@ impl QueryRouter {
         let estimate = QueryEstimate {
             data_size_mb: size_estimate.total_mb,
             required_memory_mb,
-            cpu_cores: self.estimate_cpu_cores(size_estimate.total_mb, has_join, has_aggregation),
+            cpu_cores,
             tables,
             has_aggregation,
             has_join,
@@ -292,24 +306,12 @@ impl QueryRouter {
     }
 
     fn extract_tables_from_sql(&self, sql: &str, tables: &mut Vec<String>) {
-        let patterns = [
-            r"read_csv_auto\s*\(\s*'([^']+)'",
-            r"read_csv\s*\(\s*'([^']+)'",
-            r"read_parquet\s*\(\s*'([^']+)'",
-            r"read_json\s*\(\s*'([^']+)'",
-            r"read_json_auto\s*\(\s*'([^']+)'",
-            r"delta_scan\s*\(\s*'([^']+)'",
-            r"iceberg_scan\s*\(\s*'([^']+)'",
-        ];
-
-        for pattern in patterns {
-            if let Ok(re) = Regex::new(pattern) {
-                for cap in re.captures_iter(sql) {
-                    if let Some(m) = cap.get(1) {
-                        let path = m.as_str().to_string();
-                        if !tables.contains(&path) {
-                            tables.push(path);
-                        }
+        for re in TABLE_REGEXES.iter() {
+            for cap in re.captures_iter(sql) {
+                if let Some(m) = cap.get(1) {
+                    let path = m.as_str().to_string();
+                    if !tables.contains(&path) {
+                        tables.push(path);
                     }
                 }
             }

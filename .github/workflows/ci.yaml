@@ -1,7 +1,6 @@
 name: CI
 
 on:
-  # Only run on PRs, not on direct pushes to main
   pull_request:
     branches: [main, develop]
     paths-ignore:
@@ -12,10 +11,13 @@ on:
       - 'CONTRIBUTING.md'
       - '**.sh'
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Reduce debug info size
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
 
@@ -142,4 +144,4 @@ jobs:
         run: cargo install cargo-audit --locked
       
       - name: Run cargo-audit
-        run: cargo audit || true
+        run: cargo audit

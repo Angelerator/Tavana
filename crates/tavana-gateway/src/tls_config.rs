@@ -163,6 +163,9 @@ mod tests {
 
     #[test]
     fn test_self_signed_cert() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
         let config = TlsConfig::self_signed("test.tavana.local").unwrap();
         let _acceptor = config.acceptor();
     }

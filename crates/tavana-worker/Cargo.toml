@@ -41,7 +41,6 @@ parquet = { workspace = true }
 # Observability
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-opentelemetry = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

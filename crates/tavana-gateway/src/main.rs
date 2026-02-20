@@ -29,7 +29,6 @@ mod worker_pool;
 
 use crate::auth::AuthService;
 use crate::data_sizer::DataSizer;
-use crate::pg_wire::PgWireServer;
 use crate::query_router::QueryRouter;
 use crate::worker_client::WorkerClient;
 use crate::worker_pool::{PreSizingConfig, WorkerPoolManager};

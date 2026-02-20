@@ -31,7 +31,7 @@ use tracing::{debug, warn};
 /// Configuration for backpressure-aware streaming
 #[derive(Debug, Clone)]
 pub struct BackpressureConfig {
-    /// Bytes to buffer before forcing a flush (default: 64KB)
+    /// Bytes to buffer before forcing a flush (default: 256KB)
     /// Smaller = more backpressure, higher latency
     /// Larger = less backpressure, lower latency, risk of overwhelming client
     pub flush_threshold_bytes: usize,
@@ -1527,9 +1527,9 @@ mod tests {
     #[test]
     fn test_config_defaults() {
         let config = BackpressureConfig::default();
-        assert_eq!(config.flush_threshold_bytes, 64 * 1024);
-        assert_eq!(config.flush_threshold_rows, 100);
-        assert_eq!(config.flush_timeout_secs, 300); // StarRocks-style 5 minute timeout
+        assert_eq!(config.flush_threshold_bytes, 256 * 1024);
+        assert_eq!(config.flush_threshold_rows, 500);
+        assert_eq!(config.flush_timeout_secs, 300);
     }
 
     #[test]
@@ -1607,7 +1607,9 @@ mod tests {
             data_row[11], data_row[12], data_row[13], data_row[14],
             data_row[15], data_row[16], data_row[17], data_row[18]
         ]);
-        assert!((value - 3.14159).abs() < 0.00001);
+        #[allow(clippy::approx_constant)]
+        let expected = 3.14159;
+        assert!((value - expected).abs() < 0.00001);
     }
 
     #[test]

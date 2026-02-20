@@ -43,11 +43,11 @@ jobs:
           tags: tavana-gateway:scan
       
       - name: Scan Gateway image
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.34.0
         with:
           image-ref: 'tavana-gateway:scan'
           format: 'table'
-          exit-code: '0'
+          exit-code: '1'
           severity: 'CRITICAL,HIGH'
       
       - name: Remove Gateway image
@@ -63,11 +63,11 @@ jobs:
           tags: tavana-worker:scan
       
       - name: Scan Worker image
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@v0.34.0
         with:
           image-ref: 'tavana-worker:scan'
           format: 'table'
-          exit-code: '0'
+          exit-code: '1'
           severity: 'CRITICAL,HIGH'
 
   helm-lint:

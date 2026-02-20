@@ -19,9 +19,13 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
+RUN useradd -m -u 1000 -s /bin/bash tavana
+
 COPY --from=builder /app/target/release/tavana-gateway /usr/local/bin/
 
-EXPOSE 15432 443 8080
+USER tavana
+
+EXPOSE 5432 8080
 
 ENTRYPOINT ["tavana-gateway"]
 

@@ -69,7 +69,7 @@ RUN set -eux && \
     curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/delta.duckdb_extension.gz" | gunzip > "$EXT_DIR/delta.duckdb_extension" && \
     curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/iceberg.duckdb_extension.gz" | gunzip > "$EXT_DIR/iceberg.duckdb_extension" && \
     # ===== Utility Extensions =====
-    # Note: postgres, mysql, sqlite extensions are not available as pre-built binaries for v1.4.3
+    # Note: postgres, mysql, sqlite extensions may not be available as pre-built binaries
     curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/icu.duckdb_extension.gz" | gunzip > "$EXT_DIR/icu.duckdb_extension" && \
     curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/fts.duckdb_extension.gz" | gunzip > "$EXT_DIR/fts.duckdb_extension" && \
     curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_ARCH}/inet.duckdb_extension.gz" | gunzip > "$EXT_DIR/inet.duckdb_extension" && \
@@ -86,11 +86,28 @@ RUN set -eux && \
 COPY --from=builder /app/target/release/tavana-worker /usr/local/bin/
 
 # Download DuckDB CLI for extension verification (as root, before switching user)
-ARG DUCKDB_VERSION=v1.4.4
-RUN mkdir -p /tmp/duckdb_cli && \
-    curl -fsSL "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip" -o /tmp/duckdb_cli/duckdb.zip && \
+RUN set -eux && \
+    if [ -n "${TARGETARCH:-}" ]; then \
+        case "$TARGETARCH" in \
+            amd64) CLI_ARCH="linux-amd64" ;; \
+            arm64) CLI_ARCH="linux-arm64" ;; \
+            *) echo "ERROR: Unsupported TARGETARCH: $TARGETARCH" && exit 1 ;; \
+        esac; \
+    else \
+        UNAME_ARCH=$(uname -m); \
+        case "$UNAME_ARCH" in \
+            x86_64)  CLI_ARCH="linux-amd64" ;; \
+            aarch64) CLI_ARCH="linux-arm64" ;; \
+            arm64)   CLI_ARCH="linux-arm64" ;; \
+            *) echo "ERROR: Unsupported architecture: $UNAME_ARCH" && exit 1 ;; \
+        esac; \
+    fi && \
+    mkdir -p /tmp/duckdb_cli && \
+    curl -fsSL "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-${CLI_ARCH}.zip" -o /tmp/duckdb_cli/duckdb.zip && \
     cd /tmp/duckdb_cli && unzip -oq duckdb.zip && chmod +x duckdb && mv duckdb /usr/local/bin/ && \
-    rm -rf /tmp/duckdb_cli
+    rm -rf /tmp/duckdb_cli && \
+    apt-get purge -y --auto-remove curl unzip && \
+    rm -rf /var/lib/apt/lists/*
 
 USER tavana
 WORKDIR /home/tavana
